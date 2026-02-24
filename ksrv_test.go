@@ -1,151 +1,45 @@
 package ksrv
 
 import (
-	"bytes"
 	"context"
-	"crypto/rand"
-	"crypto/rsa"
-	"crypto/tls"
-	"crypto/x509"
-	"crypto/x509/pkix"
 	"encoding/binary"
-	"encoding/pem"
 	"fmt"
 	"io"
-	"math/big"
 	"net"
-	"os"
-	"sync"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/twmb/franz-go/pkg/kbin"
-	"github.com/twmb/franz-go/pkg/kerr"
-	"github.com/twmb/franz-go/pkg/kgo"
 	"github.com/twmb/franz-go/pkg/kmsg"
-	"github.com/twmb/franz-go/pkg/sasl/plain"
-	"github.com/twmb/franz-go/pkg/sasl/scram"
 )
 
-// testLogger is a simple logger that writes to testing.T.
-type testLogger struct {
-	t *testing.T
+// --- Unit tests ---
+
+func TestConfigDefaults(t *testing.T) {
+	cfg := Config{}
+	cfg.setDefaults()
+
+	assert.Equal(t, defaultAddress, cfg.Address)
+	assert.Equal(t, defaultTimeout, cfg.Timeout)
+	assert.Equal(t, defaultIdleTimeout, cfg.IdleTimeout)
+	assert.Equal(t, defaultMaxMessageBytes, cfg.MaxMessageBytes)
 }
 
-func (l *testLogger) Debugf(format string, args ...any) { l.t.Logf("[DEBUG] "+format, args...) }
-func (l *testLogger) Infof(format string, args ...any)  { l.t.Logf("[INFO] "+format, args...) }
-func (l *testLogger) Warnf(format string, args ...any)  { l.t.Logf("[WARN] "+format, args...) }
-func (l *testLogger) Errorf(format string, args ...any) { l.t.Logf("[ERROR] "+format, args...) }
-
-// getFreePort finds an available TCP port.
-func getFreePort(t *testing.T) int {
-	t.Helper()
-	l, err := net.Listen("tcp", "127.0.0.1:0")
-	require.NoError(t, err)
-	port := l.Addr().(*net.TCPAddr).Port
-	l.Close()
-	return port
-}
-
-// waitForTCPReady polls until the given TCP address is accepting connections.
-func waitForTCPReady(t *testing.T, addr string, timeout time.Duration) {
-	t.Helper()
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		conn, err := net.DialTimeout("tcp", addr, 500*time.Millisecond)
-		if err == nil {
-			conn.Close()
-			return
-		}
-		time.Sleep(50 * time.Millisecond)
+func TestConfigDoesNotOverrideSet(t *testing.T) {
+	cfg := Config{
+		Address:         "127.0.0.1:1234",
+		Timeout:         10 * time.Second,
+		IdleTimeout:     120 * time.Second,
+		MaxMessageBytes: 2048,
 	}
-	t.Fatalf("timed out waiting for %s to accept connections", addr)
-}
+	cfg.setDefaults()
 
-// receivedMessage is used in tests to capture messages.
-type receivedMessage struct {
-	Topic   string
-	Key     string
-	Value   string
-	Headers map[string]string
-}
-
-// messageCapture captures messages.
-type messageCapture struct {
-	messages []receivedMessage
-	mu       sync.Mutex
-}
-
-func (mc *messageCapture) add(msg receivedMessage) {
-	mc.mu.Lock()
-	defer mc.mu.Unlock()
-	mc.messages = append(mc.messages, msg)
-}
-
-func (mc *messageCapture) get() []receivedMessage {
-	mc.mu.Lock()
-	defer mc.mu.Unlock()
-	result := make([]receivedMessage, len(mc.messages))
-	copy(result, mc.messages)
-	return result
-}
-
-func (mc *messageCapture) waitForMessages(count int, timeout time.Duration) []receivedMessage {
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		msgs := mc.get()
-		if len(msgs) >= count {
-			return msgs
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
-	return mc.get()
-}
-
-// captureHandler creates a Handler that captures messages into a messageCapture.
-func captureHandler(capture *messageCapture) Handler {
-	return func(_ context.Context, msgs []*Message) error {
-		for _, msg := range msgs {
-			rm := receivedMessage{
-				Topic:   msg.Topic,
-				Value:   string(msg.Value),
-				Headers: make(map[string]string),
-			}
-			if msg.Key != nil {
-				rm.Key = string(msg.Key)
-			}
-			for k, v := range msg.Headers {
-				rm.Headers[k] = v
-			}
-			capture.add(rm)
-		}
-		return nil
-	}
-}
-
-// startTestServer creates and starts a server for testing, returning the server and its address.
-func startTestServer(t *testing.T, cfg Config, handler Handler) (*Server, string) {
-	t.Helper()
-
-	port := getFreePort(t)
-	cfg.Address = fmt.Sprintf("127.0.0.1:%d", port)
-
-	srv, err := New(cfg, handler, WithLogger(&testLogger{t}))
-	require.NoError(t, err)
-
-	err = srv.Start(context.Background())
-	require.NoError(t, err)
-
-	addr := srv.Addr().String()
-	waitForTCPReady(t, addr, 5*time.Second)
-
-	t.Cleanup(func() {
-		srv.Close(context.Background())
-	})
-
-	return srv, addr
+	assert.Equal(t, "127.0.0.1:1234", cfg.Address)
+	assert.Equal(t, 10*time.Second, cfg.Timeout)
+	assert.Equal(t, 120*time.Second, cfg.IdleTimeout)
+	assert.Equal(t, 2048, cfg.MaxMessageBytes)
 }
 
 func TestServerConfig(t *testing.T) {
@@ -189,761 +83,134 @@ func TestServerConfig(t *testing.T) {
 	}
 }
 
-func TestServerBasic(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	capture := &messageCapture{}
-
-	_, addr := startTestServer(t, Config{
-		Timeout: 5 * time.Second,
-	}, captureHandler(capture))
-
-	// Create a franz-go producer client
-	client, err := kgo.NewClient(
-		kgo.SeedBrokers(addr),
-		kgo.RequestTimeoutOverhead(5*time.Second),
-		kgo.DisableIdempotentWrite(),
-	)
-	require.NoError(t, err)
-	defer client.Close()
-
-	testTopic := "test-topic"
-	testKey := "test-key"
-	testValue := "test-value"
-
-	record := &kgo.Record{
-		Topic: testTopic,
-		Key:   []byte(testKey),
-		Value: []byte(testValue),
-		Headers: []kgo.RecordHeader{
-			{Key: "header1", Value: []byte("value1")},
+func TestSplitSASLPlain(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    []byte
+		expected [][]byte
+	}{
+		{
+			name:     "standard format",
+			input:    []byte("\x00user\x00pass"),
+			expected: [][]byte{[]byte(""), []byte("user"), []byte("pass")},
+		},
+		{
+			name:     "with authzID",
+			input:    []byte("authz\x00user\x00pass"),
+			expected: [][]byte{[]byte("authz"), []byte("user"), []byte("pass")},
+		},
+		{
+			name:     "empty password",
+			input:    []byte("\x00user\x00"),
+			expected: [][]byte{[]byte(""), []byte("user"), []byte("")},
+		},
+		{
+			name:     "no separators",
+			input:    []byte("noNulls"),
+			expected: [][]byte{[]byte("noNulls")},
+		},
+		{
+			name:     "empty input",
+			input:    []byte{},
+			expected: [][]byte{[]byte("")},
 		},
 	}
 
-	results := client.ProduceSync(ctx, record)
-	require.Len(t, results, 1)
-	require.NoError(t, results[0].Err)
-
-	msgs := capture.waitForMessages(1, 5*time.Second)
-	require.Len(t, msgs, 1)
-
-	assert.Equal(t, testTopic, msgs[0].Topic)
-	assert.Equal(t, testKey, msgs[0].Key)
-	assert.Equal(t, testValue, msgs[0].Value)
-	assert.Equal(t, "value1", msgs[0].Headers["header1"])
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			parts := splitSASLPlain(tt.input)
+			require.Len(t, parts, len(tt.expected))
+			for i, part := range parts {
+				assert.Equal(t, tt.expected[i], part)
+			}
+		})
+	}
 }
 
-func TestServerMultipleMessages(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	capture := &messageCapture{}
-	_, addr := startTestServer(t, Config{
-		Timeout: 5 * time.Second,
-	}, captureHandler(capture))
-
-	client, err := kgo.NewClient(
-		kgo.SeedBrokers(addr),
-		kgo.RequestTimeoutOverhead(5*time.Second),
-		kgo.DisableIdempotentWrite(),
-	)
-	require.NoError(t, err)
-	defer client.Close()
-
-	for i := 0; i < 5; i++ {
-		record := &kgo.Record{
-			Topic: "test-topic",
-			Value: []byte(fmt.Sprintf("message-%d", i)),
-		}
-		results := client.ProduceSync(ctx, record)
-		require.NoError(t, results[0].Err)
+func TestIsTopicAllowed(t *testing.T) {
+	tests := []struct {
+		name    string
+		topics  []string
+		check   string
+		allowed bool
+	}{
+		{
+			name:    "empty topics allows all",
+			topics:  nil,
+			check:   "any-topic",
+			allowed: true,
+		},
+		{
+			name:    "allowed topic",
+			topics:  []string{"events", "logs"},
+			check:   "events",
+			allowed: true,
+		},
+		{
+			name:    "disallowed topic",
+			topics:  []string{"events", "logs"},
+			check:   "other",
+			allowed: false,
+		},
 	}
 
-	msgs := capture.waitForMessages(5, 10*time.Second)
-	require.Len(t, msgs, 5)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := Config{Address: "127.0.0.1:0", Topics: tt.topics}
+			srv, err := New(cfg, func(context.Context, []*Message) error { return nil })
+			require.NoError(t, err)
+			assert.Equal(t, tt.allowed, srv.isTopicAllowed(tt.check))
+		})
+	}
 }
 
-func TestServerTopicFiltering(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
+func TestGenerateTopicID(t *testing.T) {
+	// Same topic should produce same ID
+	id1 := generateTopicID("test-topic")
+	id2 := generateTopicID("test-topic")
+	assert.Equal(t, id1, id2)
 
-	capture := &messageCapture{}
-	_, addr := startTestServer(t, Config{
-		Timeout: 5 * time.Second,
-		Topics:  []string{"allowed-topic"},
-	}, captureHandler(capture))
+	// Different topics should produce different IDs
+	id3 := generateTopicID("other-topic")
+	assert.NotEqual(t, id1, id3)
 
-	client, err := kgo.NewClient(
-		kgo.SeedBrokers(addr),
-		kgo.RequestTimeoutOverhead(5*time.Second),
-		kgo.DisableIdempotentWrite(),
-	)
-	require.NoError(t, err)
-	defer client.Close()
-
-	// Produce to allowed topic
-	results := client.ProduceSync(ctx, &kgo.Record{
-		Topic: "allowed-topic",
-		Value: []byte("allowed"),
-	})
-	require.NoError(t, results[0].Err)
-
-	// Produce to disallowed topic should fail
-	results = client.ProduceSync(ctx, &kgo.Record{
-		Topic: "disallowed-topic",
-		Value: []byte("disallowed"),
-	})
-	require.Error(t, results[0].Err)
-
-	msgs := capture.waitForMessages(1, 5*time.Second)
-	require.Len(t, msgs, 1)
-	assert.Equal(t, "allowed-topic", msgs[0].Topic)
-	assert.Equal(t, "allowed", msgs[0].Value)
+	// Should not be all zeros
+	assert.NotEqual(t, [16]byte{}, id1)
 }
 
-func TestServerSASLPlain(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	capture := &messageCapture{}
-	_, addr := startTestServer(t, Config{
-		Timeout: 5 * time.Second,
-		SASL: []SASLCredential{
-			{Mechanism: "PLAIN", Username: "user1", Password: "pass1"},
-		},
-	}, captureHandler(capture))
-
-	// With correct credentials
-	client, err := kgo.NewClient(
-		kgo.SeedBrokers(addr),
-		kgo.RequestTimeoutOverhead(5*time.Second),
-		kgo.DisableIdempotentWrite(),
-		kgo.SASL(plain.Auth{
-			User: "user1",
-			Pass: "pass1",
-		}.AsMechanism()),
-	)
-	require.NoError(t, err)
-	defer client.Close()
-
-	results := client.ProduceSync(ctx, &kgo.Record{
-		Topic: "test-topic",
-		Value: []byte("authed-message"),
-	})
-	require.NoError(t, results[0].Err)
-
-	msgs := capture.waitForMessages(1, 5*time.Second)
-	require.Len(t, msgs, 1)
-	assert.Equal(t, "authed-message", msgs[0].Value)
-}
-
-func TestServerSASLPlainWrongPassword(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	capture := &messageCapture{}
-	_, addr := startTestServer(t, Config{
-		Timeout: 5 * time.Second,
-		SASL: []SASLCredential{
-			{Mechanism: "PLAIN", Username: "user1", Password: "pass1"},
-		},
-	}, captureHandler(capture))
-
-	client, err := kgo.NewClient(
-		kgo.SeedBrokers(addr),
-		kgo.RequestTimeoutOverhead(5*time.Second),
-		kgo.DisableIdempotentWrite(),
-		kgo.SASL(plain.Auth{
-			User: "user1",
-			Pass: "wrongpass",
-		}.AsMechanism()),
-	)
-	require.NoError(t, err)
-	defer client.Close()
-
-	results := client.ProduceSync(ctx, &kgo.Record{
-		Topic: "test-topic",
-		Value: []byte("should-fail"),
-	})
-	require.Error(t, results[0].Err)
-
-	// Should not have received any messages
-	time.Sleep(500 * time.Millisecond)
-	msgs := capture.get()
-	assert.Len(t, msgs, 0)
-}
-
-func TestServerSASLScram256(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	capture := &messageCapture{}
-	_, addr := startTestServer(t, Config{
-		Timeout: 5 * time.Second,
-		SASL: []SASLCredential{
-			{Mechanism: "SCRAM-SHA-256", Username: "scramuser", Password: "scrampass"},
-		},
-	}, captureHandler(capture))
-
-	client, err := kgo.NewClient(
-		kgo.SeedBrokers(addr),
-		kgo.RequestTimeoutOverhead(5*time.Second),
-		kgo.DisableIdempotentWrite(),
-		kgo.SASL(scram.Auth{
-			User: "scramuser",
-			Pass: "scrampass",
-		}.AsSha256Mechanism()),
-	)
-	require.NoError(t, err)
-	defer client.Close()
-
-	results := client.ProduceSync(ctx, &kgo.Record{
-		Topic: "scram-topic",
-		Value: []byte("scram-message"),
-	})
-	require.NoError(t, results[0].Err)
-
-	msgs := capture.waitForMessages(1, 5*time.Second)
-	require.Len(t, msgs, 1)
-	assert.Equal(t, "scram-message", msgs[0].Value)
-}
-
-func TestServerSASLScram512(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	capture := &messageCapture{}
-	_, addr := startTestServer(t, Config{
-		Timeout: 5 * time.Second,
-		SASL: []SASLCredential{
-			{Mechanism: "SCRAM-SHA-512", Username: "scramuser", Password: "scrampass"},
-		},
-	}, captureHandler(capture))
-
-	client, err := kgo.NewClient(
-		kgo.SeedBrokers(addr),
-		kgo.RequestTimeoutOverhead(5*time.Second),
-		kgo.DisableIdempotentWrite(),
-		kgo.SASL(scram.Auth{
-			User: "scramuser",
-			Pass: "scrampass",
-		}.AsSha512Mechanism()),
-	)
-	require.NoError(t, err)
-	defer client.Close()
-
-	results := client.ProduceSync(ctx, &kgo.Record{
-		Topic: "scram-topic",
-		Value: []byte("scram512-message"),
-	})
-	require.NoError(t, results[0].Err)
-
-	msgs := capture.waitForMessages(1, 5*time.Second)
-	require.Len(t, msgs, 1)
-	assert.Equal(t, "scram512-message", msgs[0].Value)
-}
-
-func TestServerSASLScramWrongPassword(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	capture := &messageCapture{}
-	_, addr := startTestServer(t, Config{
-		Timeout: 5 * time.Second,
-		SASL: []SASLCredential{
-			{Mechanism: "SCRAM-SHA-256", Username: "scramuser", Password: "scrampass"},
-		},
-	}, captureHandler(capture))
-
-	client, err := kgo.NewClient(
-		kgo.SeedBrokers(addr),
-		kgo.RequestTimeoutOverhead(5*time.Second),
-		kgo.DisableIdempotentWrite(),
-		kgo.SASL(scram.Auth{
-			User: "scramuser",
-			Pass: "wrongpass",
-		}.AsSha256Mechanism()),
-	)
-	require.NoError(t, err)
-	defer client.Close()
-
-	results := client.ProduceSync(ctx, &kgo.Record{
-		Topic: "scram-topic",
-		Value: []byte("should-fail"),
-	})
-	require.Error(t, results[0].Err)
-
-	time.Sleep(500 * time.Millisecond)
-	msgs := capture.get()
-	assert.Len(t, msgs, 0)
-}
-
-func TestServerMultipleUsers(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	capture := &messageCapture{}
-	_, addr := startTestServer(t, Config{
-		Timeout: 5 * time.Second,
+func TestServerSASLSetup(t *testing.T) {
+	cfg := Config{
+		Address: "127.0.0.1:0",
 		SASL: []SASLCredential{
 			{Mechanism: "PLAIN", Username: "user1", Password: "pass1"},
 			{Mechanism: "PLAIN", Username: "user2", Password: "pass2"},
+			{Mechanism: "SCRAM-SHA-256", Username: "suser", Password: "spass"},
 		},
-	}, captureHandler(capture))
-
-	// User1
-	client1, err := kgo.NewClient(
-		kgo.SeedBrokers(addr),
-		kgo.RequestTimeoutOverhead(5*time.Second),
-		kgo.DisableIdempotentWrite(),
-		kgo.SASL(plain.Auth{User: "user1", Pass: "pass1"}.AsMechanism()),
-	)
-	require.NoError(t, err)
-	defer client1.Close()
-
-	results := client1.ProduceSync(ctx, &kgo.Record{
-		Topic: "user1-topic",
-		Value: []byte(`{"user": "user1"}`),
-	})
-	require.NoError(t, results[0].Err)
-
-	// User2
-	client2, err := kgo.NewClient(
-		kgo.SeedBrokers(addr),
-		kgo.RequestTimeoutOverhead(5*time.Second),
-		kgo.DisableIdempotentWrite(),
-		kgo.SASL(plain.Auth{User: "user2", Pass: "pass2"}.AsMechanism()),
-	)
-	require.NoError(t, err)
-	defer client2.Close()
-
-	results = client2.ProduceSync(ctx, &kgo.Record{
-		Topic: "user2-topic",
-		Value: []byte(`{"user": "user2"}`),
-	})
-	require.NoError(t, results[0].Err)
-
-	msgs := capture.waitForMessages(2, 10*time.Second)
-	require.Len(t, msgs, 2)
-}
-
-func TestServerIdempotentProducer(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	capture := &messageCapture{}
-	_, addr := startTestServer(t, Config{
-		Timeout:         5 * time.Second,
-		IdempotentWrite: true,
-	}, captureHandler(capture))
-
-	client, err := kgo.NewClient(
-		kgo.SeedBrokers(addr),
-		kgo.RequestTimeoutOverhead(5*time.Second),
-		kgo.RequiredAcks(kgo.AllISRAcks()),
-	)
-	require.NoError(t, err)
-	defer client.Close()
-
-	results := client.ProduceSync(ctx, &kgo.Record{
-		Topic: "idempotent-topic",
-		Value: []byte("idempotent-message"),
-	})
-	require.NoError(t, results[0].Err)
-
-	msgs := capture.waitForMessages(1, 5*time.Second)
-	require.Len(t, msgs, 1)
-	assert.Equal(t, "idempotent-message", msgs[0].Value)
-}
-
-func TestServerMessageWithKey(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	capture := &messageCapture{}
-	_, addr := startTestServer(t, Config{
-		Timeout: 5 * time.Second,
-	}, captureHandler(capture))
-
-	client, err := kgo.NewClient(
-		kgo.SeedBrokers(addr),
-		kgo.RequestTimeoutOverhead(5*time.Second),
-		kgo.DisableIdempotentWrite(),
-	)
-	require.NoError(t, err)
-	defer client.Close()
-
-	results := client.ProduceSync(ctx, &kgo.Record{
-		Topic: "key-topic",
-		Key:   []byte("my-key"),
-		Value: []byte(`{"test": "with_key"}`),
-	})
-	require.NoError(t, results[0].Err)
-
-	msgs := capture.waitForMessages(1, 5*time.Second)
-	require.Len(t, msgs, 1)
-	assert.Equal(t, "key-topic", msgs[0].Topic)
-	assert.Equal(t, "my-key", msgs[0].Key)
-	assert.Equal(t, `{"test": "with_key"}`, msgs[0].Value)
-}
-
-func TestServerProtocolApiVersions(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	_, addr := startTestServer(t, Config{
-		Timeout: 5 * time.Second,
-	}, func(context.Context, []*Message) error { return nil })
-
-	conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
-	require.NoError(t, err)
-	defer conn.Close()
-
-	// Send ApiVersions request (apiKey=18, version=0)
-	req := &kmsg.ApiVersionsRequest{Version: 0}
-	reqBuf := req.AppendTo(nil)
-
-	// Build request: apiKey(2) + apiVersion(2) + correlationID(4) + clientID(2 + len)
-	header := make([]byte, 0)
-	header = kbin.AppendInt16(header, int16(kmsg.ApiVersions))
-	header = kbin.AppendInt16(header, 0) // version
-	header = kbin.AppendInt32(header, 1) // correlationID
-	header = kbin.AppendInt16(header, -1) // no clientID
-
-	fullReq := append(header, reqBuf...)
-
-	// Write size prefix + request
-	sizeBuf := kbin.AppendInt32(nil, int32(len(fullReq)))
-	_, err = conn.Write(append(sizeBuf, fullReq...))
-	require.NoError(t, err)
-
-	// Read response
-	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
-	respSizeBuf := make([]byte, 4)
-	_, err = io.ReadFull(conn, respSizeBuf)
-	require.NoError(t, err)
-
-	respSize := int32(binary.BigEndian.Uint32(respSizeBuf))
-	respBuf := make([]byte, respSize)
-	_, err = io.ReadFull(conn, respBuf)
-	require.NoError(t, err)
-
-	// Parse: correlationID(4) + response body
-	require.True(t, len(respBuf) >= 4)
-	corrID := int32(binary.BigEndian.Uint32(respBuf[:4]))
-	assert.Equal(t, int32(1), corrID)
-
-	_ = ctx
-}
-
-func TestServerClose(t *testing.T) {
-	capture := &messageCapture{}
-	srv, _ := startTestServer(t, Config{
-		Timeout: 5 * time.Second,
-	}, captureHandler(capture))
-
-	// Close should not error
-	err := srv.Close(context.Background())
-	assert.NoError(t, err)
-
-	// Double close should not error
-	err = srv.Close(context.Background())
-	assert.NoError(t, err)
-}
-
-func TestServerTLS(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	// Generate CA certificate
-	caKey, err := rsa.GenerateKey(rand.Reader, 2048)
-	require.NoError(t, err)
-
-	caTemplate := x509.Certificate{
-		SerialNumber: big.NewInt(1),
-		Subject: pkix.Name{
-			Organization: []string{"Test CA"},
-			CommonName:   "Test CA",
-		},
-		NotBefore:             time.Now(),
-		NotAfter:              time.Now().Add(24 * time.Hour),
-		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
-		BasicConstraintsValid: true,
-		IsCA:                  true,
 	}
 
-	caCertDER, err := x509.CreateCertificate(rand.Reader, &caTemplate, &caTemplate, &caKey.PublicKey, caKey)
+	srv, err := New(cfg, func(context.Context, []*Message) error { return nil })
 	require.NoError(t, err)
 
-	caCertPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: caCertDER})
+	assert.True(t, srv.saslEnabled)
+	assert.Len(t, srv.saslCredentials["PLAIN"], 2)
+	assert.Equal(t, "pass1", srv.saslCredentials["PLAIN"]["user1"])
+	assert.NotNil(t, srv.scram256Server)
+	assert.Nil(t, srv.scram512Server)
+}
 
-	// Create server certificate
-	serverKey, err := rsa.GenerateKey(rand.Reader, 2048)
+func TestServerAddr(t *testing.T) {
+	srv, err := New(Config{Address: "127.0.0.1:0"}, func(context.Context, []*Message) error { return nil })
 	require.NoError(t, err)
 
-	serverTemplate := x509.Certificate{
-		SerialNumber: big.NewInt(2),
-		Subject: pkix.Name{
-			Organization: []string{"Test Server"},
-			CommonName:   "localhost",
-		},
-		NotBefore:             time.Now(),
-		NotAfter:              time.Now().Add(24 * time.Hour),
-		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
-		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
-		BasicConstraintsValid: true,
-		DNSNames:              []string{"localhost"},
-		IPAddresses:           []net.IP{net.ParseIP("127.0.0.1")},
-	}
-
-	serverCertDER, err := x509.CreateCertificate(rand.Reader, &serverTemplate, &caTemplate, &serverKey.PublicKey, caKey)
-	require.NoError(t, err)
-
-	serverCertPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: serverCertDER})
-	serverKeyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(serverKey)})
-
-	// Write certificates to temp files
-	tmpDir := t.TempDir()
-
-	serverCertFile := tmpDir + "/server-cert.pem"
-	require.NoError(t, os.WriteFile(serverCertFile, serverCertPEM, 0600))
-
-	serverKeyFile := tmpDir + "/server-key.pem"
-	require.NoError(t, os.WriteFile(serverKeyFile, serverKeyPEM, 0600))
-
-	capture := &messageCapture{}
-	port := getFreePort(t)
-	addr := fmt.Sprintf("127.0.0.1:%d", port)
-
-	srv, err := New(Config{
-		Address:  addr,
-		CertFile: serverCertFile,
-		KeyFile:  serverKeyFile,
-		Timeout:  5 * time.Second,
-	}, captureHandler(capture), WithLogger(&testLogger{t}))
-	require.NoError(t, err)
+	// Before Start, Addr should be nil
+	assert.Nil(t, srv.Addr())
 
 	err = srv.Start(context.Background())
 	require.NoError(t, err)
 	defer srv.Close(context.Background())
 
-	waitForTCPReady(t, addr, 5*time.Second)
-
-	// Connect with TLS
-	caCertPool := x509.NewCertPool()
-	caCertPool.AppendCertsFromPEM(caCertPEM)
-
-	tlsConfig := &tls.Config{
-		RootCAs: caCertPool,
-	}
-
-	client, err := kgo.NewClient(
-		kgo.SeedBrokers(addr),
-		kgo.DialTLSConfig(tlsConfig),
-		kgo.RequestTimeoutOverhead(5*time.Second),
-		kgo.DisableIdempotentWrite(),
-	)
-	require.NoError(t, err)
-	defer client.Close()
-
-	results := client.ProduceSync(ctx, &kgo.Record{
-		Topic: "tls-topic",
-		Value: []byte("tls-message"),
-	})
-	require.NoError(t, results[0].Err)
-
-	msgs := capture.waitForMessages(1, 5*time.Second)
-	require.Len(t, msgs, 1)
-	assert.Equal(t, "tls-message", msgs[0].Value)
-}
-
-func TestServerMTLS(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	// Generate CA
-	caKey, err := rsa.GenerateKey(rand.Reader, 2048)
-	require.NoError(t, err)
-
-	caTemplate := x509.Certificate{
-		SerialNumber: big.NewInt(1),
-		Subject: pkix.Name{
-			Organization: []string{"Test CA"},
-			CommonName:   "Test CA",
-		},
-		NotBefore:             time.Now(),
-		NotAfter:              time.Now().Add(24 * time.Hour),
-		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
-		BasicConstraintsValid: true,
-		IsCA:                  true,
-	}
-
-	caCertDER, err := x509.CreateCertificate(rand.Reader, &caTemplate, &caTemplate, &caKey.PublicKey, caKey)
-	require.NoError(t, err)
-	caCertPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: caCertDER})
-
-	// Server cert
-	serverKey, err := rsa.GenerateKey(rand.Reader, 2048)
-	require.NoError(t, err)
-
-	serverTemplate := x509.Certificate{
-		SerialNumber: big.NewInt(2),
-		Subject: pkix.Name{
-			Organization: []string{"Test Server"},
-			CommonName:   "localhost",
-		},
-		NotBefore:             time.Now(),
-		NotAfter:              time.Now().Add(24 * time.Hour),
-		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
-		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
-		BasicConstraintsValid: true,
-		DNSNames:              []string{"localhost"},
-		IPAddresses:           []net.IP{net.ParseIP("127.0.0.1")},
-	}
-
-	serverCertDER, err := x509.CreateCertificate(rand.Reader, &serverTemplate, &caTemplate, &serverKey.PublicKey, caKey)
-	require.NoError(t, err)
-	serverCertPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: serverCertDER})
-	serverKeyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(serverKey)})
-
-	// Client cert
-	clientKey, err := rsa.GenerateKey(rand.Reader, 2048)
-	require.NoError(t, err)
-
-	clientTemplate := x509.Certificate{
-		SerialNumber: big.NewInt(3),
-		Subject: pkix.Name{
-			Organization: []string{"Test Client"},
-			CommonName:   "test-client",
-		},
-		NotBefore:             time.Now(),
-		NotAfter:              time.Now().Add(24 * time.Hour),
-		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
-		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
-		BasicConstraintsValid: true,
-	}
-
-	clientCertDER, err := x509.CreateCertificate(rand.Reader, &clientTemplate, &caTemplate, &clientKey.PublicKey, caKey)
-	require.NoError(t, err)
-	clientCertPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: clientCertDER})
-	clientKeyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(clientKey)})
-
-	// Write certs to temp files
-	tmpDir := t.TempDir()
-	serverCertFile := tmpDir + "/server-cert.pem"
-	require.NoError(t, os.WriteFile(serverCertFile, serverCertPEM, 0600))
-	serverKeyFile := tmpDir + "/server-key.pem"
-	require.NoError(t, os.WriteFile(serverKeyFile, serverKeyPEM, 0600))
-	clientCAFile := tmpDir + "/client-ca.pem"
-	require.NoError(t, os.WriteFile(clientCAFile, caCertPEM, 0600))
-
-	capture := &messageCapture{}
-	port := getFreePort(t)
-	addr := fmt.Sprintf("127.0.0.1:%d", port)
-
-	srv, err := New(Config{
-		Address:      addr,
-		CertFile:     serverCertFile,
-		KeyFile:      serverKeyFile,
-		MTLSAuth:     "require_and_verify",
-		MTLSCAsFiles: []string{clientCAFile},
-		Timeout:      5 * time.Second,
-	}, captureHandler(capture), WithLogger(&testLogger{t}))
-	require.NoError(t, err)
-
-	err = srv.Start(context.Background())
-	require.NoError(t, err)
-	defer srv.Close(context.Background())
-
-	waitForTCPReady(t, addr, 5*time.Second)
-
-	// Test: Client with valid certificate should work
-	t.Run("valid_client_cert", func(t *testing.T) {
-		clientCert, err := tls.X509KeyPair(clientCertPEM, clientKeyPEM)
-		require.NoError(t, err)
-
-		caCertPool := x509.NewCertPool()
-		caCertPool.AppendCertsFromPEM(caCertPEM)
-
-		tlsConfig := &tls.Config{
-			Certificates: []tls.Certificate{clientCert},
-			RootCAs:      caCertPool,
-		}
-
-		client, err := kgo.NewClient(
-			kgo.SeedBrokers(addr),
-			kgo.DialTLSConfig(tlsConfig),
-			kgo.RequestTimeoutOverhead(5*time.Second),
-		kgo.DisableIdempotentWrite(),
-		)
-		require.NoError(t, err)
-		defer client.Close()
-
-		results := client.ProduceSync(ctx, &kgo.Record{
-			Topic: "mtls-topic",
-			Value: []byte("mtls-message"),
-		})
-		require.NoError(t, results[0].Err)
-
-		msgs := capture.waitForMessages(1, 5*time.Second)
-		require.Len(t, msgs, 1)
-		assert.Equal(t, "mtls-message", msgs[0].Value)
-	})
-
-	// Test: Client without certificate should be rejected
-	t.Run("no_client_cert", func(t *testing.T) {
-		caCertPool := x509.NewCertPool()
-		caCertPool.AppendCertsFromPEM(caCertPEM)
-
-		tlsConfig := &tls.Config{
-			RootCAs: caCertPool,
-		}
-
-		client, err := kgo.NewClient(
-			kgo.SeedBrokers(addr),
-			kgo.DialTLSConfig(tlsConfig),
-			kgo.RequestTimeoutOverhead(5*time.Second),
-		kgo.DisableIdempotentWrite(),
-		)
-		require.NoError(t, err)
-		defer client.Close()
-
-		results := client.ProduceSync(ctx, &kgo.Record{
-			Topic: "mtls-fail-topic",
-			Value: []byte("should-fail"),
-		})
-		require.Error(t, results[0].Err)
-	})
-}
-
-func TestServerMaxMessageBytes(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	capture := &messageCapture{}
-	_, addr := startTestServer(t, Config{
-		Timeout:         5 * time.Second,
-		MaxMessageBytes: 100,
-	}, captureHandler(capture))
-
-	client, err := kgo.NewClient(
-		kgo.SeedBrokers(addr),
-		kgo.RequestTimeoutOverhead(5*time.Second),
-		kgo.DisableIdempotentWrite(),
-	)
-	require.NoError(t, err)
-	defer client.Close()
-
-	// Small message should work
-	results := client.ProduceSync(ctx, &kgo.Record{
-		Topic: "test-topic",
-		Value: []byte("small"),
-	})
-	require.NoError(t, results[0].Err)
-
-	msgs := capture.waitForMessages(1, 5*time.Second)
-	require.Len(t, msgs, 1)
+	// After Start, Addr should not be nil
+	assert.NotNil(t, srv.Addr())
 }
 
 func TestServerAdvertisedAddress(t *testing.T) {
@@ -1029,38 +296,100 @@ func TestServerAdvertisedAddress(t *testing.T) {
 	assert.Equal(t, int32(port), metadataResp.Brokers[0].Port)
 }
 
-func TestServerHandlerError(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	// Handler that always returns an error
-	failHandler := func(_ context.Context, _ []*Message) error {
-		return fmt.Errorf("handler error")
-	}
-
+func TestProtocolApiVersions(t *testing.T) {
 	_, addr := startTestServer(t, Config{
 		Timeout: 5 * time.Second,
-	}, failHandler)
+	}, func(context.Context, []*Message) error { return nil })
 
-	client, err := kgo.NewClient(
-		kgo.SeedBrokers(addr),
-		kgo.RequestTimeoutOverhead(5*time.Second),
-		kgo.DisableIdempotentWrite(),
-	)
+	conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
 	require.NoError(t, err)
-	defer client.Close()
+	defer conn.Close()
 
-	results := client.ProduceSync(ctx, &kgo.Record{
-		Topic: "test-topic",
-		Value: []byte("should-get-error-response"),
-	})
-	// The produce should get an error response (UnknownServerError)
-	require.Error(t, results[0].Err)
-	assert.Contains(t, results[0].Err.Error(), kerr.UnknownServerError.Message)
+	// Send ApiVersions request (apiKey=18, version=0)
+	req := &kmsg.ApiVersionsRequest{Version: 0}
+	reqBuf := req.AppendTo(nil)
+
+	// Build request: apiKey(2) + apiVersion(2) + correlationID(4) + clientID(2 + len)
+	header := make([]byte, 0)
+	header = kbin.AppendInt16(header, int16(kmsg.ApiVersions))
+	header = kbin.AppendInt16(header, 0) // version
+	header = kbin.AppendInt32(header, 1) // correlationID
+	header = kbin.AppendInt16(header, -1) // no clientID
+
+	fullReq := append(header, reqBuf...)
+
+	// Write size prefix + request
+	sizeBuf := kbin.AppendInt32(nil, int32(len(fullReq)))
+	_, err = conn.Write(append(sizeBuf, fullReq...))
+	require.NoError(t, err)
+
+	// Read response
+	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	respSizeBuf := make([]byte, 4)
+	_, err = io.ReadFull(conn, respSizeBuf)
+	require.NoError(t, err)
+
+	respSize := int32(binary.BigEndian.Uint32(respSizeBuf))
+	respBuf := make([]byte, respSize)
+	_, err = io.ReadFull(conn, respBuf)
+	require.NoError(t, err)
+
+	// Parse: correlationID(4) + response body
+	require.True(t, len(respBuf) >= 4)
+	corrID := int32(binary.BigEndian.Uint32(respBuf[:4]))
+	assert.Equal(t, int32(1), corrID)
 }
 
-// Ensure unused imports are referenced
-var (
-	_ = bytes.NewBuffer
-	_ = kbin.AppendInt16
-)
+func TestValidateSASLPlain(t *testing.T) {
+	srv, err := New(Config{
+		Address: "127.0.0.1:0",
+		SASL: []SASLCredential{
+			{Mechanism: "PLAIN", Username: "user", Password: "pass"},
+		},
+	}, func(context.Context, []*Message) error { return nil })
+	require.NoError(t, err)
+
+	tests := []struct {
+		name string
+		data []byte
+		want bool
+	}{
+		{
+			name: "valid credentials",
+			data: []byte("\x00user\x00pass"),
+			want: true,
+		},
+		{
+			name: "wrong password",
+			data: []byte("\x00user\x00wrong"),
+			want: false,
+		},
+		{
+			name: "unknown user",
+			data: []byte("\x00nobody\x00pass"),
+			want: false,
+		},
+		{
+			name: "missing separator",
+			data: []byte("userpass"),
+			want: false,
+		},
+		{
+			name: "empty",
+			data: []byte{},
+			want: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			state := &connState{}
+			got := srv.validateSASLPlain(tt.data, state)
+			assert.Equal(t, tt.want, got)
+			if tt.want {
+				assert.True(t, state.authenticated)
+			}
+		})
+	}
+}
+
