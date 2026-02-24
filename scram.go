@@ -1,8 +1,10 @@
 package ksrv
 
 import (
-	"crypto/sha256"
+	"crypto/rand"
+	"encoding/base64"
 	"fmt"
+	"io"
 
 	"github.com/xdg-go/scram"
 )
@@ -15,8 +17,12 @@ func computeScramCredentials(hashGen scram.HashGeneratorFcn, users map[string]st
 		if err != nil {
 			return nil, fmt.Errorf("failed to create SCRAM client for user %s: %w", username, err)
 		}
+		salt, err := randomSalt()
+		if err != nil {
+			return nil, fmt.Errorf("failed to generate salt for user %s: %w", username, err)
+		}
 		kf := scram.KeyFactors{
-			Salt:  deterministicSalt(username, password),
+			Salt:  salt,
 			Iters: 4096,
 		}
 		stored, err := client.GetStoredCredentialsWithError(kf)
@@ -28,10 +34,13 @@ func computeScramCredentials(hashGen scram.HashGeneratorFcn, users map[string]st
 	return creds, nil
 }
 
-// deterministicSalt derives a fixed salt from username and password.
-func deterministicSalt(username, password string) string {
-	h := sha256.Sum256([]byte(username + ":" + password))
-	return string(h[:16])
+// randomSalt generates a random 16-byte salt, base64-encoded.
+func randomSalt() (string, error) {
+	b := make([]byte, 16)
+	if _, err := io.ReadFull(rand.Reader, b); err != nil {
+		return "", err
+	}
+	return base64.StdEncoding.EncodeToString(b), nil
 }
 
 // scramServer wraps a *scram.Server.
