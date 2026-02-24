@@ -43,22 +43,13 @@ func randomSalt() (string, error) {
 	return base64.StdEncoding.EncodeToString(b), nil
 }
 
-// scramServer wraps a *scram.Server.
-type scramServer struct {
-	srv *scram.Server
-}
-
-// newScramServer creates a scramServer with a credential lookup function.
-func newScramServer(hashGen scram.HashGeneratorFcn, credMap map[string]scram.StoredCredentials) (*scramServer, error) {
-	srv, err := hashGen.NewServer(func(username string) (scram.StoredCredentials, error) {
+// newScramServer creates a *scram.Server with a credential lookup function.
+func newScramServer(hashGen scram.HashGeneratorFcn, credMap map[string]scram.StoredCredentials) (*scram.Server, error) {
+	return hashGen.NewServer(func(username string) (scram.StoredCredentials, error) {
 		cred, ok := credMap[username]
 		if !ok {
 			return scram.StoredCredentials{}, fmt.Errorf("unknown user: %s", username)
 		}
 		return cred, nil
 	})
-	if err != nil {
-		return nil, err
-	}
-	return &scramServer{srv: srv}, nil
 }

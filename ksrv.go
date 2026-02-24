@@ -165,8 +165,8 @@ type Server struct {
 	// SASL credentials
 	saslCredentials map[string]map[string]string // mechanism -> username -> password
 	saslEnabled     bool
-	scram256Server  *scramServer
-	scram512Server  *scramServer
+	scram256Server  *scram.Server
+	scram512Server  *scram.Server
 
 	// TLS
 	tlsConfig *tls.Config

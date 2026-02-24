@@ -7,6 +7,7 @@ import (
 	"github.com/twmb/franz-go/pkg/kbin"
 	"github.com/twmb/franz-go/pkg/kerr"
 	"github.com/twmb/franz-go/pkg/kmsg"
+	"github.com/xdg-go/scram"
 )
 
 func (s *Server) handleSaslHandshake(conn net.Conn, connID uint64, correlationID int32, apiVersion int16, req *kmsg.SASLHandshakeRequest, state *connState) error {
@@ -141,7 +142,7 @@ func (s *Server) handleSASLScram(connID uint64, authBytes []byte, state *connSta
 
 	if state.scramConv == nil {
 		// First message - create a new conversation
-		var srv *scramServer
+		var srv *scram.Server
 		switch state.saslMechanism {
 		case "SCRAM-SHA-256":
 			srv = s.scram256Server
@@ -151,7 +152,7 @@ func (s *Server) handleSASLScram(connID uint64, authBytes []byte, state *connSta
 		if srv == nil {
 			return nil, fmt.Errorf("no SCRAM server for mechanism %s", state.saslMechanism)
 		}
-		state.scramConv = srv.srv.NewConversation()
+		state.scramConv = srv.NewConversation()
 	}
 
 	response, err := state.scramConv.Step(clientMsg)

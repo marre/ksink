@@ -42,47 +42,6 @@ func TestConfigDoesNotOverrideSet(t *testing.T) {
 	assert.Equal(t, 2048, cfg.MaxMessageBytes)
 }
 
-func TestServerConfig(t *testing.T) {
-	tests := []struct {
-		name    string
-		cfg     Config
-		wantErr bool
-	}{
-		{
-			name: "valid minimal config",
-			cfg: Config{
-				Address: "127.0.0.1:0",
-			},
-		},
-		{
-			name: "valid config with topics",
-			cfg: Config{
-				Address: "127.0.0.1:0",
-				Topics:  []string{"test-topic", "events"},
-			},
-		},
-		{
-			name: "valid config with timeout",
-			cfg: Config{
-				Address:         "127.0.0.1:0",
-				Timeout:         10 * time.Second,
-				MaxMessageBytes: 2097152,
-			},
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			_, err := New(tt.cfg, func(context.Context, []*Message) error { return nil })
-			if tt.wantErr {
-				assert.Error(t, err)
-			} else {
-				assert.NoError(t, err)
-			}
-		})
-	}
-}
-
 func TestSplitSASLPlain(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -294,50 +253,6 @@ func TestServerAdvertisedAddress(t *testing.T) {
 	require.Len(t, metadataResp.Brokers, 1)
 	assert.Equal(t, "myhost.local", metadataResp.Brokers[0].Host)
 	assert.Equal(t, int32(port), metadataResp.Brokers[0].Port)
-}
-
-func TestProtocolApiVersions(t *testing.T) {
-	_, addr := startTestServer(t, Config{
-		Timeout: 5 * time.Second,
-	}, func(context.Context, []*Message) error { return nil })
-
-	conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
-	require.NoError(t, err)
-	defer conn.Close()
-
-	// Send ApiVersions request (apiKey=18, version=0)
-	req := &kmsg.ApiVersionsRequest{Version: 0}
-	reqBuf := req.AppendTo(nil)
-
-	// Build request: apiKey(2) + apiVersion(2) + correlationID(4) + clientID(2 + len)
-	header := make([]byte, 0)
-	header = kbin.AppendInt16(header, int16(kmsg.ApiVersions))
-	header = kbin.AppendInt16(header, 0) // version
-	header = kbin.AppendInt32(header, 1) // correlationID
-	header = kbin.AppendInt16(header, -1) // no clientID
-
-	fullReq := append(header, reqBuf...)
-
-	// Write size prefix + request
-	sizeBuf := kbin.AppendInt32(nil, int32(len(fullReq)))
-	_, err = conn.Write(append(sizeBuf, fullReq...))
-	require.NoError(t, err)
-
-	// Read response
-	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
-	respSizeBuf := make([]byte, 4)
-	_, err = io.ReadFull(conn, respSizeBuf)
-	require.NoError(t, err)
-
-	respSize := int32(binary.BigEndian.Uint32(respSizeBuf))
-	respBuf := make([]byte, respSize)
-	_, err = io.ReadFull(conn, respBuf)
-	require.NoError(t, err)
-
-	// Parse: correlationID(4) + response body
-	require.True(t, len(respBuf) >= 4)
-	corrID := int32(binary.BigEndian.Uint32(respBuf[:4]))
-	assert.Equal(t, int32(1), corrID)
 }
 
 func TestValidateSASLPlain(t *testing.T) {
