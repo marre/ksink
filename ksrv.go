@@ -24,6 +24,7 @@ import (
 	"github.com/twmb/franz-go/pkg/kerr"
 	"github.com/twmb/franz-go/pkg/kgo"
 	"github.com/twmb/franz-go/pkg/kmsg"
+	"github.com/xdg-go/scram"
 )
 
 // Server configuration constants.
@@ -171,6 +172,8 @@ type Server struct {
 	// SASL credentials
 	saslCredentials map[string]map[string]string // mechanism -> username -> password
 	saslEnabled     bool
+	scram256Server  *scram.Server
+	scram512Server  *scram.Server
 
 	// TLS
 	tlsConfig *tls.Config
@@ -219,6 +222,30 @@ func New(cfg Config, handler Handler, opts ...Option) (*Server, error) {
 		s.saslCredentials[cred.Mechanism][cred.Username] = cred.Password
 	}
 	s.saslEnabled = len(s.saslCredentials) > 0
+
+	// Pre-compute SCRAM servers
+	if users, ok := s.saslCredentials["SCRAM-SHA-256"]; ok {
+		credMap, err := computeScramCredentials(scram.SHA256, users)
+		if err != nil {
+			return nil, fmt.Errorf("failed to compute SCRAM-SHA-256 credentials: %w", err)
+		}
+		srv, err := newScramServer(scram.SHA256, credMap)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create SCRAM-SHA-256 server: %w", err)
+		}
+		s.scram256Server = srv
+	}
+	if users, ok := s.saslCredentials["SCRAM-SHA-512"]; ok {
+		credMap, err := computeScramCredentials(scram.SHA512, users)
+		if err != nil {
+			return nil, fmt.Errorf("failed to compute SCRAM-SHA-512 credentials: %w", err)
+		}
+		srv, err := newScramServer(scram.SHA512, credMap)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create SCRAM-SHA-512 server: %w", err)
+		}
+		s.scram512Server = srv
+	}
 
 	// Set up TLS if configured
 	if cfg.CertFile != "" && cfg.KeyFile != "" {
@@ -375,32 +402,7 @@ func (s *Server) acceptLoop(ctx context.Context) {
 type connState struct {
 	authenticated bool
 	saslMechanism string
-	scramState    *scramServerState
-}
-
-// scramServerState holds server-side SCRAM authentication state.
-type scramServerState struct {
-	mechanism    string
-	username     string
-	password     string
-	nonce        string
-	clientNonce  string
-	salt         []byte
-	iterations   int
-	authMessage  string
-	serverKey    []byte
-	storedKey    []byte
-	clientProof  []byte
-	serverSig    []byte
-	step         int
-	conversation scramConversation
-}
-
-// scramConversation manages the SCRAM authentication flow using xdg-go/scram.
-type scramConversation interface {
-	Step(challenge string) (response string, err error)
-	Valid() bool
-	Done() bool
+	scramConv     *scram.ServerConversation
 }
 
 func (s *Server) handleConnection(ctx context.Context, conn net.Conn, connID uint64) {
@@ -845,131 +847,33 @@ func splitSASLPlain(data []byte) [][]byte {
 }
 
 func (s *Server) handleSASLScram(connID uint64, authBytes []byte, state *connState) ([]byte, error) {
-	if state.scramState == nil {
-		// First message - client-first
-		return s.handleScramClientFirst(connID, authBytes, state)
+	clientMsg := string(authBytes)
+
+	if state.scramConv == nil {
+		// First message - create a new conversation
+		var srv *scram.Server
+		switch state.saslMechanism {
+		case "SCRAM-SHA-256":
+			srv = s.scram256Server
+		case "SCRAM-SHA-512":
+			srv = s.scram512Server
+		}
+		if srv == nil {
+			return nil, fmt.Errorf("no SCRAM server for mechanism %s", state.saslMechanism)
+		}
+		state.scramConv = srv.NewConversation()
 	}
-	// Second message - client-final
-	return s.handleScramClientFinal(connID, authBytes, state)
-}
 
-func (s *Server) handleScramClientFirst(connID uint64, authBytes []byte, state *connState) ([]byte, error) {
-	clientFirst := string(authBytes)
-	s.logger.Debugf("[conn:%d] SCRAM client-first: %s", connID, clientFirst)
-
-	// Parse client-first-message: "n,,n=username,r=nonce"
-	username, clientNonce, err := parseScramClientFirst(clientFirst)
+	response, err := state.scramConv.Step(clientMsg)
 	if err != nil {
-		return nil, fmt.Errorf("invalid SCRAM client-first message: %w", err)
+		return nil, fmt.Errorf("SCRAM step failed: %w", err)
 	}
 
-	// Look up user credentials
-	creds, ok := s.saslCredentials[state.saslMechanism]
-	if !ok {
-		return nil, fmt.Errorf("no credentials for mechanism %s", state.saslMechanism)
+	if state.scramConv.Done() && state.scramConv.Valid() {
+		state.authenticated = true
 	}
 
-	password, ok := creds[username]
-	if !ok {
-		return nil, fmt.Errorf("unknown user: %s", username)
-	}
-
-	// Generate server parameters
-	salt := make([]byte, 16)
-	if _, err := io.ReadFull(randReader, salt); err != nil {
-		return nil, fmt.Errorf("failed to generate salt: %w", err)
-	}
-
-	iterations := 4096
-	serverNonce := clientNonce + generateNonce()
-
-	state.scramState = &scramServerState{
-		mechanism:   state.saslMechanism,
-		username:    username,
-		password:    password,
-		nonce:       serverNonce,
-		clientNonce: clientNonce,
-		salt:        salt,
-		iterations:  iterations,
-		step:        1,
-	}
-
-	// Build server-first-message
-	serverFirst := fmt.Sprintf("r=%s,s=%s,i=%d",
-		serverNonce,
-		base64Encode(salt),
-		iterations)
-
-	// Store for auth message computation
-	clientFirstBare := extractClientFirstBare(clientFirst)
-	state.scramState.authMessage = clientFirstBare + "," + serverFirst
-
-	s.logger.Debugf("[conn:%d] SCRAM server-first: %s", connID, serverFirst)
-	return []byte(serverFirst), nil
-}
-
-func (s *Server) handleScramClientFinal(connID uint64, authBytes []byte, state *connState) ([]byte, error) {
-	clientFinal := string(authBytes)
-	s.logger.Debugf("[conn:%d] SCRAM client-final: %s", connID, clientFinal)
-
-	ss := state.scramState
-
-	// Parse client-final-message: "c=biws,r=nonce,p=proof"
-	channelBinding, nonce, proof, err := parseScramClientFinal(clientFinal)
-	if err != nil {
-		return nil, fmt.Errorf("invalid SCRAM client-final message: %w", err)
-	}
-
-	_ = channelBinding
-
-	// Verify nonce
-	if nonce != ss.nonce {
-		return nil, fmt.Errorf("nonce mismatch")
-	}
-
-	// Compute SCRAM verification
-	var hashName string
-	switch ss.mechanism {
-	case "SCRAM-SHA-256":
-		hashName = "SHA-256"
-	case "SCRAM-SHA-512":
-		hashName = "SHA-512"
-	default:
-		return nil, fmt.Errorf("unsupported SCRAM mechanism: %s", ss.mechanism)
-	}
-
-	// Build the complete auth message
-	clientFinalWithoutProof := extractClientFinalWithoutProof(clientFinal)
-	authMessage := ss.authMessage + "," + clientFinalWithoutProof
-
-	// Compute keys and verify
-	saltedPassword := computeSaltedPassword(hashName, ss.password, ss.salt, ss.iterations)
-	clientKey := computeHMAC(hashName, saltedPassword, []byte("Client Key"))
-	storedKey := computeHash(hashName, clientKey)
-	clientSig := computeHMAC(hashName, storedKey, []byte(authMessage))
-
-	// Verify proof
-	decodedProof, err := base64Decode(proof)
-	if err != nil {
-		return nil, fmt.Errorf("invalid proof encoding: %w", err)
-	}
-
-	recoveredClientKey := xorBytes(decodedProof, clientSig)
-	recoveredStoredKey := computeHash(hashName, recoveredClientKey)
-
-	if !bytesEqual(recoveredStoredKey, storedKey) {
-		return nil, fmt.Errorf("authentication failed: invalid proof")
-	}
-
-	// Compute server signature
-	serverKey := computeHMAC(hashName, saltedPassword, []byte("Server Key"))
-	serverSig := computeHMAC(hashName, serverKey, []byte(authMessage))
-
-	serverFinal := "v=" + base64Encode(serverSig)
-
-	state.authenticated = true
-	s.logger.Debugf("[conn:%d] SCRAM server-final: %s", connID, serverFinal)
-	return []byte(serverFinal), nil
+	return []byte(response), nil
 }
 
 func (s *Server) handleInitProducerId(conn net.Conn, connID uint64, correlationID int32, apiVersion int16, state *connState) error {
