@@ -27,6 +27,9 @@ go.work.sum
 # env file
 .env
 
+# Binary build artifacts
+/example
+
 # Editor/IDE
 # .idea/
 # .vscode/
