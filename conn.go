@@ -1,8 +1,7 @@
-package ksrv
+package ksink
 
 import (
 	"context"
-	"encoding/binary"
 	"fmt"
 	"io"
 	"net"
@@ -79,7 +78,7 @@ func (s *Server) handleConnection(ctx context.Context, conn net.Conn, connID uin
 			return
 		}
 
-		requestSize := int32(binary.BigEndian.Uint32(sizeBuf))
+		requestSize := (&kbin.Reader{Src: sizeBuf}).Int32()
 		s.logger.Debugf("[conn:%d] Request size: %d", connID, requestSize)
 
 		maxRequestSize := int32(s.cfg.MaxMessageBytes*requestSizeMultiplier + protocolOverheadBytes)

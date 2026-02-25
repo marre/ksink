@@ -1,4 +1,4 @@
-package ksrv_test
+package ksink_test
 
 import (
 	"fmt"

@@ -1,9 +1,9 @@
-// Package ksrv provides a lightweight Kafka-protocol-compatible server
+// Package ksink provides a lightweight Kafka-protocol-compatible server
 // that accepts produce requests from Kafka producers.
 //
 // It implements enough of the Kafka protocol to allow standard Kafka producers
 // to connect and send messages, without requiring a full Kafka cluster.
-package ksrv
+package ksink
 
 import (
 	"context"

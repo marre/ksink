@@ -1,4 +1,4 @@
-package ksrv
+package ksink
 
 import (
 	"context"
@@ -73,7 +73,7 @@ func (s *Server) handleMetadata(conn net.Conn, connID uint64, correlationID int3
 			},
 		},
 		ControllerID: 1,
-		ClusterID:    kmsg.StringPtr("ksrv-cluster"),
+		ClusterID:    kmsg.StringPtr("ksink-cluster"),
 	}
 
 	// Build topic list for response using parsed request topics

@@ -17,7 +17,7 @@ import (
 	"sync"
 	"syscall"
 
-	"github.com/marre/ksrv"
+	"github.com/marre/ksink"
 )
 
 type stdLogger struct{}
@@ -53,7 +53,7 @@ func main() {
 	enc := json.NewEncoder(f)
 	var mu sync.Mutex
 
-	handler := func(_ context.Context, msgs []*ksrv.Message) error {
+	handler := func(_ context.Context, msgs []*ksink.Message) error {
 		mu.Lock()
 		defer mu.Unlock()
 
@@ -79,9 +79,9 @@ func main() {
 		return nil
 	}
 
-	srv, err := ksrv.New(ksrv.Config{
+	srv, err := ksink.New(ksink.Config{
 		Address: *addr,
-	}, handler, ksrv.WithLogger(stdLogger{}))
+	}, handler, ksink.WithLogger(stdLogger{}))
 	if err != nil {
 		log.Fatalf("Failed to create server: %v", err)
 	}

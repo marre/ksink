@@ -1,8 +1,7 @@
-package ksrv
+package ksink
 
 import (
 	"context"
-	"encoding/binary"
 	"fmt"
 	"io"
 	"net"
@@ -216,7 +215,7 @@ func TestServerAdvertisedAddress(t *testing.T) {
 	respSizeBuf := make([]byte, 4)
 	_, err = io.ReadFull(conn, respSizeBuf)
 	require.NoError(t, err)
-	respSize := int32(binary.BigEndian.Uint32(respSizeBuf))
+	respSize := (&kbin.Reader{Src: respSizeBuf}).Int32()
 	respBuf := make([]byte, respSize)
 	_, err = io.ReadFull(conn, respBuf)
 	require.NoError(t, err)
@@ -239,7 +238,7 @@ func TestServerAdvertisedAddress(t *testing.T) {
 	respSizeBuf2 := make([]byte, 4)
 	_, err = io.ReadFull(conn, respSizeBuf2)
 	require.NoError(t, err)
-	respSize2 := int32(binary.BigEndian.Uint32(respSizeBuf2))
+	respSize2 := (&kbin.Reader{Src: respSizeBuf2}).Int32()
 	respBuf2 := make([]byte, respSize2)
 	_, err = io.ReadFull(conn, respBuf2)
 	require.NoError(t, err)

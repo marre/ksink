@@ -1,4 +1,4 @@
-module github.com/marre/ksrv
+module github.com/marre/ksink
 
 go 1.24.12
 

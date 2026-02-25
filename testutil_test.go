@@ -1,4 +1,4 @@
-package ksrv
+package ksink
 
 import (
 	"context"

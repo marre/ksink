@@ -1,4 +1,4 @@
-# ksrv
+# ksink
 
 A lightweight Kafka-protocol-compatible server library for Go. It accepts produce requests from standard Kafka producers without requiring a full Kafka cluster.
 
@@ -14,7 +14,7 @@ A lightweight Kafka-protocol-compatible server library for Go. It accepts produc
 ## Installation
 
 ```bash
-go get github.com/marre/ksrv
+go get github.com/marre/ksink
 ```
 
 ## Quick Start
@@ -27,18 +27,18 @@ import (
     "fmt"
     "log"
 
-    "github.com/marre/ksrv"
+    "github.com/marre/ksink"
 )
 
 func main() {
-    handler := func(ctx context.Context, msgs []*ksrv.Message) error {
+    handler := func(ctx context.Context, msgs []*ksink.Message) error {
         for _, msg := range msgs {
             fmt.Printf("topic=%s key=%s value=%s\n", msg.Topic, msg.Key, msg.Value)
         }
         return nil
     }
 
-    srv, err := ksrv.New(ksrv.Config{
+    srv, err := ksink.New(ksink.Config{
         Address: ":9092",
     }, handler)
     if err != nil {
@@ -64,7 +64,7 @@ echo "hello world" | kafka-console-producer.sh --bootstrap-server localhost:9092
 ## Configuration
 
 ```go
-cfg := ksrv.Config{
+cfg := ksink.Config{
     Address:           ":9092",           // Listen address
     AdvertisedAddress: "myhost:9092",     // Address advertised to clients
     Topics:            []string{"events"},// Restrict to specific topics
@@ -72,7 +72,7 @@ cfg := ksrv.Config{
     KeyFile:           "server-key.pem",  // TLS private key
     MTLSAuth:          "require_and_verify",
     MTLSCAsFiles:      []string{"ca.pem"},
-    SASL: []ksrv.SASLCredential{
+    SASL: []ksink.SASLCredential{
         {Mechanism: "PLAIN", Username: "user", Password: "pass"},
     },
     Timeout:         30 * time.Second,

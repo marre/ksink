@@ -1,4 +1,4 @@
-package ksrv_test
+package ksink_test
 
 import (
 	"bytes"
@@ -16,7 +16,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/marre/ksrv"
+	"github.com/marre/ksink"
 )
 
 // --- Shared integration test utilities ---
@@ -115,8 +115,8 @@ func (mc *integrationMessageCapture) waitForCount(count int, timeout time.Durati
 	return false
 }
 
-func integrationCaptureHandler(capture *integrationMessageCapture) ksrv.Handler {
-	return func(_ context.Context, msgs []*ksrv.Message) error {
+func integrationCaptureHandler(capture *integrationMessageCapture) ksink.Handler {
+	return func(_ context.Context, msgs []*ksink.Message) error {
 		for _, msg := range msgs {
 			rm := integrationReceivedMessage{
 				Topic:   msg.Topic,
@@ -305,12 +305,12 @@ type kafkaProducer interface {
 
 // --- Integration test server helper ---
 
-func startIntegrationServer(t *testing.T, port int, cfg ksrv.Config, handler ksrv.Handler) *ksrv.Server {
+func startIntegrationServer(t *testing.T, port int, cfg ksink.Config, handler ksink.Handler) *ksink.Server {
 	t.Helper()
 
 	cfg.Address = fmt.Sprintf("0.0.0.0:%d", port)
 
-	srv, err := ksrv.New(cfg, handler, ksrv.WithLogger(&integrationLogger{t}))
+	srv, err := ksink.New(cfg, handler, ksink.WithLogger(&integrationLogger{t}))
 	require.NoError(t, err)
 
 	err = srv.Start(context.Background())
@@ -332,7 +332,7 @@ func testBasicNoAuth(t *testing.T, client kafkaProducer) {
 	hostAddr := fmt.Sprintf("%s:%d", getHostAddress(), port)
 
 	capture := &integrationMessageCapture{}
-	startIntegrationServer(t, port, ksrv.Config{
+	startIntegrationServer(t, port, ksink.Config{
 		AdvertisedAddress: hostAddr,
 		Timeout:           10 * time.Second,
 	}, integrationCaptureHandler(capture))
@@ -351,7 +351,7 @@ func testMultipleMessages(t *testing.T, client kafkaProducer) {
 	hostAddr := fmt.Sprintf("%s:%d", getHostAddress(), port)
 
 	capture := &integrationMessageCapture{}
-	startIntegrationServer(t, port, ksrv.Config{
+	startIntegrationServer(t, port, ksink.Config{
 		AdvertisedAddress: hostAddr,
 		Timeout:           10 * time.Second,
 	}, integrationCaptureHandler(capture))
@@ -373,10 +373,10 @@ func testSASLPlain(t *testing.T, client kafkaProducer) {
 	hostAddr := fmt.Sprintf("%s:%d", getHostAddress(), port)
 
 	capture := &integrationMessageCapture{}
-	startIntegrationServer(t, port, ksrv.Config{
+	startIntegrationServer(t, port, ksink.Config{
 		AdvertisedAddress: hostAddr,
 		Timeout:           10 * time.Second,
-		SASL: []ksrv.SASLCredential{
+		SASL: []ksink.SASLCredential{
 			{Mechanism: "PLAIN", Username: "testuser", Password: "testpass"},
 		},
 	}, integrationCaptureHandler(capture))
@@ -394,10 +394,10 @@ func testSASLPlainWrongPassword(t *testing.T, client kafkaProducer) {
 	hostAddr := fmt.Sprintf("%s:%d", getHostAddress(), port)
 
 	capture := &integrationMessageCapture{}
-	startIntegrationServer(t, port, ksrv.Config{
+	startIntegrationServer(t, port, ksink.Config{
 		AdvertisedAddress: hostAddr,
 		Timeout:           10 * time.Second,
-		SASL: []ksrv.SASLCredential{
+		SASL: []ksink.SASLCredential{
 			{Mechanism: "PLAIN", Username: "testuser", Password: "testpass"},
 		},
 	}, integrationCaptureHandler(capture))
@@ -414,7 +414,7 @@ func testMessageWithKey(t *testing.T, client kafkaProducer) {
 	hostAddr := fmt.Sprintf("%s:%d", getHostAddress(), port)
 
 	capture := &integrationMessageCapture{}
-	startIntegrationServer(t, port, ksrv.Config{
+	startIntegrationServer(t, port, ksink.Config{
 		AdvertisedAddress: hostAddr,
 		Timeout:           10 * time.Second,
 	}, integrationCaptureHandler(capture))
@@ -434,7 +434,7 @@ func testIdempotentProducer(t *testing.T, client kafkaProducer) {
 	hostAddr := fmt.Sprintf("%s:%d", getHostAddress(), port)
 
 	capture := &integrationMessageCapture{}
-	startIntegrationServer(t, port, ksrv.Config{
+	startIntegrationServer(t, port, ksink.Config{
 		AdvertisedAddress: hostAddr,
 		Timeout:           10 * time.Second,
 		IdempotentWrite:   true,
