@@ -132,6 +132,7 @@ type Logger interface {
 // AckFunc is called to acknowledge processing of a message batch.
 // Pass nil to indicate success (success response sent to the producer).
 // Pass an error to reject the batch (error response sent to the producer).
+// Must be called exactly once per batch. Calling more than once is a no-op.
 type AckFunc func(err error)
 
 // pendingBatch is an internal type that pairs messages with an ack channel.

@@ -18,7 +18,7 @@ import (
 
 type stdLogger struct{}
 
-func (stdLogger) Debugf(string, ...any) {}
+func (stdLogger) Debugf(format string, args ...any) {}
 func (stdLogger) Infof(format string, args ...any)  { log.Printf("[INFO] "+format, args...) }
 func (stdLogger) Warnf(format string, args ...any)  { log.Printf("[WARN] "+format, args...) }
 func (stdLogger) Errorf(format string, args ...any) { log.Printf("[ERROR] "+format, args...) }
