@@ -29,11 +29,10 @@ func TestFranzBasic(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	capture := &messageCapture{}
-
-	_, addr := startTestServer(t, Config{
+	srv, addr := startTestServer(t, Config{
 		Timeout: 5 * time.Second,
-	}, captureHandler(capture))
+	})
+	capture := startReadLoop(t, srv)
 
 	client, err := kgo.NewClient(
 		kgo.SeedBrokers(addr),
@@ -73,10 +72,10 @@ func TestFranzMultipleMessages(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	capture := &messageCapture{}
-	_, addr := startTestServer(t, Config{
+	srv, addr := startTestServer(t, Config{
 		Timeout: 5 * time.Second,
-	}, captureHandler(capture))
+	})
+	capture := startReadLoop(t, srv)
 
 	client, err := kgo.NewClient(
 		kgo.SeedBrokers(addr),
@@ -103,11 +102,11 @@ func TestFranzTopicFiltering(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	capture := &messageCapture{}
-	_, addr := startTestServer(t, Config{
+	srv, addr := startTestServer(t, Config{
 		Timeout: 5 * time.Second,
 		Topics:  []string{"allowed-topic"},
-	}, captureHandler(capture))
+	})
+	capture := startReadLoop(t, srv)
 
 	client, err := kgo.NewClient(
 		kgo.SeedBrokers(addr),
@@ -141,13 +140,13 @@ func TestFranzSASLPlain(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	capture := &messageCapture{}
-	_, addr := startTestServer(t, Config{
+	srv, addr := startTestServer(t, Config{
 		Timeout: 5 * time.Second,
 		SASL: []SASLCredential{
 			{Mechanism: "PLAIN", Username: "user1", Password: "pass1"},
 		},
-	}, captureHandler(capture))
+	})
+	capture := startReadLoop(t, srv)
 
 	// With correct credentials
 	client, err := kgo.NewClient(
@@ -177,13 +176,13 @@ func TestFranzSASLPlainWrongPassword(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	capture := &messageCapture{}
-	_, addr := startTestServer(t, Config{
+	srv, addr := startTestServer(t, Config{
 		Timeout: 5 * time.Second,
 		SASL: []SASLCredential{
 			{Mechanism: "PLAIN", Username: "user1", Password: "pass1"},
 		},
-	}, captureHandler(capture))
+	})
+	capture := startReadLoop(t, srv)
 
 	client, err := kgo.NewClient(
 		kgo.SeedBrokers(addr),
@@ -213,13 +212,13 @@ func TestFranzSASLScram256(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	capture := &messageCapture{}
-	_, addr := startTestServer(t, Config{
+	srv, addr := startTestServer(t, Config{
 		Timeout: 5 * time.Second,
 		SASL: []SASLCredential{
 			{Mechanism: "SCRAM-SHA-256", Username: "scramuser", Password: "scrampass"},
 		},
-	}, captureHandler(capture))
+	})
+	capture := startReadLoop(t, srv)
 
 	client, err := kgo.NewClient(
 		kgo.SeedBrokers(addr),
@@ -248,13 +247,13 @@ func TestFranzSASLScram512(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	capture := &messageCapture{}
-	_, addr := startTestServer(t, Config{
+	srv, addr := startTestServer(t, Config{
 		Timeout: 5 * time.Second,
 		SASL: []SASLCredential{
 			{Mechanism: "SCRAM-SHA-512", Username: "scramuser", Password: "scrampass"},
 		},
-	}, captureHandler(capture))
+	})
+	capture := startReadLoop(t, srv)
 
 	client, err := kgo.NewClient(
 		kgo.SeedBrokers(addr),
@@ -283,13 +282,13 @@ func TestFranzSASLScramWrongPassword(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	capture := &messageCapture{}
-	_, addr := startTestServer(t, Config{
+	srv, addr := startTestServer(t, Config{
 		Timeout: 5 * time.Second,
 		SASL: []SASLCredential{
 			{Mechanism: "SCRAM-SHA-256", Username: "scramuser", Password: "scrampass"},
 		},
-	}, captureHandler(capture))
+	})
+	capture := startReadLoop(t, srv)
 
 	client, err := kgo.NewClient(
 		kgo.SeedBrokers(addr),
@@ -318,14 +317,14 @@ func TestFranzMultipleUsers(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	capture := &messageCapture{}
-	_, addr := startTestServer(t, Config{
+	srv, addr := startTestServer(t, Config{
 		Timeout: 5 * time.Second,
 		SASL: []SASLCredential{
 			{Mechanism: "PLAIN", Username: "user1", Password: "pass1"},
 			{Mechanism: "PLAIN", Username: "user2", Password: "pass2"},
 		},
-	}, captureHandler(capture))
+	})
+	capture := startReadLoop(t, srv)
 
 	// User1
 	client1, err := kgo.NewClient(
@@ -367,11 +366,11 @@ func TestFranzIdempotentProducer(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	capture := &messageCapture{}
-	_, addr := startTestServer(t, Config{
+	srv, addr := startTestServer(t, Config{
 		Timeout:         5 * time.Second,
 		IdempotentWrite: true,
-	}, captureHandler(capture))
+	})
+	capture := startReadLoop(t, srv)
 
 	client, err := kgo.NewClient(
 		kgo.SeedBrokers(addr),
@@ -396,14 +395,12 @@ func TestFranzHandlerError(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	// Handler that always returns an error
-	failHandler := func(_ context.Context, _ []*Message) error {
-		return fmt.Errorf("handler error")
-	}
-
-	_, addr := startTestServer(t, Config{
+	srv, addr := startTestServer(t, Config{
 		Timeout: 5 * time.Second,
-	}, failHandler)
+	})
+
+	// Read loop that always acks with error
+	startFailReadLoop(t, srv, fmt.Errorf("handler error"))
 
 	client, err := kgo.NewClient(
 		kgo.SeedBrokers(addr),
@@ -426,11 +423,11 @@ func TestFranzMaxMessageBytes(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	capture := &messageCapture{}
-	_, addr := startTestServer(t, Config{
+	srv, addr := startTestServer(t, Config{
 		Timeout:         5 * time.Second,
 		MaxMessageBytes: 100,
-	}, captureHandler(capture))
+	})
+	capture := startReadLoop(t, srv)
 
 	client, err := kgo.NewClient(
 		kgo.SeedBrokers(addr),
@@ -520,12 +517,39 @@ func TestFranzTLS(t *testing.T) {
 		CertFile: serverCertFile,
 		KeyFile:  serverKeyFile,
 		Timeout:  5 * time.Second,
-	}, captureHandler(capture), WithLogger(&testLogger{t}))
+	}, WithLogger(&testLogger{t}))
 	require.NoError(t, err)
 
 	err = srv.Start(context.Background())
 	require.NoError(t, err)
 	defer srv.Close(context.Background())
+
+	// Start read loop
+	readCtx, readCancel := context.WithCancel(context.Background())
+	defer readCancel()
+	go func() {
+		for {
+			msgs, ack, err := srv.ReadBatch(readCtx)
+			if err != nil {
+				return
+			}
+			for _, msg := range msgs {
+				rm := receivedMessage{
+					Topic:   msg.Topic,
+					Value:   string(msg.Value),
+					Headers: make(map[string]string),
+				}
+				if msg.Key != nil {
+					rm.Key = string(msg.Key)
+				}
+				for k, v := range msg.Headers {
+					rm.Headers[k] = v
+				}
+				capture.add(rm)
+			}
+			ack(nil)
+		}
+	}()
 
 	waitForTCPReady(t, addr, 5*time.Second)
 
@@ -648,12 +672,39 @@ func TestFranzMTLS(t *testing.T) {
 		MTLSAuth:     "require_and_verify",
 		MTLSCAsFiles: []string{clientCAFile},
 		Timeout:      5 * time.Second,
-	}, captureHandler(capture), WithLogger(&testLogger{t}))
+	}, WithLogger(&testLogger{t}))
 	require.NoError(t, err)
 
 	err = srv.Start(context.Background())
 	require.NoError(t, err)
 	defer srv.Close(context.Background())
+
+	// Start read loop
+	readCtx, readCancel := context.WithCancel(context.Background())
+	defer readCancel()
+	go func() {
+		for {
+			msgs, ack, err := srv.ReadBatch(readCtx)
+			if err != nil {
+				return
+			}
+			for _, msg := range msgs {
+				rm := receivedMessage{
+					Topic:   msg.Topic,
+					Value:   string(msg.Value),
+					Headers: make(map[string]string),
+				}
+				if msg.Key != nil {
+					rm.Key = string(msg.Key)
+				}
+				for k, v := range msg.Headers {
+					rm.Headers[k] = v
+				}
+				capture.add(rm)
+			}
+			ack(nil)
+		}
+	}()
 
 	waitForTCPReady(t, addr, 5*time.Second)
 
@@ -717,10 +768,9 @@ func TestFranzMTLS(t *testing.T) {
 }
 
 func TestFranzClose(t *testing.T) {
-	capture := &messageCapture{}
 	srv, _ := startTestServer(t, Config{
 		Timeout: 5 * time.Second,
-	}, captureHandler(capture))
+	})
 
 	// Close should not error
 	err := srv.Close(context.Background())

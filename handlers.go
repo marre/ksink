@@ -146,37 +146,63 @@ func (s *Server) handleProduce(ctx context.Context, conn net.Conn, connID uint64
 
 	remoteAddr := conn.RemoteAddr().String()
 
-	for _, topicData := range req.Topics {
-		topicResp := kmsg.ProduceResponseTopic{
-			Topic: topicData.Topic,
-		}
+	// First pass: parse all records and track per-partition status
+	type partResult struct {
+		errCode int16
+	}
+	type partKey struct {
+		topicIdx, partIdx int
+	}
+	results := make(map[partKey]partResult)
+	var allMsgs []*Message
 
-		for _, partData := range topicData.Partitions {
-			partResp := kmsg.ProduceResponseTopicPartition{
-				Partition: partData.Partition,
-			}
+	for ti, topicData := range req.Topics {
+		for pi, partData := range topicData.Partitions {
+			key := partKey{ti, pi}
 
 			if !s.isTopicAllowed(topicData.Topic) {
 				s.logger.Warnf("[conn:%d] Rejected produce to disallowed topic: %s", connID, topicData.Topic)
-				partResp.ErrorCode = kerr.UnknownTopicOrPartition.Code
-				topicResp.Partitions = append(topicResp.Partitions, partResp)
+				results[key] = partResult{errCode: kerr.UnknownTopicOrPartition.Code}
 				continue
 			}
 
 			batch, err := s.parseRecords(connID, topicData.Topic, partData.Partition, partData.Records, remoteAddr)
 			if err != nil {
 				s.logger.Errorf("[conn:%d] Failed to parse records for %s/%d: %v", connID, topicData.Topic, partData.Partition, err)
-				partResp.ErrorCode = kerr.CorruptMessage.Code
-				topicResp.Partitions = append(topicResp.Partitions, partResp)
+				results[key] = partResult{errCode: kerr.CorruptMessage.Code}
 				continue
 			}
 
-			if len(batch) > 0 {
-				err = s.handler(ctx, batch)
-				if err != nil {
-					s.logger.Errorf("[conn:%d] Handler error for %s/%d: %v", connID, topicData.Topic, partData.Partition, err)
-					partResp.ErrorCode = kerr.UnknownServerError.Code
-				}
+			results[key] = partResult{}
+			allMsgs = append(allMsgs, batch...)
+		}
+	}
+
+	// Deliver batch via channel and wait for ack
+	var handlerErr error
+	if len(allMsgs) > 0 {
+		handlerErr = s.deliverBatch(ctx, allMsgs)
+		if handlerErr != nil {
+			s.logger.Errorf("[conn:%d] Batch processing error: %v", connID, handlerErr)
+		}
+	}
+
+	// Build response
+	for ti, topicData := range req.Topics {
+		topicResp := kmsg.ProduceResponseTopic{
+			Topic: topicData.Topic,
+		}
+
+		for pi, partData := range topicData.Partitions {
+			partResp := kmsg.ProduceResponseTopicPartition{
+				Partition: partData.Partition,
+			}
+
+			result := results[partKey{ti, pi}]
+			if result.errCode != 0 {
+				partResp.ErrorCode = result.errCode
+			} else if handlerErr != nil {
+				partResp.ErrorCode = kerr.UnknownServerError.Code
 			}
 
 			topicResp.Partitions = append(topicResp.Partitions, partResp)
@@ -190,6 +216,29 @@ func (s *Server) handleProduce(ctx context.Context, conn net.Conn, connID uint64
 	}
 
 	return s.sendResponse(conn, connID, correlationID, resp)
+}
+
+// deliverBatch sends a batch to ReadBatch and waits for the ack.
+func (s *Server) deliverBatch(ctx context.Context, msgs []*Message) error {
+	pending := pendingBatch{
+		messages: msgs,
+		ackCh:    make(chan error, 1),
+	}
+	select {
+	case s.batchCh <- pending:
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-s.shutdownCh:
+		return ErrServerClosed
+	}
+	select {
+	case err := <-pending.ackCh:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-s.shutdownCh:
+		return ErrServerClosed
+	}
 }
 
 func (s *Server) handleInitProducerId(conn net.Conn, connID uint64, correlationID int32, apiVersion int16, state *connState) error {

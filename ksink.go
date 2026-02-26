@@ -9,6 +9,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -19,6 +20,9 @@ import (
 	"github.com/twmb/franz-go/pkg/kgo"
 	"github.com/xdg-go/scram"
 )
+
+// ErrServerClosed is returned by ReadBatch when the server has been closed.
+var ErrServerClosed = errors.New("server closed")
 
 // Server configuration constants.
 const (
@@ -125,11 +129,16 @@ type Logger interface {
 	Errorf(format string, args ...any)
 }
 
-// Handler is the callback for processing received message batches.
-// It is called for each produce request with the batch of messages.
-// Return nil to acknowledge the messages (success response sent to the producer).
-// Return an error to reject the messages (error response sent to the producer).
-type Handler func(ctx context.Context, msgs []*Message) error
+// AckFunc is called to acknowledge processing of a message batch.
+// Pass nil to indicate success (success response sent to the producer).
+// Pass an error to reject the batch (error response sent to the producer).
+type AckFunc func(err error)
+
+// pendingBatch is an internal type that pairs messages with an ack channel.
+type pendingBatch struct {
+	messages []*Message
+	ackCh    chan error
+}
 
 // noopLogger discards all log messages.
 type noopLogger struct{}
@@ -150,10 +159,10 @@ func WithLogger(l Logger) Option {
 }
 
 // Server is a Kafka-protocol-compatible server that accepts produce requests.
+// Use [ReadBatch] to receive message batches from connected producers.
 type Server struct {
-	cfg     Config
-	handler Handler
-	logger  Logger
+	cfg    Config
+	logger Logger
 
 	listener  net.Listener
 	connWG    sync.WaitGroup
@@ -177,6 +186,9 @@ type Server struct {
 	// Decompressor for parsing record batches
 	decompressor kgo.Decompressor
 
+	// Batch delivery channel for ReadBatch
+	batchCh chan pendingBatch
+
 	// Shutdown
 	cancelFn     context.CancelFunc
 	shutdownCh   chan struct{}
@@ -184,17 +196,17 @@ type Server struct {
 	shutdownDone atomic.Bool
 }
 
-// New creates a new [Server] with the given configuration, handler, and options.
-func New(cfg Config, handler Handler, opts ...Option) (*Server, error) {
+// New creates a new [Server] with the given configuration and options.
+func New(cfg Config, opts ...Option) (*Server, error) {
 	cfg.setDefaults()
 
 	s := &Server{
 		cfg:             cfg,
-		handler:         handler,
 		logger:          noopLogger{},
 		allowedTopics:   make(map[string]struct{}),
 		saslCredentials: make(map[string]map[string]string),
 		shutdownCh:      make(chan struct{}),
+		batchCh:         make(chan pendingBatch),
 		decompressor:    kgo.DefaultDecompressor(),
 	}
 
@@ -326,6 +338,29 @@ func (s *Server) Addr() net.Addr {
 		return nil
 	}
 	return s.listener.Addr()
+}
+
+// ReadBatch blocks until a batch of messages is available from a connected
+// producer, or the context is cancelled, or the server is closed.
+//
+// Returns the messages, an [AckFunc] to acknowledge processing, and any error.
+// The caller must call the AckFunc after processing the messages — pass nil to
+// indicate success, or an error to reject the batch.
+func (s *Server) ReadBatch(ctx context.Context) ([]*Message, AckFunc, error) {
+	select {
+	case <-ctx.Done():
+		return nil, nil, ctx.Err()
+	case <-s.shutdownCh:
+		return nil, nil, ErrServerClosed
+	case batch := <-s.batchCh:
+		ack := func(err error) {
+			select {
+			case batch.ackCh <- err:
+			default:
+			}
+		}
+		return batch.messages, ack, nil
+	}
 }
 
 // Close gracefully shuts down the server.

@@ -28,7 +28,7 @@ go.work.sum
 .env
 
 # Binary build artifacts
-/example
+/ksink
 
 # Editor/IDE
 # .idea/

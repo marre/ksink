@@ -1,15 +1,15 @@
 # ksink
 
-A lightweight Kafka-protocol-compatible server library for Go. It accepts produce requests from standard Kafka producers without requiring a full Kafka cluster.
+A lightweight Kafka-protocol-compatible server library and tool for Go. It accepts produce requests from standard Kafka producers without requiring a full Kafka cluster.
 
 ## Features
 
 - Accepts produce requests from any Kafka producer (kafka-console-producer, librdkafka, franz-go, etc.)
+- Pull-based API: call `ReadBatch` to receive messages, then acknowledge
 - SASL authentication (PLAIN, SCRAM-SHA-256, SCRAM-SHA-512)
 - TLS and mutual TLS (mTLS)
 - Topic filtering
 - Idempotent producer support
-- Callback-based message handling
 
 ## Installation
 
@@ -31,27 +31,33 @@ import (
 )
 
 func main() {
-    handler := func(ctx context.Context, msgs []*ksink.Message) error {
-        for _, msg := range msgs {
-            fmt.Printf("topic=%s key=%s value=%s\n", msg.Topic, msg.Key, msg.Value)
-        }
-        return nil
-    }
-
     srv, err := ksink.New(ksink.Config{
         Address: ":9092",
-    }, handler)
+    })
     if err != nil {
         log.Fatal(err)
     }
 
-    if err := srv.Start(context.Background()); err != nil {
+    ctx := context.Background()
+    if err := srv.Start(ctx); err != nil {
         log.Fatal(err)
     }
-    defer srv.Close(context.Background())
+    defer srv.Close(ctx)
 
     log.Printf("Listening on %s", srv.Addr())
-    select {} // Block forever
+
+    for {
+        msgs, ack, err := srv.ReadBatch(ctx)
+        if err != nil {
+            log.Fatal(err)
+        }
+
+        for _, msg := range msgs {
+            fmt.Printf("topic=%s key=%s value=%s\n", msg.Topic, msg.Key, msg.Value)
+        }
+
+        ack(nil) // acknowledge successful processing
+    }
 }
 ```
 
@@ -82,10 +88,10 @@ cfg := ksink.Config{
 }
 ```
 
-## Example
+## ksink Tool
 
-See [cmd/example](cmd/example) for a complete example that writes all received messages to a JSONL file.
+The `cmd/ksink` tool writes all received messages to a JSONL file:
 
 ```bash
-go run ./cmd/example -addr :9092 -output messages.jsonl
+go run ./cmd/ksink --addr :9092 --output messages.jsonl
 ```

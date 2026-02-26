@@ -115,7 +115,7 @@ func TestIsTopicAllowed(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			cfg := Config{Address: "127.0.0.1:0", Topics: tt.topics}
-			srv, err := New(cfg, func(context.Context, []*Message) error { return nil })
+			srv, err := New(cfg)
 			require.NoError(t, err)
 			assert.Equal(t, tt.allowed, srv.isTopicAllowed(tt.check))
 		})
@@ -146,7 +146,7 @@ func TestServerSASLSetup(t *testing.T) {
 		},
 	}
 
-	srv, err := New(cfg, func(context.Context, []*Message) error { return nil })
+	srv, err := New(cfg)
 	require.NoError(t, err)
 
 	assert.True(t, srv.saslEnabled)
@@ -157,7 +157,7 @@ func TestServerSASLSetup(t *testing.T) {
 }
 
 func TestServerAddr(t *testing.T) {
-	srv, err := New(Config{Address: "127.0.0.1:0"}, func(context.Context, []*Message) error { return nil })
+	srv, err := New(Config{Address: "127.0.0.1:0"})
 	require.NoError(t, err)
 
 	// Before Start, Addr should be nil
@@ -172,7 +172,6 @@ func TestServerAddr(t *testing.T) {
 }
 
 func TestServerAdvertisedAddress(t *testing.T) {
-	capture := &messageCapture{}
 	port := getFreePort(t)
 
 	cfg := Config{
@@ -181,12 +180,15 @@ func TestServerAdvertisedAddress(t *testing.T) {
 		Timeout:           5 * time.Second,
 	}
 
-	srv, err := New(cfg, captureHandler(capture), WithLogger(&testLogger{t}))
+	srv, err := New(cfg, WithLogger(&testLogger{t}))
 	require.NoError(t, err)
 
 	err = srv.Start(context.Background())
 	require.NoError(t, err)
 	defer srv.Close(context.Background())
+
+	// Start a read loop so produce requests don't block
+	startReadLoop(t, srv)
 
 	addr := srv.Addr().String()
 	waitForTCPReady(t, addr, 5*time.Second)
@@ -260,7 +262,7 @@ func TestValidateSASLPlain(t *testing.T) {
 		SASL: []SASLCredential{
 			{Mechanism: "PLAIN", Username: "user", Password: "pass"},
 		},
-	}, func(context.Context, []*Message) error { return nil })
+	})
 	require.NoError(t, err)
 
 	tests := []struct {
@@ -305,5 +307,34 @@ func TestValidateSASLPlain(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestReadBatchContextCancelled(t *testing.T) {
+	srv, err := New(Config{Address: "127.0.0.1:0"})
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // cancel immediately
+
+	msgs, ack, err := srv.ReadBatch(ctx)
+	assert.Nil(t, msgs)
+	assert.Nil(t, ack)
+	assert.ErrorIs(t, err, context.Canceled)
+}
+
+func TestReadBatchServerClosed(t *testing.T) {
+	srv, err := New(Config{Address: "127.0.0.1:0"})
+	require.NoError(t, err)
+
+	err = srv.Start(context.Background())
+	require.NoError(t, err)
+
+	// Close the server
+	srv.Close(context.Background())
+
+	msgs, ack, err := srv.ReadBatch(context.Background())
+	assert.Nil(t, msgs)
+	assert.Nil(t, ack)
+	assert.ErrorIs(t, err, ErrServerClosed)
 }
 

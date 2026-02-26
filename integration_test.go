@@ -115,24 +115,37 @@ func (mc *integrationMessageCapture) waitForCount(count int, timeout time.Durati
 	return false
 }
 
-func integrationCaptureHandler(capture *integrationMessageCapture) ksink.Handler {
-	return func(_ context.Context, msgs []*ksink.Message) error {
-		for _, msg := range msgs {
-			rm := integrationReceivedMessage{
-				Topic:   msg.Topic,
-				Value:   string(msg.Value),
-				Headers: make(map[string]string),
+func integrationStartReadLoop(t *testing.T, srv *ksink.Server) *integrationMessageCapture {
+	t.Helper()
+	capture := &integrationMessageCapture{}
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	go func() {
+		for {
+			msgs, ack, err := srv.ReadBatch(ctx)
+			if err != nil {
+				return
 			}
-			if msg.Key != nil {
-				rm.Key = string(msg.Key)
+			for _, msg := range msgs {
+				rm := integrationReceivedMessage{
+					Topic:   msg.Topic,
+					Value:   string(msg.Value),
+					Headers: make(map[string]string),
+				}
+				if msg.Key != nil {
+					rm.Key = string(msg.Key)
+				}
+				for k, v := range msg.Headers {
+					rm.Headers[k] = v
+				}
+				capture.add(rm)
 			}
-			for k, v := range msg.Headers {
-				rm.Headers[k] = v
-			}
-			capture.add(rm)
+			ack(nil)
 		}
-		return nil
-	}
+	}()
+
+	return capture
 }
 
 // --- Integration test logger ---
@@ -148,7 +161,27 @@ func (l *integrationLogger) Errorf(format string, args ...any) {
 	l.t.Logf("[ERROR] "+format, args...)
 }
 
-// --- Docker container helpers ---
+// --- Integration test server helper ---
+
+func startIntegrationServer(t *testing.T, port int, cfg ksink.Config) *integrationMessageCapture {
+	t.Helper()
+
+	cfg.Address = fmt.Sprintf("0.0.0.0:%d", port)
+
+	srv, err := ksink.New(cfg, ksink.WithLogger(&integrationLogger{t}))
+	require.NoError(t, err)
+
+	err = srv.Start(context.Background())
+	require.NoError(t, err)
+
+	integrationWaitForTCPReady(t, fmt.Sprintf("127.0.0.1:%d", port), 5*time.Second)
+
+	t.Cleanup(func() {
+		srv.Close(context.Background())
+	})
+
+	return integrationStartReadLoop(t, srv)
+}
 
 func newDockerPool(t *testing.T) *dockertest.Pool {
 	t.Helper()
@@ -305,25 +338,7 @@ type kafkaProducer interface {
 
 // --- Integration test server helper ---
 
-func startIntegrationServer(t *testing.T, port int, cfg ksink.Config, handler ksink.Handler) *ksink.Server {
-	t.Helper()
-
-	cfg.Address = fmt.Sprintf("0.0.0.0:%d", port)
-
-	srv, err := ksink.New(cfg, handler, ksink.WithLogger(&integrationLogger{t}))
-	require.NoError(t, err)
-
-	err = srv.Start(context.Background())
-	require.NoError(t, err)
-
-	integrationWaitForTCPReady(t, fmt.Sprintf("127.0.0.1:%d", port), 5*time.Second)
-
-	t.Cleanup(func() {
-		srv.Close(context.Background())
-	})
-
-	return srv
-}
+// (Defined above: startIntegrationServer)
 
 // --- Shared integration test cases ---
 
@@ -331,11 +346,10 @@ func testBasicNoAuth(t *testing.T, client kafkaProducer) {
 	port := getIntegrationFreePort(t)
 	hostAddr := fmt.Sprintf("%s:%d", getHostAddress(), port)
 
-	capture := &integrationMessageCapture{}
-	startIntegrationServer(t, port, ksink.Config{
+	capture := startIntegrationServer(t, port, ksink.Config{
 		AdvertisedAddress: hostAddr,
 		Timeout:           10 * time.Second,
-	}, integrationCaptureHandler(capture))
+	})
 
 	err := client.produceMessage(hostAddr, "test-topic", `{"hello": "world"}`)
 	require.NoError(t, err)
@@ -350,11 +364,10 @@ func testMultipleMessages(t *testing.T, client kafkaProducer) {
 	port := getIntegrationFreePort(t)
 	hostAddr := fmt.Sprintf("%s:%d", getHostAddress(), port)
 
-	capture := &integrationMessageCapture{}
-	startIntegrationServer(t, port, ksink.Config{
+	capture := startIntegrationServer(t, port, ksink.Config{
 		AdvertisedAddress: hostAddr,
 		Timeout:           10 * time.Second,
-	}, integrationCaptureHandler(capture))
+	})
 
 	messages := []string{
 		`{"msg": 1}`,
@@ -372,14 +385,13 @@ func testSASLPlain(t *testing.T, client kafkaProducer) {
 	port := getIntegrationFreePort(t)
 	hostAddr := fmt.Sprintf("%s:%d", getHostAddress(), port)
 
-	capture := &integrationMessageCapture{}
-	startIntegrationServer(t, port, ksink.Config{
+	capture := startIntegrationServer(t, port, ksink.Config{
 		AdvertisedAddress: hostAddr,
 		Timeout:           10 * time.Second,
 		SASL: []ksink.SASLCredential{
 			{Mechanism: "PLAIN", Username: "testuser", Password: "testpass"},
 		},
-	}, integrationCaptureHandler(capture))
+	})
 
 	err := client.produceWithSASLPlain(hostAddr, "sasl-topic", `{"auth": "plain"}`, "testuser", "testpass")
 	require.NoError(t, err)
@@ -393,14 +405,13 @@ func testSASLPlainWrongPassword(t *testing.T, client kafkaProducer) {
 	port := getIntegrationFreePort(t)
 	hostAddr := fmt.Sprintf("%s:%d", getHostAddress(), port)
 
-	capture := &integrationMessageCapture{}
-	startIntegrationServer(t, port, ksink.Config{
+	capture := startIntegrationServer(t, port, ksink.Config{
 		AdvertisedAddress: hostAddr,
 		Timeout:           10 * time.Second,
 		SASL: []ksink.SASLCredential{
 			{Mechanism: "PLAIN", Username: "testuser", Password: "testpass"},
 		},
-	}, integrationCaptureHandler(capture))
+	})
 
 	err := client.produceWithSASLPlainExpectFailure(hostAddr, "fail-topic", `{"should": "fail"}`, "testuser", "wrongpass")
 	assert.Error(t, err)
@@ -413,11 +424,10 @@ func testMessageWithKey(t *testing.T, client kafkaProducer) {
 	port := getIntegrationFreePort(t)
 	hostAddr := fmt.Sprintf("%s:%d", getHostAddress(), port)
 
-	capture := &integrationMessageCapture{}
-	startIntegrationServer(t, port, ksink.Config{
+	capture := startIntegrationServer(t, port, ksink.Config{
 		AdvertisedAddress: hostAddr,
 		Timeout:           10 * time.Second,
-	}, integrationCaptureHandler(capture))
+	})
 
 	err := client.produceMessageWithKey(hostAddr, "key-topic", "my-key", `{"test": "with_key"}`)
 	require.NoError(t, err)
@@ -433,12 +443,11 @@ func testIdempotentProducer(t *testing.T, client kafkaProducer) {
 	port := getIntegrationFreePort(t)
 	hostAddr := fmt.Sprintf("%s:%d", getHostAddress(), port)
 
-	capture := &integrationMessageCapture{}
-	startIntegrationServer(t, port, ksink.Config{
+	capture := startIntegrationServer(t, port, ksink.Config{
 		AdvertisedAddress: hostAddr,
 		Timeout:           10 * time.Second,
 		IdempotentWrite:   true,
-	}, integrationCaptureHandler(capture))
+	})
 
 	err := client.produceMessageIdempotent(hostAddr, "idempotent-topic", `{"idempotent": true}`)
 	require.NoError(t, err)

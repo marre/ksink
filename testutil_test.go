@@ -86,35 +86,14 @@ func (mc *messageCapture) waitForMessages(count int, timeout time.Duration) []re
 	return mc.get()
 }
 
-// captureHandler creates a Handler that captures messages into a messageCapture.
-func captureHandler(capture *messageCapture) Handler {
-	return func(_ context.Context, msgs []*Message) error {
-		for _, msg := range msgs {
-			rm := receivedMessage{
-				Topic:   msg.Topic,
-				Value:   string(msg.Value),
-				Headers: make(map[string]string),
-			}
-			if msg.Key != nil {
-				rm.Key = string(msg.Key)
-			}
-			for k, v := range msg.Headers {
-				rm.Headers[k] = v
-			}
-			capture.add(rm)
-		}
-		return nil
-	}
-}
-
 // startTestServer creates and starts a server for testing, returning the server and its address.
-func startTestServer(t *testing.T, cfg Config, handler Handler) (*Server, string) {
+func startTestServer(t *testing.T, cfg Config) (*Server, string) {
 	t.Helper()
 
 	port := getFreePort(t)
 	cfg.Address = fmt.Sprintf("127.0.0.1:%d", port)
 
-	srv, err := New(cfg, handler, WithLogger(&testLogger{t}))
+	srv, err := New(cfg, WithLogger(&testLogger{t}))
 	require.NoError(t, err)
 
 	err = srv.Start(context.Background())
@@ -128,4 +107,57 @@ func startTestServer(t *testing.T, cfg Config, handler Handler) (*Server, string
 	})
 
 	return srv, addr
+}
+
+// startReadLoop starts a goroutine that reads batches from the server and
+// captures messages. It acknowledges each batch with nil (success).
+func startReadLoop(t *testing.T, srv *Server) *messageCapture {
+	t.Helper()
+	capture := &messageCapture{}
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	go func() {
+		for {
+			msgs, ack, err := srv.ReadBatch(ctx)
+			if err != nil {
+				return
+			}
+			for _, msg := range msgs {
+				rm := receivedMessage{
+					Topic:   msg.Topic,
+					Value:   string(msg.Value),
+					Headers: make(map[string]string),
+				}
+				if msg.Key != nil {
+					rm.Key = string(msg.Key)
+				}
+				for k, v := range msg.Headers {
+					rm.Headers[k] = v
+				}
+				capture.add(rm)
+			}
+			ack(nil)
+		}
+	}()
+
+	return capture
+}
+
+// startFailReadLoop starts a goroutine that reads batches from the server
+// and always acknowledges with the given error.
+func startFailReadLoop(t *testing.T, srv *Server, ackErr error) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	go func() {
+		for {
+			_, ack, err := srv.ReadBatch(ctx)
+			if err != nil {
+				return
+			}
+			ack(ackErr)
+		}
+	}()
 }
