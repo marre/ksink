@@ -99,6 +99,16 @@ go run ./cmd/ksink --addr :9092 --output messages.jsonl
 # Send JSON lines over a TCP client socket
 go run ./cmd/ksink --addr :9092 --output tcp://host:port
 
+# Send JSON lines over a TLS-encrypted TCP connection
+go run ./cmd/ksink --addr :9092 --output tls://host:port --output-tls-ca ca.pem
+
+# TLS with mTLS client authentication
+go run ./cmd/ksink --addr :9092 --output tls://host:port \
+  --output-tls-ca ca.pem --output-tls-cert client.pem --output-tls-key client-key.pem
+
 # Send messages over a nanomsg PUSH socket
 go run ./cmd/ksink --addr :9092 --output nanomsg://tcp://host:port
+
+# Send messages over a nanomsg PUSH socket with TLS
+go run ./cmd/ksink --addr :9092 --output nanomsg://tls+tcp://host:port --output-tls-ca ca.pem
 ```
