@@ -90,8 +90,15 @@ cfg := ksink.Config{
 
 ## ksink Tool
 
-The `cmd/ksink` tool writes all received messages to a JSONL file:
+The `cmd/ksink` tool forwards received messages to an output sink:
 
 ```bash
+# Write JSON lines to a file (default)
 go run ./cmd/ksink --addr :9092 --output messages.jsonl
+
+# Send JSON lines over a TCP client socket
+go run ./cmd/ksink --addr :9092 --output tcp://host:port
+
+# Send messages over a nanomsg PUSH socket
+go run ./cmd/ksink --addr :9092 --output nanomsg://tcp://host:port
 ```
