@@ -246,13 +246,21 @@ func TestOutputFile(t *testing.T) {
 	startReadWriteLoop(t, srv, w)
 	produceMessages(t, ctx, kafkaAddr, 3)
 
-	// Allow time for messages to be written to file
-	time.Sleep(2 * time.Second)
+	// Poll until the file has the expected number of lines
+	var lines []string
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		data, err := os.ReadFile(outputFile)
+		if err == nil {
+			lines = splitJSONLines(data)
+			if len(lines) >= 3 {
+				break
+			}
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
 
-	data, err := os.ReadFile(outputFile)
-	require.NoError(t, err)
-
-	verifyMessages(t, splitJSONLines(data), 3)
+	verifyMessages(t, lines, 3)
 }
 
 func TestOutputTCP(t *testing.T) {
