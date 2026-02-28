@@ -102,7 +102,7 @@ type fileWriter struct {
 }
 
 func newFileWriter(path string) (*fileWriter, error) {
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open output file: %w", err)
 	}
@@ -198,7 +198,7 @@ func openWriter(output string, tlsCfg *tls.Config) (writer, error) {
 		return newTCPWriter(addr, tlsCfg)
 	case strings.HasPrefix(output, "tcp://"):
 		addr := strings.TrimPrefix(output, "tcp://")
-		return newTCPWriter(addr, tlsCfg)
+		return newTCPWriter(addr, nil)
 	case strings.HasPrefix(output, "nanomsg://"):
 		url := strings.TrimPrefix(output, "nanomsg://")
 		return newNanomsgWriter(url, tlsCfg)
