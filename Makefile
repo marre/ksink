@@ -1,4 +1,4 @@
-.PHONY: build test vet lint clean
+.PHONY: build test vet clean
 
 build:
 	go build ./...
