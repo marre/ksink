@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/marre/ksink/internal/output"
 	"github.com/stretchr/testify/require"
 )
 
@@ -36,7 +37,7 @@ func TestOutputTCP(t *testing.T) {
 		}
 	}()
 
-	w, err := openWriter(fmt.Sprintf("tcp://%s", tcpAddr), nil)
+	w, err := output.Open(fmt.Sprintf("tcp://%s", tcpAddr), nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { w.Close() })
 
@@ -98,7 +99,7 @@ func TestOutputTCPTLS(t *testing.T) {
 		RootCAs:    ca.certPool(t),
 		MinVersion: tls.VersionTLS12,
 	}
-	w, err := openWriter(fmt.Sprintf("tls://%s", tcpAddr), clientTLS)
+	w, err := output.Open(fmt.Sprintf("tls://%s", tcpAddr), clientTLS)
 	require.NoError(t, err)
 	t.Cleanup(func() { w.Close() })
 
