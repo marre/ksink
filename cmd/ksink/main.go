@@ -15,6 +15,13 @@ import (
 	"github.com/spf13/cobra"
 )
 
+// Set via ldflags at build time by goreleaser.
+var (
+	version = "dev"
+	commit  = "none"
+	date    = "unknown"
+)
+
 type stdLogger struct{}
 
 func (stdLogger) Debugf(format string, args ...any) {}
@@ -42,8 +49,9 @@ func main() {
 	)
 
 	rootCmd := &cobra.Command{
-		Use:   "ksink",
-		Short: "A lightweight Kafka-protocol-compatible message sink",
+		Use:     "ksink",
+		Short:   "A lightweight Kafka-protocol-compatible message sink",
+		Version: fmt.Sprintf("%s (commit=%s, date=%s)", version, commit, date),
 		Long: `ksink accepts produce requests from Kafka producers and forwards
 received messages to an output sink.
 

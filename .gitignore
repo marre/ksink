@@ -30,6 +30,9 @@ go.work.sum
 # Binary build artifacts
 /ksink
 
+# GoReleaser
+/dist
+
 # Editor/IDE
 # .idea/
 # .vscode/

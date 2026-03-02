@@ -1,0 +1,108 @@
+version: 2
+
+project_name: ksink
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - main: ./cmd/ksink
+    binary: ksink
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w
+      - -X main.version={{.Version}}
+      - -X main.commit={{.Commit}}
+      - -X main.date={{.Date}}
+
+archives:
+  - format: tar.gz
+    format_overrides:
+      - goos: windows
+        format: zip
+
+checksum:
+  name_template: checksums.txt
+
+signs:
+  - cmd: cosign
+    certificate: "${artifact}.pem"
+    args:
+      - sign-blob
+      - --output-certificate=${certificate}
+      - --output-signature=${signature}
+      - ${artifact}
+      - --yes
+    artifacts: checksum
+    output: true
+
+docker_signs:
+  - cmd: cosign
+    artifacts: all
+    output: true
+    args:
+      - sign
+      - ${artifact}
+      - --yes
+
+dockers:
+  - image_templates:
+      - "ghcr.io/marre/ksink:{{ .Version }}-amd64"
+    use: buildx
+    build_flag_templates:
+      - --platform=linux/amd64
+      - --label=org.opencontainers.image.title={{ .ProjectName }}
+      - --label=org.opencontainers.image.description=A lightweight Kafka-protocol-compatible message sink
+      - --label=org.opencontainers.image.url=https://github.com/marre/ksink
+      - --label=org.opencontainers.image.source=https://github.com/marre/ksink
+      - --label=org.opencontainers.image.version={{ .Version }}
+      - --label=org.opencontainers.image.created={{ .Date }}
+      - --label=org.opencontainers.image.revision={{ .FullCommit }}
+    dockerfile: Dockerfile
+    goarch: amd64
+  - image_templates:
+      - "ghcr.io/marre/ksink:{{ .Version }}-arm64"
+    use: buildx
+    build_flag_templates:
+      - --platform=linux/arm64
+      - --label=org.opencontainers.image.title={{ .ProjectName }}
+      - --label=org.opencontainers.image.description=A lightweight Kafka-protocol-compatible message sink
+      - --label=org.opencontainers.image.url=https://github.com/marre/ksink
+      - --label=org.opencontainers.image.source=https://github.com/marre/ksink
+      - --label=org.opencontainers.image.version={{ .Version }}
+      - --label=org.opencontainers.image.created={{ .Date }}
+      - --label=org.opencontainers.image.revision={{ .FullCommit }}
+    dockerfile: Dockerfile
+    goarch: arm64
+
+docker_manifests:
+  - name_template: "ghcr.io/marre/ksink:{{ .Version }}"
+    image_templates:
+      - "ghcr.io/marre/ksink:{{ .Version }}-amd64"
+      - "ghcr.io/marre/ksink:{{ .Version }}-arm64"
+  - name_template: "ghcr.io/marre/ksink:latest"
+    image_templates:
+      - "ghcr.io/marre/ksink:{{ .Version }}-amd64"
+      - "ghcr.io/marre/ksink:{{ .Version }}-arm64"
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^ci:"
+
+release:
+  github:
+    owner: marre
+    name: ksink
