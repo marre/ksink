@@ -44,6 +44,9 @@ func (o *TLSOpts) BuildTLSConfig() (*tls.Config, error) {
 	}
 
 	// Client certificate for mTLS
+	if (o.CertFile != "") != (o.KeyFile != "") {
+		return nil, fmt.Errorf("both --output-tls-cert and --output-tls-key must be provided for mTLS")
+	}
 	if o.CertFile != "" && o.KeyFile != "" {
 		cert, err := tls.LoadX509KeyPair(o.CertFile, o.KeyFile)
 		if err != nil {
