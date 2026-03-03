@@ -166,6 +166,7 @@ type Server struct {
 	logger Logger
 
 	listener  net.Listener
+	acceptWG  sync.WaitGroup
 	connWG    sync.WaitGroup
 	connCount atomic.Uint64
 
@@ -327,7 +328,11 @@ func (s *Server) Start(ctx context.Context) error {
 
 	s.logger.Infof("Kafka server listening on %s", s.listener.Addr().String())
 
-	go s.acceptLoop(ctx)
+	s.acceptWG.Add(1)
+	go func() {
+		defer s.acceptWG.Done()
+		s.acceptLoop(ctx)
+	}()
 
 	return nil
 }
@@ -381,6 +386,10 @@ func (s *Server) Close(ctx context.Context) error {
 	if s.listener != nil {
 		s.listener.Close()
 	}
+
+	// Wait for accept loop to exit before waiting on connections,
+	// so no new connWG.Add(1) calls race with connWG.Wait().
+	s.acceptWG.Wait()
 
 	// Wait for connections to finish with timeout
 	done := make(chan struct{})

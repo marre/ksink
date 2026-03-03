@@ -34,17 +34,18 @@ func newKafkaDockerClient(t *testing.T) *kafkaDockerClient {
 
 func (c *kafkaDockerClient) produceMessage(brokerAddr, topic, value string) error {
 	encodedValue := base64.StdEncoding.EncodeToString([]byte(value))
+	propFile := fmt.Sprintf("/tmp/producer-%s.properties", topic)
 	cmd := []string{
 		"bash", "-c",
-		fmt.Sprintf(`cat > /tmp/producer.properties << 'PROPEOF'
+		fmt.Sprintf(`cat > %s << 'PROPEOF'
 enable.idempotence=false
 request.timeout.ms=5000
 delivery.timeout.ms=10000
 acks=1
 retries=0
 PROPEOF
-timeout 30 bash -c "echo %s | base64 -d | /opt/kafka/bin/kafka-console-producer.sh --bootstrap-server %s --topic %s --producer.config /tmp/producer.properties" 2>&1`,
-			encodedValue, brokerAddr, topic),
+timeout 30 bash -c "echo %s | base64 -d | /opt/kafka/bin/kafka-console-producer.sh --bootstrap-server %s --topic %s --producer.config %s" 2>&1`,
+			propFile, encodedValue, brokerAddr, topic, propFile),
 	}
 	return c.runProduce(fmt.Sprintf("message to %s topic=%s", brokerAddr, topic), cmd)
 }
@@ -52,34 +53,38 @@ timeout 30 bash -c "echo %s | base64 -d | /opt/kafka/bin/kafka-console-producer.
 func (c *kafkaDockerClient) produceMessageWithKey(brokerAddr, topic, key, value string) error {
 	encodedKey := base64.StdEncoding.EncodeToString([]byte(key))
 	encodedValue := base64.StdEncoding.EncodeToString([]byte(value))
+	propFile := fmt.Sprintf("/tmp/producer-%s.properties", topic)
 
 	cmd := []string{
 		"bash", "-c",
-		fmt.Sprintf(`cat > /tmp/producer.properties << 'PROPEOF'
+		fmt.Sprintf(`cat > %s << 'PROPEOF'
 enable.idempotence=false
 request.timeout.ms=5000
 delivery.timeout.ms=10000
 acks=1
 retries=0
 PROPEOF
-timeout 30 bash -c "printf '%%s\t%%s\n' "\$(echo %s | base64 -d)" "\$(echo %s | base64 -d)" | /opt/kafka/bin/kafka-console-producer.sh --bootstrap-server %s --topic %s --property parse.key=true --property 'key.separator=	' --producer.config /tmp/producer.properties" 2>&1`,
-			encodedKey, encodedValue, brokerAddr, topic),
+KEY=$(echo %s | base64 -d)
+VALUE=$(echo %s | base64 -d)
+printf '%%s\t%%s\n' "$KEY" "$VALUE" | timeout 30 /opt/kafka/bin/kafka-console-producer.sh --bootstrap-server %s --topic %s --property parse.key=true --property 'key.separator=	' --producer.config %s 2>&1`,
+			propFile, encodedKey, encodedValue, brokerAddr, topic, propFile),
 	}
 	return c.runProduce(fmt.Sprintf("message with key to %s topic=%s", brokerAddr, topic), cmd)
 }
 
 func (c *kafkaDockerClient) produceMessageIdempotent(brokerAddr, topic, value string) error {
 	encodedValue := base64.StdEncoding.EncodeToString([]byte(value))
+	propFile := fmt.Sprintf("/tmp/producer-%s.properties", topic)
 	cmd := []string{
 		"bash", "-c",
-		fmt.Sprintf(`cat > /tmp/producer.properties << 'PROPEOF'
+		fmt.Sprintf(`cat > %s << 'PROPEOF'
 enable.idempotence=true
 request.timeout.ms=5000
 delivery.timeout.ms=10000
 acks=all
 PROPEOF
-timeout 30 bash -c "echo %s | base64 -d | /opt/kafka/bin/kafka-console-producer.sh --bootstrap-server %s --topic %s --producer.config /tmp/producer.properties" 2>&1`,
-			encodedValue, brokerAddr, topic),
+timeout 30 bash -c "echo %s | base64 -d | /opt/kafka/bin/kafka-console-producer.sh --bootstrap-server %s --topic %s --producer.config %s" 2>&1`,
+			propFile, encodedValue, brokerAddr, topic, propFile),
 	}
 	return c.runProduce(fmt.Sprintf("idempotent message to %s topic=%s", brokerAddr, topic), cmd)
 }
@@ -87,28 +92,30 @@ timeout 30 bash -c "echo %s | base64 -d | /opt/kafka/bin/kafka-console-producer.
 func (c *kafkaDockerClient) produceMultipleMessages(brokerAddr, topic string, messages []string) error {
 	input := strings.Join(messages, "\n")
 	encodedInput := base64.StdEncoding.EncodeToString([]byte(input))
+	propFile := fmt.Sprintf("/tmp/producer-%s.properties", topic)
 
 	cmd := []string{
 		"bash", "-c",
-		fmt.Sprintf(`cat > /tmp/producer.properties << 'PROPEOF'
+		fmt.Sprintf(`cat > %s << 'PROPEOF'
 enable.idempotence=false
 request.timeout.ms=5000
 delivery.timeout.ms=10000
 acks=1
 retries=0
 PROPEOF
-timeout 30 bash -c "echo %s | base64 -d | /opt/kafka/bin/kafka-console-producer.sh --bootstrap-server %s --topic %s --producer.config /tmp/producer.properties" 2>&1`,
-			encodedInput, brokerAddr, topic),
+timeout 30 bash -c "echo %s | base64 -d | /opt/kafka/bin/kafka-console-producer.sh --bootstrap-server %s --topic %s --producer.config %s" 2>&1`,
+			propFile, encodedInput, brokerAddr, topic, propFile),
 	}
 	return c.runProduce(fmt.Sprintf("%d messages to %s topic=%s", len(messages), brokerAddr, topic), cmd)
 }
 
 func (c *kafkaDockerClient) produceWithSASLPlain(brokerAddr, topic, value, username, password string) error {
 	encodedValue := base64.StdEncoding.EncodeToString([]byte(value))
+	propFile := fmt.Sprintf("/tmp/plain-%s.properties", topic)
 
 	cmd := []string{
 		"bash", "-c",
-		fmt.Sprintf(`cat > /tmp/plain.properties << 'PROPEOF'
+		fmt.Sprintf(`cat > %s << 'PROPEOF'
 security.protocol=SASL_PLAINTEXT
 sasl.mechanism=PLAIN
 sasl.jaas.config=org.apache.kafka.common.security.plain.PlainLoginModule required username="%s" password="%s";
@@ -118,18 +125,19 @@ delivery.timeout.ms=10000
 acks=1
 retries=0
 PROPEOF
-timeout 30 bash -c "echo %s | base64 -d | /opt/kafka/bin/kafka-console-producer.sh --bootstrap-server %s --topic %s --producer.config /tmp/plain.properties" 2>&1`,
-			username, password, encodedValue, brokerAddr, topic),
+timeout 30 bash -c "echo %s | base64 -d | /opt/kafka/bin/kafka-console-producer.sh --bootstrap-server %s --topic %s --producer.config %s" 2>&1`,
+			propFile, username, password, encodedValue, brokerAddr, topic, propFile),
 	}
 	return c.runProduce(fmt.Sprintf("SASL PLAIN message to %s topic=%s user=%s", brokerAddr, topic, username), cmd)
 }
 
 func (c *kafkaDockerClient) produceWithSASLPlainExpectFailure(brokerAddr, topic, value, username, password string) error {
 	encodedValue := base64.StdEncoding.EncodeToString([]byte(value))
+	propFile := fmt.Sprintf("/tmp/plain-%s.properties", topic)
 
 	cmd := []string{
 		"bash", "-c",
-		fmt.Sprintf(`cat > /tmp/plain.properties << 'PROPEOF'
+		fmt.Sprintf(`cat > %s << 'PROPEOF'
 security.protocol=SASL_PLAINTEXT
 sasl.mechanism=PLAIN
 sasl.jaas.config=org.apache.kafka.common.security.plain.PlainLoginModule required username="%s" password="%s";
@@ -139,8 +147,8 @@ delivery.timeout.ms=8000
 acks=1
 retries=0
 PROPEOF
-timeout 10 bash -c "echo %s | base64 -d | /opt/kafka/bin/kafka-console-producer.sh --bootstrap-server %s --topic %s --producer.config /tmp/plain.properties 2>&1" || echo "TIMEOUT_OR_ERROR"`,
-			username, password, encodedValue, brokerAddr, topic),
+timeout 10 bash -c "echo %s | base64 -d | /opt/kafka/bin/kafka-console-producer.sh --bootstrap-server %s --topic %s --producer.config %s 2>&1" || echo "TIMEOUT_OR_ERROR"`,
+			propFile, username, password, encodedValue, brokerAddr, topic, propFile),
 	}
 	return c.runProduceExpectFailure(
 		fmt.Sprintf("SASL PLAIN message to %s topic=%s user=%s", brokerAddr, topic, username),
@@ -150,10 +158,11 @@ timeout 10 bash -c "echo %s | base64 -d | /opt/kafka/bin/kafka-console-producer.
 
 func (c *kafkaDockerClient) produceWithSASLScram(brokerAddr, topic, value, username, password, mechanism string) error {
 	encodedValue := base64.StdEncoding.EncodeToString([]byte(value))
+	propFile := fmt.Sprintf("/tmp/scram-%s.properties", topic)
 
 	cmd := []string{
 		"bash", "-c",
-		fmt.Sprintf(`cat > /tmp/scram.properties << 'PROPEOF'
+		fmt.Sprintf(`cat > %s << 'PROPEOF'
 security.protocol=SASL_PLAINTEXT
 sasl.mechanism=%s
 sasl.jaas.config=org.apache.kafka.common.security.scram.ScramLoginModule required username="%s" password="%s";
@@ -163,18 +172,19 @@ delivery.timeout.ms=10000
 acks=1
 retries=0
 PROPEOF
-timeout 30 bash -c "echo %s | base64 -d | /opt/kafka/bin/kafka-console-producer.sh --bootstrap-server %s --topic %s --producer.config /tmp/scram.properties" 2>&1`,
-			mechanism, username, password, encodedValue, brokerAddr, topic),
+timeout 30 bash -c "echo %s | base64 -d | /opt/kafka/bin/kafka-console-producer.sh --bootstrap-server %s --topic %s --producer.config %s" 2>&1`,
+			propFile, mechanism, username, password, encodedValue, brokerAddr, topic, propFile),
 	}
 	return c.runProduce(fmt.Sprintf("SASL %s message to %s topic=%s user=%s", mechanism, brokerAddr, topic, username), cmd)
 }
 
 func (c *kafkaDockerClient) produceWithSASLScramExpectFailure(brokerAddr, topic, value, username, password, mechanism string) error {
 	encodedValue := base64.StdEncoding.EncodeToString([]byte(value))
+	propFile := fmt.Sprintf("/tmp/scram-%s.properties", topic)
 
 	cmd := []string{
 		"bash", "-c",
-		fmt.Sprintf(`cat > /tmp/scram.properties << 'PROPEOF'
+		fmt.Sprintf(`cat > %s << 'PROPEOF'
 security.protocol=SASL_PLAINTEXT
 sasl.mechanism=%s
 sasl.jaas.config=org.apache.kafka.common.security.scram.ScramLoginModule required username="%s" password="%s";
@@ -184,8 +194,8 @@ delivery.timeout.ms=8000
 acks=1
 retries=0
 PROPEOF
-timeout 10 bash -c "echo %s | base64 -d | /opt/kafka/bin/kafka-console-producer.sh --bootstrap-server %s --topic %s --producer.config /tmp/scram.properties 2>&1" || echo "TIMEOUT_OR_ERROR"`,
-			mechanism, username, password, encodedValue, brokerAddr, topic),
+timeout 10 bash -c "echo %s | base64 -d | /opt/kafka/bin/kafka-console-producer.sh --bootstrap-server %s --topic %s --producer.config %s 2>&1" || echo "TIMEOUT_OR_ERROR"`,
+			propFile, mechanism, username, password, encodedValue, brokerAddr, topic, propFile),
 	}
 	return c.runProduceExpectFailure(
 		fmt.Sprintf("SASL %s message to %s topic=%s user=%s", mechanism, brokerAddr, topic, username),

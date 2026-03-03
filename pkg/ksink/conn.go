@@ -14,9 +14,10 @@ import (
 
 // connState tracks per-connection state for SASL and producer ID tracking.
 type connState struct {
-	authenticated bool
-	saslMechanism string
-	scramConv     *scram.ServerConversation
+	authenticated    bool
+	saslMechanism    string
+	scramConv        *scram.ServerConversation
+	awaitingRawSASL  bool // true after a v0 SASLHandshake to expect raw SASL bytes
 }
 
 func (s *Server) acceptLoop(ctx context.Context) {
@@ -92,6 +93,17 @@ func (s *Server) handleConnection(ctx context.Context, conn net.Conn, connID uin
 		if _, err := io.ReadFull(conn, requestBody); err != nil {
 			s.logger.Errorf("[conn:%d] Error reading request body: %v", connID, err)
 			return
+		}
+
+		// After a v0 SASL Handshake, the next frame is raw SASL auth bytes
+		// (not wrapped in a Kafka request envelope).
+		if state.awaitingRawSASL {
+			state.awaitingRawSASL = false
+			if err := s.handleRawSASLAuthenticate(conn, connID, requestBody, state); err != nil {
+				s.logger.Errorf("[conn:%d] Raw SASL authentication error: %v", connID, err)
+				return
+			}
+			continue
 		}
 
 		// Parse the request header using kbin.Reader

@@ -27,6 +27,10 @@ func (s *Server) handleSaslHandshake(conn net.Conn, connID uint64, correlationID
 		s.logger.Warnf("[conn:%d] Unsupported SASL mechanism: %s", connID, req.Mechanism)
 	} else {
 		state.saslMechanism = req.Mechanism
+		// For v0 handshake, the next frame is raw SASL bytes (not a Kafka request)
+		if apiVersion == 0 {
+			state.awaitingRawSASL = true
+		}
 	}
 
 	return s.sendResponse(conn, connID, correlationID, resp)
@@ -165,4 +169,43 @@ func (s *Server) handleSASLScram(connID uint64, authBytes []byte, state *connSta
 	}
 
 	return []byte(response), nil
+}
+
+// handleRawSASLAuthenticate handles raw SASL bytes sent after a v0 SASLHandshake.
+// The frame payload is the raw SASL authentication data (no Kafka request header).
+// The response is sent as a raw size-prefixed frame (no Kafka response envelope).
+func (s *Server) handleRawSASLAuthenticate(conn net.Conn, connID uint64, data []byte, state *connState) error {
+	s.logger.Debugf("[conn:%d] Raw SASL Authenticate: mechanism=%s, dataLen=%d", connID, state.saslMechanism, len(data))
+
+	switch state.saslMechanism {
+	case "PLAIN":
+		if !s.validateSASLPlain(data, state) {
+			s.logger.Warnf("[conn:%d] Raw SASL PLAIN authentication failed", connID)
+			// Send empty response and close the connection
+			if err := s.writeResponse(connID, conn, nil); err != nil {
+				return err
+			}
+			return fmt.Errorf("SASL PLAIN authentication failed")
+		}
+		s.logger.Infof("[conn:%d] Raw SASL PLAIN authentication successful", connID)
+		return s.writeResponse(connID, conn, nil)
+
+	case "SCRAM-SHA-256", "SCRAM-SHA-512":
+		respBytes, err := s.handleSASLScram(connID, data, state)
+		if err != nil {
+			s.logger.Warnf("[conn:%d] Raw SASL SCRAM authentication failed: %v", connID, err)
+			return err
+		}
+		if err := s.writeResponse(connID, conn, respBytes); err != nil {
+			return err
+		}
+		if !state.authenticated {
+			// SCRAM needs another round — stay in raw SASL mode
+			state.awaitingRawSASL = true
+		}
+		return nil
+
+	default:
+		return fmt.Errorf("unsupported SASL mechanism: %s", state.saslMechanism)
+	}
 }
