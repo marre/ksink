@@ -67,7 +67,7 @@ dockers:
       - --label=org.opencontainers.image.version={{ .Version }}
       - --label=org.opencontainers.image.created={{ .Date }}
       - --label=org.opencontainers.image.revision={{ .FullCommit }}
-    dockerfile: Dockerfile
+    dockerfile: build/package/Dockerfile
     goarch: amd64
   - image_templates:
       - "ghcr.io/marre/ksink:{{ .Version }}-arm64"
@@ -81,7 +81,7 @@ dockers:
       - --label=org.opencontainers.image.version={{ .Version }}
       - --label=org.opencontainers.image.created={{ .Date }}
       - --label=org.opencontainers.image.revision={{ .FullCommit }}
-    dockerfile: Dockerfile
+    dockerfile: build/package/Dockerfile
     goarch: arm64
 
 docker_manifests:
