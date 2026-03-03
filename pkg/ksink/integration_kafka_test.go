@@ -212,5 +212,5 @@ func TestIntegrationKafkaServer(t *testing.T) {
 	client := newKafkaDockerClient(t)
 	t.Cleanup(func() { client.Close() })
 
-	runIntegrationSubtests(t, client, "")
+	runIntegrationSubtests(t, client)
 }

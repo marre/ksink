@@ -21,8 +21,6 @@ var kcatAuthFailurePatterns = []string{
 	"timed out",
 }
 
-const kcatScramSkipReason = "SCRAM tests disabled for kcat due to librdkafka nonce doubling bug, see https://github.com/edenhill/kcat/issues/462"
-
 func newKcatClient(t *testing.T) *kcatClient {
 	pool := newDockerPool(t)
 	return &kcatClient{
@@ -119,5 +117,5 @@ func TestIntegrationKafkaServerKcat(t *testing.T) {
 	client := newKcatClient(t)
 	t.Cleanup(func() { client.Close() })
 
-	runIntegrationSubtests(t, client, kcatScramSkipReason)
+	runIntegrationSubtests(t, client)
 }

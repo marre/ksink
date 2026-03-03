@@ -458,7 +458,7 @@ func testIdempotentProducer(t *testing.T, client kafkaProducer) {
 }
 
 // runIntegrationSubtests dispatches the standard set of integration subtests.
-func runIntegrationSubtests(t *testing.T, client kafkaProducer, scramSkipReason string) {
+func runIntegrationSubtests(t *testing.T, client kafkaProducer) {
 	t.Run("basic_no_auth", func(t *testing.T) {
 		t.Parallel()
 		testBasicNoAuth(t, client)
