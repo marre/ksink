@@ -200,7 +200,7 @@ func (s *Server) handleRawSASLAuthenticate(conn net.Conn, connID uint64, data []
 			return err
 		}
 		if !state.authenticated {
-			// SCRAM needs another round — stay in raw SASL mode
+			// SCRAM needs another round -- stay in raw SASL mode
 			state.awaitingRawSASL = true
 		}
 		return nil

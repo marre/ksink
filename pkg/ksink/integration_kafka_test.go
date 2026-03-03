@@ -64,8 +64,8 @@ delivery.timeout.ms=10000
 acks=1
 retries=0
 PROPEOF
-KEY=$(echo %s | base64 -d)
-VALUE=$(echo %s | base64 -d)
+KEY="$(echo %s | base64 -d)"
+VALUE="$(echo %s | base64 -d)"
 printf '%%s\t%%s\n' "$KEY" "$VALUE" | timeout 30 /opt/kafka/bin/kafka-console-producer.sh --bootstrap-server %s --topic %s --property parse.key=true --property 'key.separator=	' --producer.config %s 2>&1`,
 			propFile, encodedKey, encodedValue, brokerAddr, topic, propFile),
 	}
