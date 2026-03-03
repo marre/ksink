@@ -11,7 +11,7 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/marre/ksink"
+	"github.com/marre/ksink/pkg/ksink"
 	"github.com/marre/ksink/internal/output"
 	"github.com/spf13/cobra"
 )

@@ -15,7 +15,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/marre/ksink"
+	"github.com/marre/ksink/pkg/ksink"
 	"github.com/marre/ksink/internal/output"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
