@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/marre/ksink/internal/output"
 	"github.com/stretchr/testify/require"
 	"go.nanomsg.org/mangos/v3"
 	"go.nanomsg.org/mangos/v3/protocol/pull"
@@ -27,7 +28,7 @@ func TestOutputNanomsg(t *testing.T) {
 	t.Cleanup(func() { pullSock.Close() })
 	require.NoError(t, pullSock.Listen(nmURL))
 
-	w, err := openWriter(fmt.Sprintf("nanomsg://%s", nmURL), nil)
+	w, err := output.Open(fmt.Sprintf("nanomsg://%s", nmURL), nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { w.Close() })
 
@@ -77,7 +78,7 @@ func TestOutputNanomsgTLS(t *testing.T) {
 		RootCAs:    ca.certPool(t),
 		MinVersion: tls.VersionTLS12,
 	}
-	w, err := openWriter(fmt.Sprintf("nanomsg://%s", nmURL), clientTLS)
+	w, err := output.Open(fmt.Sprintf("nanomsg://%s", nmURL), clientTLS)
 	require.NoError(t, err)
 	t.Cleanup(func() { w.Close() })
 

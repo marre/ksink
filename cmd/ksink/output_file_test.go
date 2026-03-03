@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/marre/ksink/internal/output"
 	"github.com/stretchr/testify/require"
 )
 
@@ -17,7 +18,7 @@ func TestOutputFile(t *testing.T) {
 	tmpDir := t.TempDir()
 	outputFile := filepath.Join(tmpDir, "output.jsonl")
 
-	w, err := openWriter(outputFile, nil)
+	w, err := output.Open(outputFile, nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { w.Close() })
 

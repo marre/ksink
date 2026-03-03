@@ -15,7 +15,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/marre/ksink"
+	"github.com/marre/ksink/pkg/ksink"
+	"github.com/marre/ksink/internal/output"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/twmb/franz-go/pkg/kgo"
@@ -62,7 +63,7 @@ func startKsinkServer(t *testing.T, ctx context.Context) (*ksink.Server, string)
 }
 
 // startReadWriteLoop runs the message forwarding loop (same as the main run loop).
-func startReadWriteLoop(t *testing.T, srv *ksink.Server, w writer) {
+func startReadWriteLoop(t *testing.T, srv *ksink.Server, w output.Writer) {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)

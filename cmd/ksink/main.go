@@ -11,8 +11,16 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/marre/ksink"
+	"github.com/marre/ksink/pkg/ksink"
+	"github.com/marre/ksink/internal/output"
 	"github.com/spf13/cobra"
+)
+
+// Set via ldflags at build time by goreleaser.
+var (
+	version = "dev"
+	commit  = "none"
+	date    = "unknown"
 )
 
 type stdLogger struct{}
@@ -37,13 +45,14 @@ type messageRecord struct {
 func main() {
 	var (
 		addr   string
-		output string
-		tOpts  tlsOpts
+		dst    string
+		tOpts  output.TLSOpts
 	)
 
 	rootCmd := &cobra.Command{
-		Use:   "ksink",
-		Short: "A lightweight Kafka-protocol-compatible message sink",
+		Use:     "ksink",
+		Short:   "A lightweight Kafka-protocol-compatible message sink",
+		Version: fmt.Sprintf("%s (commit=%s, date=%s)", version, commit, date),
 		Long: `ksink accepts produce requests from Kafka producers and forwards
 received messages to an output sink.
 
@@ -57,20 +66,20 @@ Output formats:
 Use --output-tls-* flags to configure client certificates (mTLS) and
 CA certificates for server verification on tcp, tls, and nanomsg outputs.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return run(addr, output, tOpts)
+			return run(addr, dst, tOpts)
 		},
 	}
 
 	rootCmd.Flags().StringVar(&addr, "addr", ":9092", "Address to listen on")
-	rootCmd.Flags().StringVar(&output, "output", "messages.jsonl",
+	rootCmd.Flags().StringVar(&dst, "output", "messages.jsonl",
 		"Output destination (file path, tcp://, tls://, or nanomsg:// URL)")
-	rootCmd.Flags().StringVar(&tOpts.certFile, "output-tls-cert", "",
+	rootCmd.Flags().StringVar(&tOpts.CertFile, "output-tls-cert", "",
 		"Client certificate file for output TLS/mTLS connections")
-	rootCmd.Flags().StringVar(&tOpts.keyFile, "output-tls-key", "",
+	rootCmd.Flags().StringVar(&tOpts.KeyFile, "output-tls-key", "",
 		"Client private key file for output TLS/mTLS connections")
-	rootCmd.Flags().StringVar(&tOpts.caFile, "output-tls-ca", "",
+	rootCmd.Flags().StringVar(&tOpts.CAFile, "output-tls-ca", "",
 		"CA certificate file for verifying the output server")
-	rootCmd.Flags().BoolVar(&tOpts.skipVerify, "output-tls-skip-verify", false,
+	rootCmd.Flags().BoolVar(&tOpts.SkipVerify, "output-tls-skip-verify", false,
 		"Skip TLS certificate verification for output connections")
 
 	if err := rootCmd.Execute(); err != nil {
@@ -78,13 +87,13 @@ CA certificates for server verification on tcp, tls, and nanomsg outputs.`,
 	}
 }
 
-func run(addr, output string, tOpts tlsOpts) error {
-	tlsCfg, err := tOpts.buildTLSConfig()
+func run(addr, dst string, tOpts output.TLSOpts) error {
+	tlsCfg, err := tOpts.BuildTLSConfig()
 	if err != nil {
 		return err
 	}
 
-	w, err := openWriter(output, tlsCfg)
+	w, err := output.Open(dst, tlsCfg)
 	if err != nil {
 		return err
 	}
@@ -104,7 +113,7 @@ func run(addr, output string, tOpts tlsOpts) error {
 		return fmt.Errorf("failed to start server: %w", err)
 	}
 
-	log.Printf("Kafka server listening on %s, output=%s", srv.Addr(), output)
+	log.Printf("Kafka server listening on %s, output=%s", srv.Addr(), dst)
 
 	// Start read loop
 	go func() {
