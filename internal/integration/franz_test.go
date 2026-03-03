@@ -1,4 +1,4 @@
-package ksink
+package ksink_test
 
 import (
 	"context"
@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/marre/ksink/pkg/ksink"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/twmb/franz-go/pkg/kerr"
@@ -22,6 +23,15 @@ import (
 	"github.com/twmb/franz-go/pkg/sasl/plain"
 	"github.com/twmb/franz-go/pkg/sasl/scram"
 )
+
+type Config = ksink.Config
+type SASLCredential = ksink.SASLCredential
+type Server = ksink.Server
+type receivedMessage = integrationReceivedMessage
+type messageCapture = integrationMessageCapture
+
+var New = ksink.New
+var WithLogger = ksink.WithLogger
 
 // --- Franz-go integration tests ---
 
@@ -517,7 +527,7 @@ func TestFranzTLS(t *testing.T) {
 		CertFile: serverCertFile,
 		KeyFile:  serverKeyFile,
 		Timeout:  5 * time.Second,
-	}, WithLogger(&testLogger{t}))
+	}, WithLogger(&integrationLogger{t}))
 	require.NoError(t, err)
 
 	err = srv.Start(context.Background())
@@ -672,7 +682,7 @@ func TestFranzMTLS(t *testing.T) {
 		MTLSAuth:     "require_and_verify",
 		MTLSCAsFiles: []string{clientCAFile},
 		Timeout:      5 * time.Second,
-	}, WithLogger(&testLogger{t}))
+	}, WithLogger(&integrationLogger{t}))
 	require.NoError(t, err)
 
 	err = srv.Start(context.Background())
@@ -779,4 +789,56 @@ func TestFranzClose(t *testing.T) {
 	// Double close should not error
 	err = srv.Close(context.Background())
 	assert.NoError(t, err)
+}
+
+func getFreePort(t *testing.T) int {
+	t.Helper()
+	return getIntegrationFreePort(t)
+}
+
+func waitForTCPReady(t *testing.T, addr string, timeout time.Duration) {
+	t.Helper()
+	integrationWaitForTCPReady(t, addr, timeout)
+}
+
+func startTestServer(t *testing.T, cfg Config) (*Server, string) {
+	t.Helper()
+	port := getFreePort(t)
+	addr := fmt.Sprintf("127.0.0.1:%d", port)
+	cfg.Address = addr
+
+	srv, err := New(cfg, WithLogger(&integrationLogger{t}))
+	require.NoError(t, err)
+
+	err = srv.Start(context.Background())
+	require.NoError(t, err)
+
+	waitForTCPReady(t, addr, 5*time.Second)
+
+	t.Cleanup(func() {
+		srv.Close(context.Background())
+	})
+
+	return srv, addr
+}
+
+func startReadLoop(t *testing.T, srv *Server) *messageCapture {
+	t.Helper()
+	return integrationStartReadLoop(t, srv)
+}
+
+func startFailReadLoop(t *testing.T, srv *Server, ackErr error) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	go func() {
+		for {
+			_, ack, err := srv.ReadBatch(ctx)
+			if err != nil {
+				return
+			}
+			ack(ackErr)
+		}
+	}()
 }
