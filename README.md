@@ -93,14 +93,20 @@ cfg := ksink.Config{
 The `cmd/ksink` tool forwards received messages to an output sink:
 
 ```bash
-# Write JSON lines to a file (default)
-go run ./cmd/ksink --addr :9092 --output messages.jsonl
+# Write raw message values (binary) to stdout, one per line (default)
+go run ./cmd/ksink --addr :9092
+
+# Write to a file instead of stdout
+go run ./cmd/ksink --addr :9092 --output messages.bin
+
+# Write JSON lines to a file
+go run ./cmd/ksink --addr :9092 --output messages.jsonl --output-format json
 
 # Send JSON lines over a TCP client socket
-go run ./cmd/ksink --addr :9092 --output tcp://host:port
+go run ./cmd/ksink --addr :9092 --output tcp://host:port --output-format json
 
 # Send JSON lines over a TLS-encrypted TCP connection
-go run ./cmd/ksink --addr :9092 --output tls://host:port --output-tls-ca ca.pem
+go run ./cmd/ksink --addr :9092 --output tls://host:port --output-tls-ca ca.pem --output-format json
 
 # TLS with mTLS client authentication
 go run ./cmd/ksink --addr :9092 --output tls://host:port \
@@ -111,4 +117,43 @@ go run ./cmd/ksink --addr :9092 --output nanomsg://tcp://host:port
 
 # Send messages over a nanomsg PUSH socket with TLS
 go run ./cmd/ksink --addr :9092 --output nanomsg://tls+tcp://host:port --output-tls-ca ca.pem
+
+# Print the JSON schema for the json output format
+go run ./cmd/ksink json-schema
+```
+
+### Message Formats
+
+Use `--output-format` to control how messages are serialized:
+
+| Format        | Description                                                      |
+|---------------|------------------------------------------------------------------|
+| `binary`      | Raw message value bytes, newline-delimited (default)             |
+| `json`        | JSON lines with key/value as UTF-8 strings                       |
+| `json-base64` | JSON lines with key/value base64-encoded (for binary data)      |
+| `text`        | Raw message value followed by the separator                      |
+| `kcat`        | kcat-compatible format string (requires `--output-format-string`)|
+
+Use `--output-separator` to set the delimiter appended after each message
+(default: `\n`). Common escape sequences (`\n`, `\r`, `\t`, `\0`) are
+interpreted. Use `--output-separator-hex` for hex-encoded binary delimiters
+(e.g. `0a` for newline, `00` for null byte). Use `--no-separator` to clear
+the delimiter entirely.
+
+```bash
+# Binary output with no separator to a file
+go run ./cmd/ksink --no-separator --output data.bin
+
+# Plain text values, one per line
+go run ./cmd/ksink --output-format text --output messages.txt
+
+# JSON with base64-encoded key/value for binary payloads
+go run ./cmd/ksink --output-format json-base64 --output messages.jsonl
+
+# Binary delimiter using hex encoding (null byte)
+go run ./cmd/ksink --output-format text --output-separator-hex "00" --output messages.txt
+
+# kcat-compatible output formatting
+go run ./cmd/ksink --output-format kcat \
+  --output-format-string 'Topic: %t Partition: %p Offset: %o\nKey: %k\nValue: %s\n---\n'
 ```

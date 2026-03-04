@@ -7,6 +7,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/json"
 	"encoding/pem"
 	"fmt"
 	"math/big"
@@ -15,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/marre/ksink/internal/format"
 	"github.com/marre/ksink/pkg/ksink"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -22,6 +24,7 @@ import (
 	"github.com/twmb/franz-go/pkg/kgo"
 	"github.com/twmb/franz-go/pkg/sasl/plain"
 	"github.com/twmb/franz-go/pkg/sasl/scram"
+	"github.com/xeipuuv/gojsonschema"
 )
 
 type Config = ksink.Config
@@ -775,6 +778,84 @@ func TestFranzMTLS(t *testing.T) {
 		})
 		require.Error(t, results[0].Err)
 	})
+}
+
+// TestFranzJSONOutputMatchesSchema produces a message through the full server
+// pipeline and validates that formatting the resulting *ksink.Message with the
+// json and json-base64 formatters produces output that conforms to the JSON schema.
+func TestFranzJSONOutputMatchesSchema(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	srv, addr := startTestServer(t, Config{
+		Timeout: 5 * time.Second,
+	})
+
+	// Collect raw *ksink.Message from ReadBatch in a goroutine so that
+	// ProduceSync (which waits for acks) does not deadlock.
+	type batchResult struct {
+		msgs []*ksink.Message
+		err  error
+	}
+	batchCh := make(chan batchResult, 1)
+	go func() {
+		msgs, ack, err := srv.ReadBatch(ctx)
+		if err != nil {
+			batchCh <- batchResult{err: err}
+			return
+		}
+		ack(nil)
+		batchCh <- batchResult{msgs: msgs}
+	}()
+
+	client, err := kgo.NewClient(
+		kgo.SeedBrokers(addr),
+		kgo.RequestTimeoutOverhead(5*time.Second),
+		kgo.DisableIdempotentWrite(),
+	)
+	require.NoError(t, err)
+	defer client.Close()
+
+	results := client.ProduceSync(ctx, &kgo.Record{
+		Topic: "schema-test",
+		Key:   []byte("test-key"),
+		Value: []byte("test-value"),
+		Headers: []kgo.RecordHeader{
+			{Key: "h1", Value: []byte("v1")},
+		},
+	})
+	require.NoError(t, results[0].Err)
+
+	br := <-batchCh
+	require.NoError(t, br.err)
+	require.NotEmpty(t, br.msgs)
+
+	schemaLoader := gojsonschema.NewStringLoader(format.JSONSchema)
+
+	for _, fmtName := range []string{"json", "json-base64"} {
+		t.Run(fmtName, func(t *testing.T) {
+			fmtr, err := format.New(fmtName, []byte("\n"))
+			require.NoError(t, err)
+
+			for _, msg := range br.msgs {
+				data, err := fmtr.Format(msg)
+				require.NoError(t, err)
+
+				// Strip trailing separator.
+				jsonBytes := data[:len(data)-1]
+				require.True(t, json.Valid(jsonBytes), "output is not valid JSON: %s", string(jsonBytes))
+
+				docLoader := gojsonschema.NewBytesLoader(jsonBytes)
+				result, err := gojsonschema.Validate(schemaLoader, docLoader)
+				require.NoError(t, err)
+
+				for _, e := range result.Errors() {
+					t.Errorf("schema validation error (%s): %s", fmtName, e)
+				}
+				assert.True(t, result.Valid(), "JSON output does not match schema for format %s", fmtName)
+			}
+		})
+	}
 }
 
 func TestFranzClose(t *testing.T) {

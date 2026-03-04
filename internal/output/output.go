@@ -1,6 +1,7 @@
 // Package output provides message output backends for ksink.
 //
 // Supported schemes:
+//   - -                              Standard output (stdout)
 //   - tcp://host:port               Plain TCP
 //   - tls://host:port               TLS-wrapped TCP
 //   - nanomsg://tcp://host:port     Nanomsg over plain TCP
@@ -72,8 +73,11 @@ func (o *TLSOpts) BuildTLSConfig() (*tls.Config, error) {
 }
 
 // Open creates a Writer based on the output string.
+// The special value "-" writes to standard output.
 func Open(dst string, tlsCfg *tls.Config) (Writer, error) {
 	switch {
+	case dst == "-":
+		return newStdoutWriter(), nil
 	case strings.HasPrefix(dst, "tls://"):
 		addr := strings.TrimPrefix(dst, "tls://")
 		if tlsCfg == nil {
