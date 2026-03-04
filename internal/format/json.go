@@ -11,7 +11,7 @@ type jsonRecord struct {
 	Topic      string            `json:"topic"`
 	Partition  int32             `json:"partition"`
 	Offset     int64             `json:"offset"`
-	Key        string            `json:"key,omitempty"`
+	Key        *string           `json:"key,omitempty"`
 	Value      string            `json:"value"`
 	Headers    map[string]string `json:"headers,omitempty"`
 	Timestamp  string            `json:"timestamp,omitempty"`
@@ -32,7 +32,8 @@ func (f *jsonFormatter) Format(msg *ksink.Message) ([]byte, error) {
 		ClientAddr: msg.ClientAddr,
 	}
 	if msg.Key != nil {
-		rec.Key = string(msg.Key)
+		k := string(msg.Key)
+		rec.Key = &k
 	}
 	if !msg.Timestamp.IsZero() {
 		rec.Timestamp = msg.Timestamp.String()

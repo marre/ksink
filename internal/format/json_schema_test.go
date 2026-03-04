@@ -57,6 +57,17 @@ func TestJSONOutputMatchesSchema(t *testing.T) {
 				ClientAddr: "127.0.0.1:3",
 			},
 		},
+		{
+			name: "empty_key",
+			msg: &ksink.Message{
+				Topic:      "t",
+				Partition:  0,
+				Offset:     0,
+				Key:        []byte{},
+				Value:      []byte("v"),
+				ClientAddr: "127.0.0.1:4",
+			},
+		},
 	}
 
 	f, err := New("json", []byte("\n"))

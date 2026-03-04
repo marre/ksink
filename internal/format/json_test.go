@@ -25,7 +25,8 @@ func TestJSONFormatter(t *testing.T) {
 	assert.Equal(t, "events", rec.Topic)
 	assert.Equal(t, int32(0), rec.Partition)
 	assert.Equal(t, int64(42), rec.Offset)
-	assert.Equal(t, "my-key", rec.Key)
+	require.NotNil(t, rec.Key)
+	assert.Equal(t, "my-key", *rec.Key)
 	assert.Equal(t, "hello world", rec.Value)
 	assert.Equal(t, "v", rec.Headers["h"])
 	assert.NotEmpty(t, rec.Timestamp)
@@ -43,7 +44,28 @@ func TestJSONFormatterNilKey(t *testing.T) {
 
 	var rec jsonRecord
 	require.NoError(t, json.Unmarshal(data[:len(data)-1], &rec))
-	assert.Empty(t, rec.Key)
+	assert.Nil(t, rec.Key)
+}
+
+func TestJSONFormatterEmptyKey(t *testing.T) {
+	f, err := New("json", []byte("\n"))
+	require.NoError(t, err)
+
+	msg := sampleMessage()
+	msg.Key = []byte{}
+	data, err := f.Format(msg)
+	require.NoError(t, err)
+
+	// Unmarshal into a map to verify the key field is present.
+	var raw map[string]any
+	require.NoError(t, json.Unmarshal(data[:len(data)-1], &raw))
+	_, present := raw["key"]
+	assert.True(t, present, "key field should be present for empty-but-non-nil key")
+
+	var rec jsonRecord
+	require.NoError(t, json.Unmarshal(data[:len(data)-1], &rec))
+	require.NotNil(t, rec.Key)
+	assert.Equal(t, "", *rec.Key)
 }
 
 func TestJSONFormatterZeroTimestamp(t *testing.T) {

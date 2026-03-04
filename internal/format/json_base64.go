@@ -12,7 +12,7 @@ type jsonBase64Record struct {
 	Topic      string            `json:"topic"`
 	Partition  int32             `json:"partition"`
 	Offset     int64             `json:"offset"`
-	Key        string            `json:"key,omitempty"`
+	Key        *string           `json:"key,omitempty"`
 	Value      string            `json:"value"`
 	Headers    map[string]string `json:"headers,omitempty"`
 	Timestamp  string            `json:"timestamp,omitempty"`
@@ -35,7 +35,8 @@ func (f *jsonBase64Formatter) Format(msg *ksink.Message) ([]byte, error) {
 		Encoding:   "base64",
 	}
 	if msg.Key != nil {
-		rec.Key = base64.StdEncoding.EncodeToString(msg.Key)
+		k := base64.StdEncoding.EncodeToString(msg.Key)
+		rec.Key = &k
 	}
 	if !msg.Timestamp.IsZero() {
 		rec.Timestamp = msg.Timestamp.String()

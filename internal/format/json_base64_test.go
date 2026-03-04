@@ -24,8 +24,30 @@ func TestJSONBase64Formatter(t *testing.T) {
 	require.NoError(t, json.Unmarshal(data[:len(data)-1], &rec))
 	assert.Equal(t, "events", rec.Topic)
 	assert.Equal(t, "base64", rec.Encoding)
-	assert.Equal(t, base64.StdEncoding.EncodeToString([]byte("my-key")), rec.Key)
+	require.NotNil(t, rec.Key)
+	assert.Equal(t, base64.StdEncoding.EncodeToString([]byte("my-key")), *rec.Key)
 	assert.Equal(t, base64.StdEncoding.EncodeToString([]byte("hello world")), rec.Value)
+}
+
+func TestJSONBase64FormatterEmptyKey(t *testing.T) {
+	f, err := New("json-base64", []byte("\n"))
+	require.NoError(t, err)
+
+	msg := sampleMessage()
+	msg.Key = []byte{}
+	data, err := f.Format(msg)
+	require.NoError(t, err)
+
+	// Unmarshal into a map to verify the key field is present.
+	var raw map[string]any
+	require.NoError(t, json.Unmarshal(data[:len(data)-1], &raw))
+	_, present := raw["key"]
+	assert.True(t, present, "key field should be present for empty-but-non-nil key")
+
+	var rec jsonBase64Record
+	require.NoError(t, json.Unmarshal(data[:len(data)-1], &rec))
+	require.NotNil(t, rec.Key)
+	assert.Equal(t, base64.StdEncoding.EncodeToString([]byte{}), *rec.Key)
 }
 
 func TestJSONBase64FormatterBinaryData(t *testing.T) {
@@ -51,7 +73,7 @@ func TestJSONBase64FormatterBinaryData(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, binData, decoded)
 
-	decodedKey, err := base64.StdEncoding.DecodeString(rec.Key)
+	decodedKey, err := base64.StdEncoding.DecodeString(*rec.Key)
 	require.NoError(t, err)
 	assert.Equal(t, binData, decodedKey)
 }
