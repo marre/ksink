@@ -7,25 +7,12 @@ import (
 	"github.com/marre/ksink/pkg/ksink"
 )
 
-// jsonBase64Record is the JSON structure written by the json-base64 formatter.
-type jsonBase64Record struct {
-	Topic      string            `json:"topic"`
-	Partition  int32             `json:"partition"`
-	Offset     int64             `json:"offset"`
-	Key        *string           `json:"key,omitempty"`
-	Value      string            `json:"value"`
-	Headers    map[string]string `json:"headers,omitempty"`
-	Timestamp  string            `json:"timestamp,omitempty"`
-	ClientAddr string            `json:"client_addr"`
-	Encoding   string            `json:"encoding"`
-}
-
 type jsonBase64Formatter struct {
 	separator []byte
 }
 
 func (f *jsonBase64Formatter) Format(msg *ksink.Message) ([]byte, error) {
-	rec := jsonBase64Record{
+	rec := jsonRecord{
 		Topic:      msg.Topic,
 		Partition:  msg.Partition,
 		Offset:     msg.Offset,

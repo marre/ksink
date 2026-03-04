@@ -20,7 +20,7 @@ func TestJSONBase64Formatter(t *testing.T) {
 
 	assert.Equal(t, byte('\n'), data[len(data)-1])
 
-	var rec jsonBase64Record
+	var rec jsonRecord
 	require.NoError(t, json.Unmarshal(data[:len(data)-1], &rec))
 	assert.Equal(t, "events", rec.Topic)
 	assert.Equal(t, "base64", rec.Encoding)
@@ -44,7 +44,7 @@ func TestJSONBase64FormatterEmptyKey(t *testing.T) {
 	_, present := raw["key"]
 	assert.True(t, present, "key field should be present for empty-but-non-nil key")
 
-	var rec jsonBase64Record
+	var rec jsonRecord
 	require.NoError(t, json.Unmarshal(data[:len(data)-1], &rec))
 	require.NotNil(t, rec.Key)
 	assert.Equal(t, base64.StdEncoding.EncodeToString([]byte{}), *rec.Key)
@@ -65,7 +65,7 @@ func TestJSONBase64FormatterBinaryData(t *testing.T) {
 	data, err := f.Format(msg)
 	require.NoError(t, err)
 
-	var rec jsonBase64Record
+	var rec jsonRecord
 	require.NoError(t, json.Unmarshal(data[:len(data)-1], &rec))
 	assert.Equal(t, "base64", rec.Encoding)
 

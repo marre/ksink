@@ -1,14 +1,14 @@
 package format
 
 // JSONSchema is a JSON Schema (draft-07) that validates the output of the
-// json formatter.  It is embedded as a Go string so that it can be used in
-// tests and shipped with the binary without extra files.
+// json and json-base64 formatters.  It is embedded as a Go string so that it
+// can be used in tests and shipped with the binary without extra files.
 const JSONSchema = `{
   "$schema": "http://json-schema.org/draft-07/schema#",
   "title": "ksink JSON message",
-  "description": "Schema for one JSON-lines record produced by the ksink json formatter.",
+  "description": "Schema for one JSON-lines record produced by the ksink json or json-base64 formatter.",
   "type": "object",
-  "required": ["topic", "partition", "offset", "value", "client_addr"],
+  "required": ["topic", "partition", "offset", "value", "client_addr", "encoding"],
   "properties": {
     "topic": {
       "type": "string",
@@ -24,11 +24,11 @@ const JSONSchema = `{
     },
     "key": {
       "type": "string",
-      "description": "Message key as a UTF-8 string. Omitted when the key is nil."
+      "description": "Message key. Encoding depends on the 'encoding' field. Omitted when the key is nil."
     },
     "value": {
       "type": "string",
-      "description": "Message value as a UTF-8 string."
+      "description": "Message value. Encoding depends on the 'encoding' field."
     },
     "headers": {
       "type": "object",
@@ -45,6 +45,11 @@ const JSONSchema = `{
     "client_addr": {
       "type": "string",
       "description": "Address of the producing client."
+    },
+    "encoding": {
+      "type": "string",
+      "description": "Encoding used for key and value fields.",
+      "enum": ["utf-8", "base64"]
     }
   },
   "additionalProperties": false

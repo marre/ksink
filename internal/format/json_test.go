@@ -31,6 +31,7 @@ func TestJSONFormatter(t *testing.T) {
 	assert.Equal(t, "v", rec.Headers["h"])
 	assert.NotEmpty(t, rec.Timestamp)
 	assert.Equal(t, "127.0.0.1:12345", rec.ClientAddr)
+	assert.Equal(t, "utf-8", rec.Encoding)
 }
 
 func TestJSONFormatterNilKey(t *testing.T) {

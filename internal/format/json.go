@@ -6,7 +6,9 @@ import (
 	"github.com/marre/ksink/pkg/ksink"
 )
 
-// jsonRecord is the JSON structure written by the json formatter.
+// jsonRecord is the JSON structure written by both the json and json-base64
+// formatters. The Encoding field indicates how key/value bytes are represented
+// ("utf-8" for plain json, "base64" for json-base64).
 type jsonRecord struct {
 	Topic      string            `json:"topic"`
 	Partition  int32             `json:"partition"`
@@ -16,6 +18,7 @@ type jsonRecord struct {
 	Headers    map[string]string `json:"headers,omitempty"`
 	Timestamp  string            `json:"timestamp,omitempty"`
 	ClientAddr string            `json:"client_addr"`
+	Encoding   string            `json:"encoding"`
 }
 
 type jsonFormatter struct {
@@ -30,6 +33,7 @@ func (f *jsonFormatter) Format(msg *ksink.Message) ([]byte, error) {
 		Value:      string(msg.Value),
 		Headers:    msg.Headers,
 		ClientAddr: msg.ClientAddr,
+		Encoding:   "utf-8",
 	}
 	if msg.Key != nil {
 		k := string(msg.Key)
