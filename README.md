@@ -112,3 +112,29 @@ go run ./cmd/ksink --addr :9092 --output nanomsg://tcp://host:port
 # Send messages over a nanomsg PUSH socket with TLS
 go run ./cmd/ksink --addr :9092 --output nanomsg://tls+tcp://host:port --output-tls-ca ca.pem
 ```
+
+### Message Formats
+
+Use `--output-format` to control how messages are serialized:
+
+| Format        | Description                                                      |
+|---------------|------------------------------------------------------------------|
+| `json`        | JSON lines with key/value as UTF-8 strings (default)             |
+| `json-base64` | JSON lines with key/value base64-encoded (for binary data)      |
+| `text`        | Raw message value followed by the separator                      |
+| `binary`      | Raw message value bytes with no separator by default             |
+
+Use `--output-separator` to set the delimiter appended after each message
+(default: `\n`). Common escape sequences (`\n`, `\r`, `\t`, `\0`) are
+interpreted.
+
+```bash
+# Plain text values, one per line
+go run ./cmd/ksink --output-format text --output messages.txt
+
+# Binary values with no separator
+go run ./cmd/ksink --output-format binary --output-separator "" --output data.bin
+
+# JSON with base64-encoded key/value for binary payloads
+go run ./cmd/ksink --output-format json-base64 --output messages.jsonl
+```

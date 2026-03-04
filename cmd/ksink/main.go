@@ -4,15 +4,16 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"log"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 
-	"github.com/marre/ksink/pkg/ksink"
+	"github.com/marre/ksink/internal/format"
 	"github.com/marre/ksink/internal/output"
+	"github.com/marre/ksink/pkg/ksink"
 	"github.com/spf13/cobra"
 )
 
@@ -30,23 +31,13 @@ func (stdLogger) Infof(format string, args ...any)  { log.Printf("[INFO] "+forma
 func (stdLogger) Warnf(format string, args ...any)  { log.Printf("[WARN] "+format, args...) }
 func (stdLogger) Errorf(format string, args ...any) { log.Printf("[ERROR] "+format, args...) }
 
-// messageRecord is the JSON structure written to outputs.
-type messageRecord struct {
-	Topic      string            `json:"topic"`
-	Partition  int32             `json:"partition"`
-	Offset     int64             `json:"offset"`
-	Key        string            `json:"key,omitempty"`
-	Value      string            `json:"value"`
-	Headers    map[string]string `json:"headers,omitempty"`
-	Timestamp  string            `json:"timestamp,omitempty"`
-	ClientAddr string            `json:"client_addr"`
-}
-
 func main() {
 	var (
-		addr   string
-		dst    string
-		tOpts  output.TLSOpts
+		addr      string
+		dst       string
+		fmtName   string
+		separator string
+		tOpts     output.TLSOpts
 	)
 
 	rootCmd := &cobra.Command{
@@ -64,15 +55,25 @@ Output formats:
   nanomsg://tls+tcp://host:port     Send messages over a nanomsg PUSH socket with TLS
 
 Use --output-tls-* flags to configure client certificates (mTLS) and
-CA certificates for server verification on tcp, tls, and nanomsg outputs.`,
+CA certificates for server verification on tcp, tls, and nanomsg outputs.
+
+Message formats (--output-format):
+  json         JSON lines with key/value as UTF-8 strings (default)
+  json-base64  JSON lines with key/value base64-encoded (for binary data)
+  text         Raw message value followed by the separator
+  binary       Raw message value bytes with no separator by default`,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return run(addr, dst, tOpts)
+			return run(addr, dst, fmtName, separator, tOpts)
 		},
 	}
 
 	rootCmd.Flags().StringVar(&addr, "addr", ":9092", "Address to listen on")
 	rootCmd.Flags().StringVar(&dst, "output", "messages.jsonl",
 		"Output destination (file path, tcp://, tls://, or nanomsg:// URL)")
+	rootCmd.Flags().StringVar(&fmtName, "output-format", "json",
+		"Message format: json, json-base64, text, binary")
+	rootCmd.Flags().StringVar(&separator, "output-separator", "\n",
+		`Separator appended after each message (e.g. "\n", "", "\r\n")`)
 	rootCmd.Flags().StringVar(&tOpts.CertFile, "output-tls-cert", "",
 		"Client certificate file for output TLS/mTLS connections")
 	rootCmd.Flags().StringVar(&tOpts.KeyFile, "output-tls-key", "",
@@ -87,7 +88,13 @@ CA certificates for server verification on tcp, tls, and nanomsg outputs.`,
 	}
 }
 
-func run(addr, dst string, tOpts output.TLSOpts) error {
+func run(addr, dst, fmtName, separator string, tOpts output.TLSOpts) error {
+	sep := parseSeparator(separator)
+	fmtr, err := format.New(fmtName, sep)
+	if err != nil {
+		return err
+	}
+
 	tlsCfg, err := tOpts.BuildTLSConfig()
 	if err != nil {
 		return err
@@ -125,27 +132,11 @@ func run(addr, dst string, tOpts output.TLSOpts) error {
 
 			var writeErr error
 			for _, msg := range msgs {
-				rec := messageRecord{
-					Topic:      msg.Topic,
-					Partition:  msg.Partition,
-					Offset:     msg.Offset,
-					Value:      string(msg.Value),
-					Headers:    msg.Headers,
-					ClientAddr: msg.ClientAddr,
-				}
-				if msg.Key != nil {
-					rec.Key = string(msg.Key)
-				}
-				if !msg.Timestamp.IsZero() {
-					rec.Timestamp = msg.Timestamp.String()
-				}
-
-				data, err := json.Marshal(rec)
+				data, err := fmtr.Format(msg)
 				if err != nil {
-					writeErr = fmt.Errorf("failed to marshal message: %w", err)
+					writeErr = fmt.Errorf("failed to format message: %w", err)
 					break
 				}
-				data = append(data, '\n')
 
 				if err := w.Write(data); err != nil {
 					writeErr = fmt.Errorf("failed to write message: %w", err)
@@ -165,4 +156,13 @@ func run(addr, dst string, tOpts output.TLSOpts) error {
 	log.Println("Shutting down...")
 	srv.Close(context.Background())
 	return nil
+}
+
+// parseSeparator interprets common escape sequences in the separator string.
+func parseSeparator(s string) []byte {
+	s = strings.ReplaceAll(s, `\n`, "\n")
+	s = strings.ReplaceAll(s, `\r`, "\r")
+	s = strings.ReplaceAll(s, `\t`, "\t")
+	s = strings.ReplaceAll(s, `\0`, "\x00")
+	return []byte(s)
 }
