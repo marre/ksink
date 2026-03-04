@@ -4,6 +4,7 @@ package main
 
 import (
 	"context"
+	"encoding/hex"
 	"fmt"
 	"log"
 	"os"
@@ -36,7 +37,9 @@ func main() {
 		addr      string
 		dst       string
 		fmtName   string
+		fmtStr    string
 		separator string
+		sepHex    string
 		tOpts     output.TLSOpts
 	)
 
@@ -61,9 +64,16 @@ Message formats (--output-format):
   json         JSON lines with key/value as UTF-8 strings (default)
   json-base64  JSON lines with key/value base64-encoded (for binary data)
   text         Raw message value followed by the separator
-  binary       Raw message value bytes with no separator by default`,
+  binary       Raw message value bytes with no separator by default
+  kcat         kcat-compatible format string (requires --output-format-string)
+
+kcat format specifiers (--output-format-string):
+  %t  topic       %k  key         %s  value (payload)
+  %p  partition   %o  offset      %T  timestamp (Unix ms)
+  %K  key length  %S  value length
+  %%  literal %%   \n  newline     \t  tab     \\  backslash`,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return run(addr, dst, fmtName, separator, tOpts)
+			return run(addr, dst, fmtName, fmtStr, separator, sepHex, tOpts)
 		},
 	}
 
@@ -71,9 +81,13 @@ Message formats (--output-format):
 	rootCmd.Flags().StringVar(&dst, "output", "messages.jsonl",
 		"Output destination (file path, tcp://, tls://, or nanomsg:// URL)")
 	rootCmd.Flags().StringVar(&fmtName, "output-format", "json",
-		"Message format: json, json-base64, text, binary")
+		"Message format: json, json-base64, text, binary, kcat")
+	rootCmd.Flags().StringVar(&fmtStr, "output-format-string", "",
+		`kcat-compatible format string (e.g. "%t %k %s\n"). Required when --output-format=kcat.`)
 	rootCmd.Flags().StringVar(&separator, "output-separator", "\n",
 		`Separator appended after each message. Escape sequences \n, \r, \t and \0 are interpreted.`)
+	rootCmd.Flags().StringVar(&sepHex, "output-separator-hex", "",
+		"Separator as hex-encoded bytes (e.g. \"0a\" for newline, \"00\" for null). Overrides --output-separator.")
 	rootCmd.Flags().StringVar(&tOpts.CertFile, "output-tls-cert", "",
 		"Client certificate file for output TLS/mTLS connections")
 	rootCmd.Flags().StringVar(&tOpts.KeyFile, "output-tls-key", "",
@@ -88,9 +102,12 @@ Message formats (--output-format):
 	}
 }
 
-func run(addr, dst, fmtName, separator string, tOpts output.TLSOpts) error {
-	sep := parseSeparator(separator)
-	fmtr, err := format.New(fmtName, sep)
+func run(addr, dst, fmtName, fmtStr, separator, sepHex string, tOpts output.TLSOpts) error {
+	sep, err := buildSeparator(separator, sepHex)
+	if err != nil {
+		return err
+	}
+	fmtr, err := format.New(fmtName, sep, fmtStr)
 	if err != nil {
 		return err
 	}
@@ -156,6 +173,19 @@ func run(addr, dst, fmtName, separator string, tOpts output.TLSOpts) error {
 	log.Println("Shutting down...")
 	srv.Close(context.Background())
 	return nil
+}
+
+// buildSeparator returns the separator bytes. If hexStr is non-empty it is
+// decoded as hex; otherwise the text separator is parsed for escape sequences.
+func buildSeparator(text, hexStr string) ([]byte, error) {
+	if hexStr != "" {
+		b, err := hex.DecodeString(hexStr)
+		if err != nil {
+			return nil, fmt.Errorf("invalid --output-separator-hex value: %w", err)
+		}
+		return b, nil
+	}
+	return parseSeparator(text), nil
 }
 
 // parseSeparator interprets common escape sequences in the separator string.

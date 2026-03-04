@@ -123,10 +123,12 @@ Use `--output-format` to control how messages are serialized:
 | `json-base64` | JSON lines with key/value base64-encoded (for binary data)      |
 | `text`        | Raw message value followed by the separator                      |
 | `binary`      | Raw message value bytes with no separator by default             |
+| `kcat`        | kcat-compatible format string (requires `--output-format-string`)|
 
 Use `--output-separator` to set the delimiter appended after each message
 (default: `\n`). Common escape sequences (`\n`, `\r`, `\t`, `\0`) are
-interpreted.
+interpreted. Use `--output-separator-hex` for hex-encoded binary delimiters
+(e.g. `0a` for newline, `00` for null byte).
 
 ```bash
 # Plain text values, one per line
@@ -137,4 +139,11 @@ go run ./cmd/ksink --output-format binary --output-separator "" --output data.bi
 
 # JSON with base64-encoded key/value for binary payloads
 go run ./cmd/ksink --output-format json-base64 --output messages.jsonl
+
+# Binary delimiter using hex encoding (null byte)
+go run ./cmd/ksink --output-format text --output-separator-hex "00" --output messages.txt
+
+# kcat-compatible output formatting
+go run ./cmd/ksink --output-format kcat \
+  --output-format-string 'Topic: %t Partition: %p Offset: %o\nKey: %k\nValue: %s\n---\n'
 ```
