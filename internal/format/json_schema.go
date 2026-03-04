@@ -39,7 +39,8 @@ const JSONSchema = `{
     },
     "timestamp": {
       "type": "string",
-      "description": "Message timestamp. Omitted when not set."
+      "description": "Message timestamp in Go time.Time.String() format (e.g. '2025-01-01 00:00:00 +0000 UTC'). Omitted when not set.",
+      "pattern": "^\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2}"
     },
     "client_addr": {
       "type": "string",

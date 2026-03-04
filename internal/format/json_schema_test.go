@@ -62,13 +62,15 @@ func TestJSONOutputMatchesSchema(t *testing.T) {
 	f, err := New("json", []byte("\n"))
 	require.NoError(t, err)
 
+	sep := []byte("\n")
+
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			data, err := f.Format(tc.msg)
 			require.NoError(t, err)
 
 			// Strip trailing separator before validation.
-			jsonBytes := data[:len(data)-1]
+			jsonBytes := data[:len(data)-len(sep)]
 
 			// Sanity: must be valid JSON.
 			require.True(t, json.Valid(jsonBytes), "output is not valid JSON")
