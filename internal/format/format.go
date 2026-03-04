@@ -123,6 +123,9 @@ func (f *jsonBase64Formatter) Format(msg *ksink.Message) ([]byte, error) {
 
 // --- text formatter ---
 
+// textFormatter writes the message value as-is. It is semantically distinct
+// from binaryFormatter to allow independent evolution (e.g. adding charset
+// handling in the future).
 type textFormatter struct {
 	separator []byte
 }
@@ -133,6 +136,9 @@ func (f *textFormatter) Format(msg *ksink.Message) ([]byte, error) {
 
 // --- binary formatter ---
 
+// binaryFormatter writes the raw message value bytes. It is kept separate
+// from textFormatter for clarity even though the implementation is currently
+// identical.
 type binaryFormatter struct {
 	separator []byte
 }

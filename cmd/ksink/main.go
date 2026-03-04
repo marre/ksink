@@ -73,7 +73,7 @@ Message formats (--output-format):
 	rootCmd.Flags().StringVar(&fmtName, "output-format", "json",
 		"Message format: json, json-base64, text, binary")
 	rootCmd.Flags().StringVar(&separator, "output-separator", "\n",
-		`Separator appended after each message (e.g. "\n", "", "\r\n")`)
+		`Separator appended after each message. Escape sequences \n, \r, \t and \0 are interpreted.`)
 	rootCmd.Flags().StringVar(&tOpts.CertFile, "output-tls-cert", "",
 		"Client certificate file for output TLS/mTLS connections")
 	rootCmd.Flags().StringVar(&tOpts.KeyFile, "output-tls-key", "",
@@ -159,10 +159,33 @@ func run(addr, dst, fmtName, separator string, tOpts output.TLSOpts) error {
 }
 
 // parseSeparator interprets common escape sequences in the separator string.
+// Supported: \n (newline), \r (carriage return), \t (tab), \0 (null), \\ (literal backslash).
 func parseSeparator(s string) []byte {
-	s = strings.ReplaceAll(s, `\n`, "\n")
-	s = strings.ReplaceAll(s, `\r`, "\r")
-	s = strings.ReplaceAll(s, `\t`, "\t")
-	s = strings.ReplaceAll(s, `\0`, "\x00")
-	return []byte(s)
+	var b strings.Builder
+	for i := 0; i < len(s); i++ {
+		if s[i] == '\\' && i+1 < len(s) {
+			switch s[i+1] {
+			case 'n':
+				b.WriteByte('\n')
+				i++
+			case 'r':
+				b.WriteByte('\r')
+				i++
+			case 't':
+				b.WriteByte('\t')
+				i++
+			case '0':
+				b.WriteByte(0)
+				i++
+			case '\\':
+				b.WriteByte('\\')
+				i++
+			default:
+				b.WriteByte(s[i])
+			}
+		} else {
+			b.WriteByte(s[i])
+		}
+	}
+	return []byte(b.String())
 }
