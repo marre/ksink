@@ -93,7 +93,10 @@ cfg := ksink.Config{
 The `cmd/ksink` tool forwards received messages to an output sink:
 
 ```bash
-# Write raw message values (binary) to a file, one per line (default)
+# Write raw message values (binary) to stdout, one per line (default)
+go run ./cmd/ksink --addr :9092
+
+# Write to a file instead of stdout
 go run ./cmd/ksink --addr :9092 --output messages.bin
 
 # Write JSON lines to a file
@@ -114,6 +117,9 @@ go run ./cmd/ksink --addr :9092 --output nanomsg://tcp://host:port
 
 # Send messages over a nanomsg PUSH socket with TLS
 go run ./cmd/ksink --addr :9092 --output nanomsg://tls+tcp://host:port --output-tls-ca ca.pem
+
+# Print the JSON schema for the json output format
+go run ./cmd/ksink json-schema
 ```
 
 ### Message Formats
@@ -135,7 +141,7 @@ interpreted. Use `--output-separator-hex` for hex-encoded binary delimiters
 the delimiter entirely.
 
 ```bash
-# Binary output with no separator
+# Binary output with no separator to a file
 go run ./cmd/ksink --no-separator --output data.bin
 
 # Plain text values, one per line

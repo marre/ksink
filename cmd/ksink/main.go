@@ -51,8 +51,9 @@ func main() {
 		Long: `ksink accepts produce requests from Kafka producers and forwards
 received messages to an output sink.
 
-Output formats:
-  messages.jsonl                    Write JSON lines to a file
+Output destinations (--output):
+  -                                 Write to stdout (default)
+  messages.jsonl                    Write to a file
   tcp://host:port                   Connect as a TCP client
   tls://host:port                   Connect over TLS
   nanomsg://tcp://host:port         Send messages over a nanomsg PUSH socket
@@ -82,8 +83,8 @@ kcat format specifiers (--output-format-string):
 	}
 
 	rootCmd.Flags().StringVar(&addr, "addr", ":9092", "Address to listen on")
-	rootCmd.Flags().StringVar(&dst, "output", "messages.bin",
-		"Output destination (file path, tcp://, tls://, or nanomsg:// URL)")
+	rootCmd.Flags().StringVar(&dst, "output", "-",
+		`Output destination: "-" for stdout (default), file path, tcp://, tls://, or nanomsg:// URL`)
 	rootCmd.Flags().StringVar(&fmtName, "output-format", "binary",
 		"Message format: binary, json, json-base64, text, kcat")
 	rootCmd.Flags().StringVar(&fmtStr, "output-format-string", "",
@@ -102,6 +103,15 @@ kcat format specifiers (--output-format-string):
 		"CA certificate file for verifying the output server")
 	rootCmd.Flags().BoolVar(&tOpts.SkipVerify, "output-tls-skip-verify", false,
 		"Skip TLS certificate verification for output connections")
+
+	rootCmd.AddCommand(&cobra.Command{
+		Use:   "json-schema",
+		Short: "Print the JSON schema for the json output format to stdout",
+		Args:  cobra.NoArgs,
+		Run: func(cmd *cobra.Command, args []string) {
+			fmt.Println(format.JSONSchema)
+		},
+	})
 
 	if err := rootCmd.Execute(); err != nil {
 		os.Exit(1)
@@ -143,7 +153,11 @@ func run(addr, dst, fmtName, fmtStr, separator, sepHex string, noSeparator bool,
 		return fmt.Errorf("failed to start server: %w", err)
 	}
 
-	log.Printf("Kafka server listening on %s, output=%s", srv.Addr(), dst)
+	outputLabel := dst
+	if dst == "-" {
+		outputLabel = "stdout"
+	}
+	log.Printf("Kafka server listening on %s, output=%s", srv.Addr(), outputLabel)
 
 	// Start read loop
 	go func() {
