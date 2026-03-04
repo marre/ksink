@@ -1,10 +1,10 @@
 // Package format provides message formatting for different output modes.
 //
 // Supported formats:
-//   - json:        JSON lines with key/value as UTF-8 strings (default)
+//   - binary:      Raw message value bytes (default, newline-delimited)
+//   - json:        JSON lines with key/value as UTF-8 strings
 //   - json-base64: JSON lines with key/value as base64-encoded strings
 //   - text:        Raw message value followed by a separator (default: newline)
-//   - binary:      Raw message value bytes with no separator by default
 //   - kcat:        kcat-compatible format string (use --output-format-string)
 package format
 
