@@ -102,6 +102,12 @@ go run ./cmd/ksink --addr :9092 --output messages.bin
 # Write JSON lines to a file
 go run ./cmd/ksink --addr :9092 --output messages.jsonl --output-format json
 
+# Send JSON lines via HTTP POST to an HTTP endpoint
+go run ./cmd/ksink --addr :9092 --output http://localhost:8080/ingest --output-format json
+
+# Send JSON lines via HTTPS POST to a remote endpoint
+go run ./cmd/ksink --addr :9092 --output https://example.com/ingest --output-format json
+
 # Print the JSON schema for the json output format
 go run ./cmd/ksink json-schema
 ```

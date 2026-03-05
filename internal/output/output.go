@@ -81,6 +81,10 @@ func Open(dst string, tlsCfg *tls.Config) (Writer, error) {
 	case strings.HasPrefix(dst, "https://"), strings.HasPrefix(dst, "http://"):
 		return NewHTTPWriter(dst, HTTPOpts{}, tlsCfg)
 	default:
+		// Reject unknown URL-like schemes explicitly to avoid treating them as file paths.
+		if strings.Contains(dst, "://") {
+			return nil, fmt.Errorf("unsupported output scheme in %q; only -, http(s), or file paths are supported", dst)
+		}
 		return newFileWriter(dst)
 	}
 }
