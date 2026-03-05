@@ -2,12 +2,8 @@
 //
 // Supported schemes:
 //   - -                              Standard output (stdout)
-//   - tcp://host:port               Plain TCP
-//   - tls://host:port               TLS-wrapped TCP
 //   - http://host:port/path         HTTP POST
 //   - https://host:port/path        HTTPS POST
-//   - nanomsg://tcp://host:port     Nanomsg over plain TCP
-//   - nanomsg://tls+tcp://host:port Nanomsg over TLS
 //   - <path>                        File output
 package output
 
@@ -84,19 +80,11 @@ func Open(dst string, tlsCfg *tls.Config) (Writer, error) {
 		return newStdoutWriter(), nil
 	case strings.HasPrefix(dst, "https://"), strings.HasPrefix(dst, "http://"):
 		return NewHTTPWriter(dst, HTTPOpts{}, tlsCfg)
-	case strings.HasPrefix(dst, "tls://"):
-		addr := strings.TrimPrefix(dst, "tls://")
-		if tlsCfg == nil {
-			tlsCfg = &tls.Config{MinVersion: tls.VersionTLS12}
-		}
-		return newTCPWriter(addr, tlsCfg)
-	case strings.HasPrefix(dst, "tcp://"):
-		addr := strings.TrimPrefix(dst, "tcp://")
-		return newTCPWriter(addr, nil)
-	case strings.HasPrefix(dst, "nanomsg://"):
-		url := strings.TrimPrefix(dst, "nanomsg://")
-		return newNanomsgWriter(url, tlsCfg)
 	default:
+		// Reject unknown URL-like schemes explicitly to avoid treating them as file paths.
+		if strings.Contains(dst, "://") {
+			return nil, fmt.Errorf("unsupported output scheme in %q; only -, http(s), or file paths are supported", dst)
+		}
 		return newFileWriter(dst)
 	}
 }

@@ -10,7 +10,6 @@ require (
 	github.com/twmb/franz-go/pkg/kmsg v1.12.0
 	github.com/xdg-go/scram v1.2.0
 	github.com/xeipuuv/gojsonschema v1.2.0
-	go.nanomsg.org/mangos/v3 v3.4.2
 )
 
 require (
@@ -32,7 +31,6 @@ require (
 	github.com/go-logr/stdr v1.2.2 // indirect
 	github.com/go-viper/mapstructure/v2 v2.5.0 // indirect
 	github.com/google/shlex v0.0.0-20191202100458-e7afc7fbc510 // indirect
-	github.com/gorilla/websocket v1.5.0 // indirect
 	github.com/inconshreveable/mousetrap v1.1.0 // indirect
 	github.com/klauspost/compress v1.18.4 // indirect
 	github.com/moby/docker-image-spec v1.3.1 // indirect

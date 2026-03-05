@@ -102,21 +102,11 @@ go run ./cmd/ksink --addr :9092 --output messages.bin
 # Write JSON lines to a file
 go run ./cmd/ksink --addr :9092 --output messages.jsonl --output-format json
 
-# Send JSON lines over a TCP client socket
-go run ./cmd/ksink --addr :9092 --output tcp://host:port --output-format json
+# Send JSON lines via HTTP POST to an HTTP endpoint
+go run ./cmd/ksink --addr :9092 --output http://localhost:8080/ingest --output-format json
 
-# Send JSON lines over a TLS-encrypted TCP connection
-go run ./cmd/ksink --addr :9092 --output tls://host:port --output-tls-ca ca.pem --output-format json
-
-# TLS with mTLS client authentication
-go run ./cmd/ksink --addr :9092 --output tls://host:port \
-  --output-tls-ca ca.pem --output-tls-cert client.pem --output-tls-key client-key.pem
-
-# Send messages over a nanomsg PUSH socket
-go run ./cmd/ksink --addr :9092 --output nanomsg://tcp://host:port
-
-# Send messages over a nanomsg PUSH socket with TLS
-go run ./cmd/ksink --addr :9092 --output nanomsg://tls+tcp://host:port --output-tls-ca ca.pem
+# Send JSON lines via HTTPS POST to a remote endpoint
+go run ./cmd/ksink --addr :9092 --output https://example.com/ingest --output-format json
 
 # Print the JSON schema for the json output format
 go run ./cmd/ksink json-schema
