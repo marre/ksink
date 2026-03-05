@@ -117,6 +117,8 @@ kcat format specifiers (--output-format-string):
 		"Delay between HTTP retry attempts")
 	rootCmd.Flags().StringVar(&httpOpts.DLQPath, "output-http-dlq", "",
 		"File path for dead-letter queue; failed HTTP messages are appended here instead of stopping the process")
+	rootCmd.Flags().DurationVar(&httpOpts.Timeout, "output-http-timeout", 30*time.Second,
+		"HTTP request timeout per message")
 
 	rootCmd.AddCommand(&cobra.Command{
 		Use:   "json-schema",

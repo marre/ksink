@@ -24,6 +24,10 @@ type HTTPOpts struct {
 	// are appended to this file when all retries are exhausted.
 	// If empty, no DLQ is used and errors are returned to the caller.
 	DLQPath string
+
+	// Timeout is the HTTP client timeout per request. Zero uses the
+	// default of 30 seconds.
+	Timeout time.Duration
 }
 
 // httpWriter sends each message as an HTTP POST request body.
@@ -45,9 +49,13 @@ func NewHTTPWriter(url string, opts HTTPOpts, tlsCfg *tls.Config) (Writer, error
 	if tlsCfg != nil {
 		transport.TLSClientConfig = tlsCfg
 	}
+	timeout := opts.Timeout
+	if timeout == 0 {
+		timeout = 30 * time.Second
+	}
 	client := &http.Client{
 		Transport: transport,
-		Timeout:   30 * time.Second,
+		Timeout:   timeout,
 	}
 	return &httpWriter{
 		url:    url,
