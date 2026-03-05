@@ -1,5 +1,5 @@
 // Command ksink starts a Kafka-protocol-compatible server and forwards all
-// received messages to an output sink (file, TCP socket, or nanomsg).
+// received messages to an output sink (file, TCP socket, HTTP, or nanomsg).
 package main
 
 import (
@@ -11,6 +11,7 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/marre/ksink/internal/format"
 	"github.com/marre/ksink/internal/output"
@@ -42,6 +43,7 @@ func main() {
 		sepHex      string
 		noSeparator bool
 		tOpts       output.TLSOpts
+		httpOpts    output.HTTPOpts
 	)
 
 	rootCmd := &cobra.Command{
@@ -56,11 +58,17 @@ Output destinations (--output):
   messages.jsonl                    Write to a file
   tcp://host:port                   Connect as a TCP client
   tls://host:port                   Connect over TLS
+  http://host:port/path             POST messages via HTTP
+  https://host:port/path            POST messages via HTTPS
   nanomsg://tcp://host:port         Send messages over a nanomsg PUSH socket
   nanomsg://tls+tcp://host:port     Send messages over a nanomsg PUSH socket with TLS
 
 Use --output-tls-* flags to configure client certificates (mTLS) and
-CA certificates for server verification on tcp, tls, and nanomsg outputs.
+CA certificates for server verification on tcp, tls, https, and nanomsg outputs.
+
+HTTP output sends one message at a time and waits for a 200 OK response
+before proceeding to the next message. Use --output-http-* flags to
+configure retries and a dead-letter queue for failed messages.
 
 Message formats (--output-format):
   binary       Raw message value bytes (default, newline-delimited)
@@ -78,7 +86,7 @@ kcat format specifiers (--output-format-string):
   %K  key length  %S  value length
   %%  literal %%   \n  newline     \t  tab     \\  backslash`,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return run(addr, dst, fmtName, fmtStr, separator, sepHex, noSeparator, tOpts)
+			return run(addr, dst, fmtName, fmtStr, separator, sepHex, noSeparator, tOpts, httpOpts)
 		},
 	}
 
@@ -103,6 +111,12 @@ kcat format specifiers (--output-format-string):
 		"CA certificate file for verifying the output server")
 	rootCmd.Flags().BoolVar(&tOpts.SkipVerify, "output-tls-skip-verify", false,
 		"Skip TLS certificate verification for output connections")
+	rootCmd.Flags().IntVar(&httpOpts.MaxRetries, "output-http-retries", 0,
+		"Number of retry attempts for failed HTTP requests (0 = no retries)")
+	rootCmd.Flags().DurationVar(&httpOpts.RetryDelay, "output-http-retry-delay", time.Second,
+		"Delay between HTTP retry attempts")
+	rootCmd.Flags().StringVar(&httpOpts.DLQPath, "output-http-dlq", "",
+		"File path for dead-letter queue; failed HTTP messages are appended here instead of stopping the process")
 
 	rootCmd.AddCommand(&cobra.Command{
 		Use:   "json-schema",
@@ -118,7 +132,7 @@ kcat format specifiers (--output-format-string):
 	}
 }
 
-func run(addr, dst, fmtName, fmtStr, separator, sepHex string, noSeparator bool, tOpts output.TLSOpts) error {
+func run(addr, dst, fmtName, fmtStr, separator, sepHex string, noSeparator bool, tOpts output.TLSOpts, httpOpts output.HTTPOpts) error {
 	sep, err := buildSeparator(separator, sepHex, noSeparator)
 	if err != nil {
 		return err
@@ -133,7 +147,12 @@ func run(addr, dst, fmtName, fmtStr, separator, sepHex string, noSeparator bool,
 		return err
 	}
 
-	w, err := output.Open(dst, tlsCfg)
+	var w output.Writer
+	if strings.HasPrefix(dst, "http://") || strings.HasPrefix(dst, "https://") {
+		w, err = output.NewHTTPWriter(dst, httpOpts, tlsCfg)
+	} else {
+		w, err = output.Open(dst, tlsCfg)
+	}
 	if err != nil {
 		return err
 	}

@@ -4,6 +4,8 @@
 //   - -                              Standard output (stdout)
 //   - tcp://host:port               Plain TCP
 //   - tls://host:port               TLS-wrapped TCP
+//   - http://host:port/path         HTTP POST
+//   - https://host:port/path        HTTPS POST
 //   - nanomsg://tcp://host:port     Nanomsg over plain TCP
 //   - nanomsg://tls+tcp://host:port Nanomsg over TLS
 //   - <path>                        File output
@@ -74,10 +76,14 @@ func (o *TLSOpts) BuildTLSConfig() (*tls.Config, error) {
 
 // Open creates a Writer based on the output string.
 // The special value "-" writes to standard output.
+// For http:// and https:// URLs, Open creates an HTTP writer with default
+// options (no retries, no DLQ). Use NewHTTPWriter for full configuration.
 func Open(dst string, tlsCfg *tls.Config) (Writer, error) {
 	switch {
 	case dst == "-":
 		return newStdoutWriter(), nil
+	case strings.HasPrefix(dst, "https://"), strings.HasPrefix(dst, "http://"):
+		return NewHTTPWriter(dst, HTTPOpts{}, tlsCfg)
 	case strings.HasPrefix(dst, "tls://"):
 		addr := strings.TrimPrefix(dst, "tls://")
 		if tlsCfg == nil {
