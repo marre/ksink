@@ -45,6 +45,9 @@ type httpWriter struct {
 // given URL. It supports optional TLS configuration, retries, and a
 // dead-letter queue for failed messages.
 func NewHTTPWriter(url string, opts HTTPOpts, tlsCfg *tls.Config) (Writer, error) {
+	if opts.MaxRetries < 0 {
+		opts.MaxRetries = 0
+	}
 	transport := &http.Transport{}
 	if tlsCfg != nil {
 		transport.TLSClientConfig = tlsCfg
@@ -84,7 +87,7 @@ func (w *httpWriter) Write(data []byte) error {
 	// All attempts failed.
 	if w.opts.DLQPath != "" {
 		if err := w.writeDLQ(data); err != nil {
-			return fmt.Errorf("HTTP POST failed (%w) and DLQ write failed: %w", lastErr, err)
+			return fmt.Errorf("HTTP POST to %s failed after %d attempt(s): %w; additionally, DLQ write to %s failed: %v", w.url, attempts, lastErr, w.opts.DLQPath, err)
 		}
 		return nil // written to DLQ, continue processing
 	}

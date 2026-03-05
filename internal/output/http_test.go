@@ -192,13 +192,32 @@ func TestHTTPWriteRetryThenDLQ(t *testing.T) {
 }
 
 func TestHTTPWriteConnectionError(t *testing.T) {
-	// Use an address that is not listening.
-	w, err := output.NewHTTPWriter("http://127.0.0.1:1", output.HTTPOpts{}, nil)
+	// Use an address that is not listening with a short timeout to avoid slow tests.
+	w, err := output.NewHTTPWriter("http://127.0.0.1:1", output.HTTPOpts{
+		Timeout: 1 * time.Second,
+	}, nil)
 	require.NoError(t, err)
 
 	err = w.Write([]byte("msg"))
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "HTTP POST")
+	require.NoError(t, w.Close())
+}
+
+func TestHTTPWriteNegativeRetries(t *testing.T) {
+	// Negative MaxRetries should be clamped to 0 (single attempt, no retries).
+	var attempts atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ts.Close()
+
+	w, err := output.NewHTTPWriter(ts.URL, output.HTTPOpts{MaxRetries: -5}, nil)
+	require.NoError(t, err)
+
+	require.NoError(t, w.Write([]byte("msg")))
+	assert.Equal(t, int32(1), attempts.Load())
 	require.NoError(t, w.Close())
 }
 
