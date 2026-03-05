@@ -153,16 +153,17 @@ output:
 		MinVersion: tls.VersionTLS12,
 	}
 
+	readyClient := &http.Client{
+		Transport: &http.Transport{TLSClientConfig: bentoTLSCfg.Clone()},
+		Timeout:   2 * time.Second,
+	}
+	readyURL := fmt.Sprintf("https://localhost:%s/ready", bentoPort)
 	err = pool.Retry(func() error {
-		httpClient := &http.Client{
-			Transport: &http.Transport{TLSClientConfig: bentoTLSCfg.Clone()},
-			Timeout:   2 * time.Second,
-		}
-		resp, reqErr := httpClient.Get(fmt.Sprintf("https://localhost:%s/ready", bentoPort))
+		resp, reqErr := readyClient.Get(readyURL)
 		if reqErr != nil {
 			return reqErr
 		}
-		resp.Body.Close()
+		defer resp.Body.Close()
 		if resp.StatusCode != http.StatusOK {
 			return fmt.Errorf("bento not ready: status %d", resp.StatusCode)
 		}
