@@ -82,7 +82,7 @@ func TestJSONOutputMatchesSchema(t *testing.T) {
 
 	for _, formatCase := range testCases {
 		t.Run(formatCase.name, func(t *testing.T) {
-			f, err := New("json", sep, formatCase.options...)
+			f, err := New("jsonl", nil, formatCase.options...)
 			require.NoError(t, err)
 
 			for _, tc := range schemaTestMessages {

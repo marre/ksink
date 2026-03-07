@@ -70,15 +70,17 @@ configure retries and a dead-letter queue for failed messages.
 
 Message formats (--output-format):
   binary       Raw message value bytes (default, newline-delimited)
-  json         JSON lines with configurable UTF-8/base64 encoding for key/value
+  jsonl        JSON lines with configurable UTF-8/base64 encoding for key/value
   kcat         kcat-compatible format string (requires --output-format-string)
 
 JSON format options:
 	--output-json-base64-key      Encode the JSON key field as base64
 	--output-json-base64-value    Encode the JSON value field as base64
 
-Use --no-separator to clear the delimiter entirely (equivalent to
---output-separator "").
+Separator options (binary format only):
+  --output-separator            Separator appended after each message (default: \n)
+  --output-separator-hex        Separator as hex-encoded bytes
+  --no-separator                Clear the separator entirely
 
 kcat format specifiers (--output-format-string):
   %t  topic       %k  key         %s  value (payload)
@@ -86,6 +88,11 @@ kcat format specifiers (--output-format-string):
   %K  key length  %S  value length
   %%  literal %%   \n  newline     \t  tab     \\  backslash`,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if fmtName != "binary" {
+				if cmd.Flags().Changed("output-separator") || cmd.Flags().Changed("output-separator-hex") || cmd.Flags().Changed("no-separator") {
+					return fmt.Errorf("--output-separator, --output-separator-hex, and --no-separator are only supported with --output-format=binary")
+				}
+			}
 			return run(addr, dst, fmtName, fmtStr, jsonB64Key, jsonB64Val, separator, sepHex, noSeparator, tOpts, httpOpts)
 		},
 	}
@@ -94,19 +101,19 @@ kcat format specifiers (--output-format-string):
 	rootCmd.Flags().StringVar(&dst, "output", "-",
 		`Output destination: "-" for stdout (default), file path, or http(s):// URL`)
 	rootCmd.Flags().StringVar(&fmtName, "output-format", "binary",
-		"Message format: binary, json, kcat")
+		"Message format: binary, jsonl, kcat")
 	rootCmd.Flags().StringVar(&fmtStr, "output-format-string", "",
 		`kcat-compatible format string (e.g. "%t %k %s\n"). Required when --output-format=kcat.`)
 	rootCmd.Flags().BoolVar(&jsonB64Key, "output-json-base64-key", false,
-		"Encode the JSON key field as base64 when --output-format=json")
+		"Encode the JSON key field as base64 when --output-format=jsonl")
 	rootCmd.Flags().BoolVar(&jsonB64Val, "output-json-base64-value", false,
-		"Encode the JSON value field as base64 when --output-format=json")
+		"Encode the JSON value field as base64 when --output-format=jsonl")
 	rootCmd.Flags().StringVar(&separator, "output-separator", "\n",
-		`Separator appended after each message. Escape sequences \n, \r, \t and \0 are interpreted.`)
+		`Separator appended after each binary message. Escape sequences \n, \r, \t and \0 are interpreted.`)
 	rootCmd.Flags().StringVar(&sepHex, "output-separator-hex", "",
-		"Separator as hex-encoded bytes (e.g. \"0a\" for newline, \"00\" for null). Overrides --output-separator.")
+		"Separator as hex-encoded bytes (e.g. \"0a\" for newline, \"00\" for null). Overrides --output-separator. Binary format only.")
 	rootCmd.Flags().BoolVar(&noSeparator, "no-separator", false,
-		"Clear the separator entirely (no delimiter between messages).")
+		"Clear the separator entirely (no delimiter between messages). Binary format only.")
 	rootCmd.Flags().StringVar(&tOpts.CertFile, "output-tls-cert", "",
 		"Client certificate file for output TLS/mTLS connections")
 	rootCmd.Flags().StringVar(&tOpts.KeyFile, "output-tls-key", "",
@@ -126,7 +133,7 @@ kcat format specifiers (--output-format-string):
 
 	rootCmd.AddCommand(&cobra.Command{
 		Use:   "json-schema",
-		Short: "Print the JSON schema for the json output format to stdout",
+		Short: "Print the JSON schema for the jsonl output format to stdout",
 		Args:  cobra.NoArgs,
 		Run: func(cmd *cobra.Command, args []string) {
 			fmt.Println(format.JSONSchema)
@@ -139,17 +146,21 @@ kcat format specifiers (--output-format-string):
 }
 
 func run(addr, dst, fmtName, fmtStr string, jsonB64Key, jsonB64Val bool, separator, sepHex string, noSeparator bool, tOpts output.TLSOpts, httpOpts output.HTTPOpts) error {
-	sep, err := buildSeparator(separator, sepHex, noSeparator)
-	if err != nil {
-		return err
+	var sep []byte
+	if fmtName == "binary" {
+		var err error
+		sep, err = buildSeparator(separator, sepHex, noSeparator)
+		if err != nil {
+			return err
+		}
 	}
 
 	// Validate format-specific flag combinations before constructing anything.
 	if fmtStr != "" && fmtName != "kcat" {
 		return fmt.Errorf("--output-format-string is only supported with --output-format=kcat")
 	}
-	if (jsonB64Key || jsonB64Val) && fmtName != "json" {
-		return fmt.Errorf("--output-json-base64-key and --output-json-base64-value require --output-format=json")
+	if (jsonB64Key || jsonB64Val) && fmtName != "jsonl" {
+		return fmt.Errorf("--output-json-base64-key and --output-json-base64-value require --output-format=jsonl")
 	}
 
 	options := make([]format.Option, 0, 3)
@@ -219,7 +230,7 @@ func run(addr, dst, fmtName, fmtStr string, jsonB64Key, jsonB64Val bool, separat
 					break
 				}
 
-				if err := w.Write(data); err != nil {
+				if err := w.Write(data, msg); err != nil {
 					writeErr = fmt.Errorf("failed to write message: %w", err)
 					break
 				}

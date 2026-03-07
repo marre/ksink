@@ -12,7 +12,7 @@ import (
 )
 
 func TestJSONFormatter(t *testing.T) {
-	f, err := New("json", []byte("\n"))
+	f, err := New("jsonl", nil)
 	require.NoError(t, err)
 
 	msg := sampleMessage()
@@ -38,7 +38,7 @@ func TestJSONFormatter(t *testing.T) {
 }
 
 func TestJSONFormatterNilKey(t *testing.T) {
-	f, err := New("json", []byte("\n"))
+	f, err := New("jsonl", nil)
 	require.NoError(t, err)
 
 	msg := sampleMessage()
@@ -53,7 +53,7 @@ func TestJSONFormatterNilKey(t *testing.T) {
 }
 
 func TestJSONFormatterEmptyKey(t *testing.T) {
-	f, err := New("json", []byte("\n"))
+	f, err := New("jsonl", nil)
 	require.NoError(t, err)
 
 	msg := sampleMessage()
@@ -75,7 +75,7 @@ func TestJSONFormatterEmptyKey(t *testing.T) {
 }
 
 func TestJSONFormatterZeroTimestamp(t *testing.T) {
-	f, err := New("json", []byte("\n"))
+	f, err := New("jsonl", nil)
 	require.NoError(t, err)
 
 	msg := sampleMessage()
@@ -89,7 +89,7 @@ func TestJSONFormatterZeroTimestamp(t *testing.T) {
 }
 
 func TestJSONFormatterBase64EncodesKeyAndValue(t *testing.T) {
-	f, err := New("json", []byte("\n"), WithJSONBase64Key(), WithJSONBase64Value())
+	f, err := New("jsonl", nil, WithJSONBase64Key(), WithJSONBase64Value())
 	require.NoError(t, err)
 
 	msg := sampleMessage()
@@ -106,7 +106,7 @@ func TestJSONFormatterBase64EncodesKeyAndValue(t *testing.T) {
 }
 
 func TestJSONFormatterCanBase64EncodeValueOnly(t *testing.T) {
-	f, err := New("json", []byte("\n"), WithJSONBase64Value())
+	f, err := New("jsonl", nil, WithJSONBase64Value())
 	require.NoError(t, err)
 
 	msg := sampleMessage()
@@ -123,7 +123,7 @@ func TestJSONFormatterCanBase64EncodeValueOnly(t *testing.T) {
 }
 
 func TestJSONFormatterBase64EncodesBinaryData(t *testing.T) {
-	f, err := New("json", []byte("\n"), WithJSONBase64Key(), WithJSONBase64Value())
+	f, err := New("jsonl", nil, WithJSONBase64Key(), WithJSONBase64Value())
 	require.NoError(t, err)
 
 	binData := []byte{0x00, 0xFF, 0xFE, 0x80, 0x01}

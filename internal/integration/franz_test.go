@@ -186,7 +186,7 @@ func TestFranzSASLPlain(t *testing.T) {
 }
 
 func TestFranzSASLPlainWrongPassword(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
 	srv, addr := startTestServer(t, Config{
@@ -292,7 +292,7 @@ func TestFranzSASLScram512(t *testing.T) {
 }
 
 func TestFranzSASLScramWrongPassword(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
 	srv, addr := startTestServer(t, Config{
@@ -782,7 +782,7 @@ func TestFranzMTLS(t *testing.T) {
 
 // TestFranzJSONOutputMatchesSchema produces a message through the full server
 // pipeline and validates that formatting the resulting *ksink.Message with the
-// json formatter, across supported encoding options, produces output that
+// jsonl formatter, across supported encoding options, produces output that
 // conforms to the JSON schema.
 func TestFranzJSONOutputMatchesSchema(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -837,15 +837,15 @@ func TestFranzJSONOutputMatchesSchema(t *testing.T) {
 		name    string
 		options []format.Option
 	}{
-		{name: "json"},
-		{name: "json_base64_key", options: []format.Option{format.WithJSONBase64Key()}},
-		{name: "json_base64_value", options: []format.Option{format.WithJSONBase64Value()}},
-		{name: "json_base64_key_value", options: []format.Option{format.WithJSONBase64Key(), format.WithJSONBase64Value()}},
+		{name: "jsonl"},
+		{name: "jsonl_base64_key", options: []format.Option{format.WithJSONBase64Key()}},
+		{name: "jsonl_base64_value", options: []format.Option{format.WithJSONBase64Value()}},
+		{name: "jsonl_base64_key_value", options: []format.Option{format.WithJSONBase64Key(), format.WithJSONBase64Value()}},
 	}
 
 	for _, testCase := range testCases {
 		t.Run(testCase.name, func(t *testing.T) {
-			fmtr, err := format.New("json", []byte("\n"), testCase.options...)
+			fmtr, err := format.New("jsonl", nil, testCase.options...)
 			require.NoError(t, err)
 
 			for _, msg := range br.msgs {

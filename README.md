@@ -100,15 +100,15 @@ go run ./cmd/ksink --addr :9092
 go run ./cmd/ksink --addr :9092 --output messages.bin
 
 # Write JSON lines to a file
-go run ./cmd/ksink --addr :9092 --output messages.jsonl --output-format json
+go run ./cmd/ksink --addr :9092 --output messages.jsonl --output-format jsonl
 
 # Send JSON lines via HTTP POST to an HTTP endpoint
-go run ./cmd/ksink --addr :9092 --output http://localhost:8080/ingest --output-format json
+go run ./cmd/ksink --addr :9092 --output http://localhost:8080/ingest --output-format jsonl
 
 # Send JSON lines via HTTPS POST to a remote endpoint
-go run ./cmd/ksink --addr :9092 --output https://example.com/ingest --output-format json
+go run ./cmd/ksink --addr :9092 --output https://example.com/ingest --output-format jsonl
 
-# Print the JSON schema for the json output format
+# Print the JSON schema for the jsonl output format
 go run ./cmd/ksink json-schema
 ```
 
@@ -119,18 +119,24 @@ Use `--output-format` to control how messages are serialized:
 | Format        | Description                                                      |
 |---------------|------------------------------------------------------------------|
 | `binary`      | Raw message value bytes, newline-delimited (default)             |
-| `json`        | JSON lines with per-field UTF-8/base64 encoding options          |
+| `jsonl`       | JSON lines with per-field UTF-8/base64 encoding options          |
 | `kcat`        | kcat-compatible format string (requires `--output-format-string`)|
 
-Use `--output-separator` to set the delimiter appended after each message
-(default: `\n`). Common escape sequences (`\n`, `\r`, `\t`, `\0`) are
+Use `--output-separator` to set the delimiter appended after each binary
+message (default: `\n`). Common escape sequences (`\n`, `\r`, `\t`, `\0`) are
 interpreted. Use `--output-separator-hex` for hex-encoded binary delimiters
 (e.g. `0a` for newline, `00` for null byte). Use `--no-separator` to clear
-the delimiter entirely.
+the delimiter entirely. Separator options only apply to binary format; jsonl
+is always newline-delimited and HTTP output is delimited by HTTP requests.
 
 For JSON output, use `--output-json-base64-key` and/or
 `--output-json-base64-value` to base64-encode those fields when payloads are
 not safe to emit as UTF-8.
+
+When using HTTP output, Kafka message metadata is sent as HTTP headers:
+`X-Kafka-Topic`, `X-Kafka-Partition`, `X-Kafka-Offset`, `X-Kafka-Key`
+(base64-encoded), `X-Kafka-Header-{name}`, `X-Kafka-Timestamp`
+(Unix milliseconds), and `X-Kafka-Client-Addr`.
 
 ```bash
 # Binary output with no separator to a file
@@ -140,7 +146,7 @@ go run ./cmd/ksink --no-separator --output data.bin
 go run ./cmd/ksink --output messages.bin
 
 # JSON with base64-encoded key/value for binary payloads
-go run ./cmd/ksink --output-format json --output-json-base64-key --output-json-base64-value --output messages.jsonl
+go run ./cmd/ksink --output-format jsonl --output-json-base64-key --output-json-base64-value --output messages.jsonl
 
 # Binary delimiter using hex encoding (null byte)
 go run ./cmd/ksink --output-separator-hex "00" --output messages.bin

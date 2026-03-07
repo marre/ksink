@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"os"
 	"sync"
+
+	"github.com/marre/ksink/pkg/ksink"
 )
 
 // fileWriter writes JSON lines to a file.
@@ -20,7 +22,7 @@ func newFileWriter(path string) (*fileWriter, error) {
 	return &fileWriter{f: f}, nil
 }
 
-func (w *fileWriter) Write(data []byte) error {
+func (w *fileWriter) Write(data []byte, _ *ksink.Message) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	_, err := w.f.Write(data)

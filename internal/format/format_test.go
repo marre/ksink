@@ -16,7 +16,7 @@ func TestNewUnknownFormat(t *testing.T) {
 }
 
 func TestNewValidFormats(t *testing.T) {
-	for _, name := range []string{"json", "binary"} {
+	for _, name := range []string{"jsonl", "binary"} {
 		f, err := New(name, []byte("\n"))
 		require.NoError(t, err, name)
 		require.NotNil(t, f, name)
@@ -36,7 +36,7 @@ func TestNewKcatValid(t *testing.T) {
 }
 
 func TestNewRejectsKcatFormatStringForNonKcat(t *testing.T) {
-	for _, name := range []string{"json", "binary"} {
+	for _, name := range []string{"jsonl", "binary"} {
 		_, err := New(name, nil, WithKcatFormatString("%s"))
 		require.Error(t, err, name)
 		assert.Contains(t, err.Error(), "kcat", name)
@@ -51,11 +51,11 @@ func TestNewRejectsBase64OptionsForNonJSON(t *testing.T) {
 		}
 		_, err := New(name, nil, append(opts, WithJSONBase64Key())...)
 		require.Error(t, err, name)
-		assert.Contains(t, err.Error(), "json", name)
+		assert.Contains(t, err.Error(), "jsonl", name)
 
 		_, err = New(name, nil, append(opts, WithJSONBase64Value())...)
 		require.Error(t, err, name)
-		assert.Contains(t, err.Error(), "json", name)
+		assert.Contains(t, err.Error(), "jsonl", name)
 	}
 }
 

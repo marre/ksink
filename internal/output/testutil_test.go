@@ -110,7 +110,7 @@ func startReadWriteLoop(t *testing.T, srv *ksink.Server, w output.Writer) {
                     break
                 }
                 data = append(data, '\n')
-                if werr := w.Write(data); werr != nil {
+                if werr := w.Write(data, msg); werr != nil {
                     writeErr = werr
                     break
                 }

@@ -86,9 +86,13 @@ func TestFranzHTTPSOutputToBento(t *testing.T) {
 	serverCertPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: serverCertDER})
 	serverKeyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(serverKey)})
 
+	// Make temp dir traversable by the Bento container (runs as uid 10001).
+	require.NoError(t, os.Chmod(tmpDir, 0755))
+
 	// Write certs to temp dir
 	certsDir := tmpDir + "/certs"
 	require.NoError(t, os.MkdirAll(certsDir, 0755))
+	require.NoError(t, os.Chmod(certsDir, 0755))
 	require.NoError(t, os.WriteFile(certsDir+"/server-cert.pem", serverCertPEM, 0644))
 	require.NoError(t, os.WriteFile(certsDir+"/server-key.pem", serverKeyPEM, 0644))
 
@@ -115,6 +119,7 @@ output:
 `
 	configDir := tmpDir + "/config"
 	require.NoError(t, os.MkdirAll(configDir, 0755))
+	require.NoError(t, os.Chmod(configDir, 0755))
 	require.NoError(t, os.WriteFile(configDir+"/bento.yaml", []byte(bentoConfig), 0644))
 
 	// --- Start Bento Docker container ---
@@ -220,7 +225,7 @@ output:
 					writeErr = fmtErr
 					break
 				}
-				if wErr := httpWriter.Write(data); wErr != nil {
+				if wErr := httpWriter.Write(data, msg); wErr != nil {
 					writeErr = wErr
 					break
 				}

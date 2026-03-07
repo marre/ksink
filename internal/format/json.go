@@ -23,7 +23,6 @@ type jsonRecord struct {
 }
 
 type jsonFormatter struct {
-	separator         []byte
 	encodeKeyBase64   bool
 	encodeValueBase64 bool
 }
@@ -50,7 +49,7 @@ func (f *jsonFormatter) Format(msg *ksink.Message) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	return append(data, f.separator...), nil
+	return append(data, '\n'), nil
 }
 
 func encodeJSONField(data []byte, useBase64 bool) string {

@@ -2,7 +2,7 @@
 //
 // Supported formats:
 //   - binary:      Raw message value bytes (default, newline-delimited)
-//   - json:        JSON lines with configurable UTF-8/base64 encoding for key/value
+//   - jsonl:       JSON lines with configurable UTF-8/base64 encoding for key/value
 //   - kcat:        kcat-compatible format string (use --output-format-string)
 package format
 
@@ -49,11 +49,11 @@ func WithJSONBase64Value() Option {
 }
 
 // New creates a Formatter for the given format name.
-// Accepted formats: "json", "binary", "kcat".
-// The separator is appended after each formatted message (ignored for kcat,
-// which embeds separators in the format string).
+// Accepted formats: "jsonl", "binary", "kcat".
+// The separator is appended after each formatted message (only used for binary;
+// jsonl always uses newline, kcat embeds separators in the format string).
 
-// For "json", WithJSONBase64Key and WithJSONBase64Value control whether the
+// For "jsonl", WithJSONBase64Key and WithJSONBase64Value control whether the
 // corresponding fields are emitted as base64 strings instead of UTF-8 strings.
 // For "kcat", WithKcatFormatString supplies the kcat-compatible format string.
 func New(name string, separator []byte, options ...Option) (Formatter, error) {
@@ -63,17 +63,16 @@ func New(name string, separator []byte, options ...Option) (Formatter, error) {
 	}
 
 	// Validate that options are only used with their intended format.
-	if (cfg.jsonBase64Key || cfg.jsonBase64Value) && name != "json" {
-		return nil, fmt.Errorf("WithJSONBase64Key/WithJSONBase64Value require format \"json\", got %q", name)
+	if (cfg.jsonBase64Key || cfg.jsonBase64Value) && name != "jsonl" {
+		return nil, fmt.Errorf("WithJSONBase64Key/WithJSONBase64Value require format \"jsonl\", got %q", name)
 	}
 	if cfg.kcatFormatString != "" && name != "kcat" {
 		return nil, fmt.Errorf("WithKcatFormatString requires format \"kcat\", got %q", name)
 	}
 
 	switch name {
-	case "json":
+	case "jsonl":
 		return &jsonFormatter{
-			separator:         separator,
 			encodeKeyBase64:   cfg.jsonBase64Key,
 			encodeValueBase64: cfg.jsonBase64Value,
 		}, nil

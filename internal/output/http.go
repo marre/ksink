@@ -3,12 +3,16 @@ package output
 import (
 	"bytes"
 	"crypto/tls"
+	"encoding/base64"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
+	"strconv"
 	"sync"
 	"time"
+
+	"github.com/marre/ksink/pkg/ksink"
 )
 
 // HTTPOpts holds configuration for the HTTP output writer.
@@ -67,14 +71,14 @@ func NewHTTPWriter(url string, opts HTTPOpts, tlsCfg *tls.Config) (Writer, error
 	}, nil
 }
 
-func (w *httpWriter) Write(data []byte) error {
+func (w *httpWriter) Write(data []byte, msg *ksink.Message) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
 	var lastErr error
 	attempts := 1 + w.opts.MaxRetries
 	for i := range attempts {
-		if err := w.doPost(data); err != nil {
+		if err := w.doPost(data, msg); err != nil {
 			lastErr = err
 			if i < attempts-1 {
 				time.Sleep(w.opts.RetryDelay)
@@ -95,8 +99,28 @@ func (w *httpWriter) Write(data []byte) error {
 }
 
 // doPost sends data as an HTTP POST and checks for 200 OK.
-func (w *httpWriter) doPost(data []byte) error {
-	resp, err := w.client.Post(w.url, "application/octet-stream", bytes.NewReader(data))
+func (w *httpWriter) doPost(data []byte, msg *ksink.Message) error {
+	req, err := http.NewRequest(http.MethodPost, w.url, bytes.NewReader(data))
+	if err != nil {
+		return fmt.Errorf("HTTP request creation failed: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/octet-stream")
+	if msg != nil {
+		req.Header.Set("X-Kafka-Topic", msg.Topic)
+		req.Header.Set("X-Kafka-Partition", strconv.FormatInt(int64(msg.Partition), 10))
+		req.Header.Set("X-Kafka-Offset", strconv.FormatInt(msg.Offset, 10))
+		if msg.Key != nil {
+			req.Header.Set("X-Kafka-Key", base64.StdEncoding.EncodeToString(msg.Key))
+		}
+		for k, v := range msg.Headers {
+			req.Header.Set("X-Kafka-Header-"+k, v)
+		}
+		if !msg.Timestamp.IsZero() {
+			req.Header.Set("X-Kafka-Timestamp", strconv.FormatInt(msg.Timestamp.UnixMilli(), 10))
+		}
+		req.Header.Set("X-Kafka-Client-Addr", msg.ClientAddr)
+	}
+	resp, err := w.client.Do(req)
 	if err != nil {
 		return fmt.Errorf("HTTP request failed: %w", err)
 	}

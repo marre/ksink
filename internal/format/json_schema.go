@@ -1,12 +1,12 @@
 package format
 
 // JSONSchema is a JSON Schema (draft-07) that validates the output of the
-// json formatter. It is embedded as a Go string so that it can be used in
+// jsonl formatter. It is embedded as a Go string so that it can be used in
 // tests and shipped with the binary without extra files.
 const JSONSchema = `{
   "$schema": "http://json-schema.org/draft-07/schema#",
   "title": "ksink JSON message",
-  "description": "Schema for one JSON-lines record produced by the ksink json formatter.",
+  "description": "Schema for one JSON-lines record produced by the ksink jsonl formatter.",
   "type": "object",
   "required": ["topic", "partition", "offset", "value", "value_encoding", "client_addr"],
   "properties": {

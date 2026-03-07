@@ -14,12 +14,14 @@ import (
 	"io"
 	"os"
 	"strings"
+
+	"github.com/marre/ksink/pkg/ksink"
 )
 
 // Writer is the interface for message output backends.
 type Writer interface {
 	io.Closer
-	Write(data []byte) error
+	Write(data []byte, msg *ksink.Message) error
 }
 
 // TLSOpts holds TLS configuration options for output connections.
