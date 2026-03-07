@@ -119,9 +119,7 @@ Use `--output-format` to control how messages are serialized:
 | Format        | Description                                                      |
 |---------------|------------------------------------------------------------------|
 | `binary`      | Raw message value bytes, newline-delimited (default)             |
-| `json`        | JSON lines with key/value as UTF-8 strings                       |
-| `json-base64` | JSON lines with key/value base64-encoded (for binary data)      |
-| `text`        | Raw message value followed by the separator                      |
+| `json`        | JSON lines with per-field UTF-8/base64 encoding options          |
 | `kcat`        | kcat-compatible format string (requires `--output-format-string`)|
 
 Use `--output-separator` to set the delimiter appended after each message
@@ -130,18 +128,22 @@ interpreted. Use `--output-separator-hex` for hex-encoded binary delimiters
 (e.g. `0a` for newline, `00` for null byte). Use `--no-separator` to clear
 the delimiter entirely.
 
+For JSON output, use `--output-json-base64-key` and/or
+`--output-json-base64-value` to base64-encode those fields when payloads are
+not safe to emit as UTF-8.
+
 ```bash
 # Binary output with no separator to a file
 go run ./cmd/ksink --no-separator --output data.bin
 
-# Plain text values, one per line
-go run ./cmd/ksink --output-format text --output messages.txt
+# Binary values, one per line
+go run ./cmd/ksink --output messages.bin
 
 # JSON with base64-encoded key/value for binary payloads
-go run ./cmd/ksink --output-format json-base64 --output messages.jsonl
+go run ./cmd/ksink --output-format json --output-json-base64-key --output-json-base64-value --output messages.jsonl
 
 # Binary delimiter using hex encoding (null byte)
-go run ./cmd/ksink --output-format text --output-separator-hex "00" --output messages.txt
+go run ./cmd/ksink --output-separator-hex "00" --output messages.bin
 
 # kcat-compatible output formatting
 go run ./cmd/ksink --output-format kcat \

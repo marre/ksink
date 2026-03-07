@@ -65,68 +65,44 @@ var schemaTestMessages = []struct {
 	},
 }
 
-// TestJSONOutputMatchesSchema validates that the json formatter output
-// conforms to the embedded JSON schema.
 func TestJSONOutputMatchesSchema(t *testing.T) {
 	schemaLoader := gojsonschema.NewStringLoader(JSONSchema)
 
-	f, err := New("json", []byte("\n"))
-	require.NoError(t, err)
-
 	sep := []byte("\n")
 
-	for _, tc := range schemaTestMessages {
-		t.Run(tc.name, func(t *testing.T) {
-			data, err := f.Format(tc.msg)
-			require.NoError(t, err)
-
-			// Strip trailing separator before validation.
-			jsonBytes := data[:len(data)-len(sep)]
-
-			// Sanity: must be valid JSON.
-			require.True(t, json.Valid(jsonBytes), "output is not valid JSON")
-
-			docLoader := gojsonschema.NewBytesLoader(jsonBytes)
-			result, err := gojsonschema.Validate(schemaLoader, docLoader)
-			require.NoError(t, err)
-
-			for _, e := range result.Errors() {
-				t.Errorf("schema validation error: %s", e)
-			}
-			assert.True(t, result.Valid(), "JSON output does not match schema")
-		})
+	testCases := []struct {
+		name    string
+		options []Option
+	}{
+		{name: "plain_json"},
+		{name: "base64_key", options: []Option{WithJSONBase64Key()}},
+		{name: "base64_value", options: []Option{WithJSONBase64Value()}},
+		{name: "base64_key_and_value", options: []Option{WithJSONBase64Key(), WithJSONBase64Value()}},
 	}
-}
 
-// TestJSONBase64OutputMatchesSchema validates that the json-base64 formatter
-// output conforms to the embedded JSON schema.
-func TestJSONBase64OutputMatchesSchema(t *testing.T) {
-	schemaLoader := gojsonschema.NewStringLoader(JSONSchema)
-
-	f, err := New("json-base64", []byte("\n"))
-	require.NoError(t, err)
-
-	sep := []byte("\n")
-
-	for _, tc := range schemaTestMessages {
-		t.Run(tc.name, func(t *testing.T) {
-			data, err := f.Format(tc.msg)
+	for _, formatCase := range testCases {
+		t.Run(formatCase.name, func(t *testing.T) {
+			f, err := New("json", sep, formatCase.options...)
 			require.NoError(t, err)
 
-			// Strip trailing separator before validation.
-			jsonBytes := data[:len(data)-len(sep)]
+			for _, tc := range schemaTestMessages {
+				t.Run(tc.name, func(t *testing.T) {
+					data, err := f.Format(tc.msg)
+					require.NoError(t, err)
 
-			// Sanity: must be valid JSON.
-			require.True(t, json.Valid(jsonBytes), "output is not valid JSON")
+					jsonBytes := data[:len(data)-len(sep)]
+					require.True(t, json.Valid(jsonBytes), "output is not valid JSON")
 
-			docLoader := gojsonschema.NewBytesLoader(jsonBytes)
-			result, err := gojsonschema.Validate(schemaLoader, docLoader)
-			require.NoError(t, err)
+					docLoader := gojsonschema.NewBytesLoader(jsonBytes)
+					result, err := gojsonschema.Validate(schemaLoader, docLoader)
+					require.NoError(t, err)
 
-			for _, e := range result.Errors() {
-				t.Errorf("schema validation error: %s", e)
+					for _, e := range result.Errors() {
+						t.Errorf("schema validation error: %s", e)
+					}
+					assert.True(t, result.Valid(), "JSON output does not match schema")
+				})
 			}
-			assert.True(t, result.Valid(), "JSON output does not match schema")
 		})
 	}
 }

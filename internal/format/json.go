@@ -1,43 +1,47 @@
 package format
 
 import (
+	"encoding/base64"
 	"encoding/json"
 
 	"github.com/marre/ksink/pkg/ksink"
 )
 
-// jsonRecord is the JSON structure written by both the json and json-base64
-// formatters. The Encoding field indicates how key/value bytes are represented
-// ("utf-8" for plain json, "base64" for json-base64).
+// jsonRecord is the JSON structure written by the json formatter. The
+// key/value encoding fields indicate how raw bytes were represented.
 type jsonRecord struct {
-	Topic      string            `json:"topic"`
-	Partition  int32             `json:"partition"`
-	Offset     int64             `json:"offset"`
-	Key        *string           `json:"key,omitempty"`
-	Value      string            `json:"value"`
-	Headers    map[string]string `json:"headers,omitempty"`
-	Timestamp  string            `json:"timestamp,omitempty"`
-	ClientAddr string            `json:"client_addr"`
-	Encoding   string            `json:"encoding"`
+	Topic         string            `json:"topic"`
+	Partition     int32             `json:"partition"`
+	Offset        int64             `json:"offset"`
+	Key           *string           `json:"key,omitempty"`
+	KeyEncoding   string            `json:"key_encoding,omitempty"`
+	Value         string            `json:"value"`
+	ValueEncoding string            `json:"value_encoding"`
+	Headers       map[string]string `json:"headers,omitempty"`
+	Timestamp     string            `json:"timestamp,omitempty"`
+	ClientAddr    string            `json:"client_addr"`
 }
 
 type jsonFormatter struct {
-	separator []byte
+	separator         []byte
+	encodeKeyBase64   bool
+	encodeValueBase64 bool
 }
 
 func (f *jsonFormatter) Format(msg *ksink.Message) ([]byte, error) {
 	rec := jsonRecord{
-		Topic:      msg.Topic,
-		Partition:  msg.Partition,
-		Offset:     msg.Offset,
-		Value:      string(msg.Value),
-		Headers:    msg.Headers,
-		ClientAddr: msg.ClientAddr,
-		Encoding:   "utf-8",
+		Topic:         msg.Topic,
+		Partition:     msg.Partition,
+		Offset:        msg.Offset,
+		Value:         encodeJSONField(msg.Value, f.encodeValueBase64),
+		ValueEncoding: jsonEncodingName(f.encodeValueBase64),
+		Headers:       msg.Headers,
+		ClientAddr:    msg.ClientAddr,
 	}
 	if msg.Key != nil {
-		k := string(msg.Key)
+		k := encodeJSONField(msg.Key, f.encodeKeyBase64)
 		rec.Key = &k
+		rec.KeyEncoding = jsonEncodingName(f.encodeKeyBase64)
 	}
 	if !msg.Timestamp.IsZero() {
 		rec.Timestamp = msg.Timestamp.String()
@@ -47,4 +51,18 @@ func (f *jsonFormatter) Format(msg *ksink.Message) ([]byte, error) {
 		return nil, err
 	}
 	return append(data, f.separator...), nil
+}
+
+func encodeJSONField(data []byte, useBase64 bool) string {
+	if useBase64 {
+		return base64.StdEncoding.EncodeToString(data)
+	}
+	return string(data)
+}
+
+func jsonEncodingName(useBase64 bool) string {
+	if useBase64 {
+		return "base64"
+	}
+	return "utf-8"
 }

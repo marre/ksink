@@ -25,7 +25,7 @@ func newKafkaDockerClient(t *testing.T) *kafkaDockerClient {
 	return &kafkaDockerClient{
 		dockerExecClient: newDockerExecClient(t, pool, dockerContainerOpts{
 			repository: "apache/kafka",
-			tag:        "4.1.1",
+			tag:        "4.2.0",
 			cmd:        []string{"sleep", "infinity"},
 			readyCmd:   []string{"echo", "ready"},
 		}),

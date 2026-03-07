@@ -10,7 +10,7 @@ import (
 )
 
 func TestKcatFormatterBasic(t *testing.T) {
-	f, err := New("kcat", nil, "Topic: %t Key: %k Value: %s\\n")
+	f, err := New("kcat", nil, WithKcatFormatString("Topic: %t Key: %k Value: %s\\n"))
 	require.NoError(t, err)
 
 	msg := sampleMessage()
@@ -20,7 +20,7 @@ func TestKcatFormatterBasic(t *testing.T) {
 }
 
 func TestKcatFormatterAllSpecifiers(t *testing.T) {
-	f, err := New("kcat", nil, "%t|%p|%o|%k|%s|%K|%S|%T\\n")
+	f, err := New("kcat", nil, WithKcatFormatString("%t|%p|%o|%k|%s|%K|%S|%T\\n"))
 	require.NoError(t, err)
 
 	msg := sampleMessage()
@@ -30,7 +30,7 @@ func TestKcatFormatterAllSpecifiers(t *testing.T) {
 }
 
 func TestKcatFormatterNilKey(t *testing.T) {
-	f, err := New("kcat", nil, "%k|%K\\n")
+	f, err := New("kcat", nil, WithKcatFormatString("%k|%K\\n"))
 	require.NoError(t, err)
 
 	msg := sampleMessage()
@@ -41,7 +41,7 @@ func TestKcatFormatterNilKey(t *testing.T) {
 }
 
 func TestKcatFormatterZeroTimestamp(t *testing.T) {
-	f, err := New("kcat", nil, "%T")
+	f, err := New("kcat", nil, WithKcatFormatString("%T"))
 	require.NoError(t, err)
 
 	msg := sampleMessage()
@@ -52,7 +52,7 @@ func TestKcatFormatterZeroTimestamp(t *testing.T) {
 }
 
 func TestKcatFormatterEscapeSequences(t *testing.T) {
-	f, err := New("kcat", nil, "%s\\t%k\\r\\n")
+	f, err := New("kcat", nil, WithKcatFormatString("%s\\t%k\\r\\n"))
 	require.NoError(t, err)
 
 	msg := sampleMessage()
@@ -62,7 +62,7 @@ func TestKcatFormatterEscapeSequences(t *testing.T) {
 }
 
 func TestKcatFormatterLiteralPercent(t *testing.T) {
-	f, err := New("kcat", nil, "100%% %s\\n")
+	f, err := New("kcat", nil, WithKcatFormatString("100%% %s\\n"))
 	require.NoError(t, err)
 
 	msg := sampleMessage()
@@ -72,7 +72,7 @@ func TestKcatFormatterLiteralPercent(t *testing.T) {
 }
 
 func TestKcatFormatterLiteralBackslash(t *testing.T) {
-	f, err := New("kcat", nil, "path\\\\dir %s\\n")
+	f, err := New("kcat", nil, WithKcatFormatString("path\\\\dir %s\\n"))
 	require.NoError(t, err)
 
 	msg := sampleMessage()
@@ -82,13 +82,13 @@ func TestKcatFormatterLiteralBackslash(t *testing.T) {
 }
 
 func TestKcatFormatterUnknownSpecifier(t *testing.T) {
-	_, err := New("kcat", nil, "%z")
+	_, err := New("kcat", nil, WithKcatFormatString("%z"))
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "unknown kcat format specifier")
 }
 
 func TestKcatFormatterBinaryValue(t *testing.T) {
-	f, err := New("kcat", nil, "%s")
+	f, err := New("kcat", nil, WithKcatFormatString("%s"))
 	require.NoError(t, err)
 
 	binData := []byte{0x00, 0xFF, 0xFE}
@@ -103,7 +103,7 @@ func TestKcatFormatterBinaryValue(t *testing.T) {
 }
 
 func TestKcatFormatterNullSeparator(t *testing.T) {
-	f, err := New("kcat", nil, "%s\\0")
+	f, err := New("kcat", nil, WithKcatFormatString("%s\\0"))
 	require.NoError(t, err)
 
 	msg := sampleMessage()
@@ -113,7 +113,7 @@ func TestKcatFormatterNullSeparator(t *testing.T) {
 }
 
 func TestKcatFormatterValueOnly(t *testing.T) {
-	f, err := New("kcat", nil, "%s")
+	f, err := New("kcat", nil, WithKcatFormatString("%s"))
 	require.NoError(t, err)
 
 	msg := sampleMessage()

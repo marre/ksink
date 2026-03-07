@@ -16,7 +16,7 @@ func TestNewUnknownFormat(t *testing.T) {
 }
 
 func TestNewValidFormats(t *testing.T) {
-	for _, name := range []string{"json", "json-base64", "text", "binary"} {
+	for _, name := range []string{"json", "binary"} {
 		f, err := New(name, []byte("\n"))
 		require.NoError(t, err, name)
 		require.NotNil(t, f, name)
@@ -30,9 +30,33 @@ func TestNewKcatRequiresFormatString(t *testing.T) {
 }
 
 func TestNewKcatValid(t *testing.T) {
-	f, err := New("kcat", nil, "%t %s\\n")
+	f, err := New("kcat", nil, WithKcatFormatString("%t %s\\n"))
 	require.NoError(t, err)
 	require.NotNil(t, f)
+}
+
+func TestNewRejectsKcatFormatStringForNonKcat(t *testing.T) {
+	for _, name := range []string{"json", "binary"} {
+		_, err := New(name, nil, WithKcatFormatString("%s"))
+		require.Error(t, err, name)
+		assert.Contains(t, err.Error(), "kcat", name)
+	}
+}
+
+func TestNewRejectsBase64OptionsForNonJSON(t *testing.T) {
+	for _, name := range []string{"binary", "kcat"} {
+		opts := []Option{WithKcatFormatString("%s")} // satisfy kcat requirement
+		if name != "kcat" {
+			opts = nil
+		}
+		_, err := New(name, nil, append(opts, WithJSONBase64Key())...)
+		require.Error(t, err, name)
+		assert.Contains(t, err.Error(), "json", name)
+
+		_, err = New(name, nil, append(opts, WithJSONBase64Value())...)
+		require.Error(t, err, name)
+		assert.Contains(t, err.Error(), "json", name)
+	}
 }
 
 func sampleMessage() *ksink.Message {

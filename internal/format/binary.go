@@ -2,9 +2,7 @@ package format
 
 import "github.com/marre/ksink/pkg/ksink"
 
-// binaryFormatter writes the raw message value bytes. It is kept separate
-// from textFormatter for clarity even though the implementation is currently
-// identical.
+// binaryFormatter writes the raw message value bytes.
 type binaryFormatter struct {
 	separator []byte
 }

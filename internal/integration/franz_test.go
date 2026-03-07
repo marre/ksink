@@ -782,7 +782,8 @@ func TestFranzMTLS(t *testing.T) {
 
 // TestFranzJSONOutputMatchesSchema produces a message through the full server
 // pipeline and validates that formatting the resulting *ksink.Message with the
-// json and json-base64 formatters produces output that conforms to the JSON schema.
+// json formatter, across supported encoding options, produces output that
+// conforms to the JSON schema.
 func TestFranzJSONOutputMatchesSchema(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -832,9 +833,19 @@ func TestFranzJSONOutputMatchesSchema(t *testing.T) {
 
 	schemaLoader := gojsonschema.NewStringLoader(format.JSONSchema)
 
-	for _, fmtName := range []string{"json", "json-base64"} {
-		t.Run(fmtName, func(t *testing.T) {
-			fmtr, err := format.New(fmtName, []byte("\n"))
+	testCases := []struct {
+		name    string
+		options []format.Option
+	}{
+		{name: "json"},
+		{name: "json_base64_key", options: []format.Option{format.WithJSONBase64Key()}},
+		{name: "json_base64_value", options: []format.Option{format.WithJSONBase64Value()}},
+		{name: "json_base64_key_value", options: []format.Option{format.WithJSONBase64Key(), format.WithJSONBase64Value()}},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			fmtr, err := format.New("json", []byte("\n"), testCase.options...)
 			require.NoError(t, err)
 
 			for _, msg := range br.msgs {
@@ -850,9 +861,9 @@ func TestFranzJSONOutputMatchesSchema(t *testing.T) {
 				require.NoError(t, err)
 
 				for _, e := range result.Errors() {
-					t.Errorf("schema validation error (%s): %s", fmtName, e)
+					t.Errorf("schema validation error (%s): %s", testCase.name, e)
 				}
-				assert.True(t, result.Valid(), "JSON output does not match schema for format %s", fmtName)
+				assert.True(t, result.Valid(), "JSON output does not match schema for format %s", testCase.name)
 			}
 		})
 	}

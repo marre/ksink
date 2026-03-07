@@ -37,3 +37,13 @@ func TestBinaryFormatterWithSeparator(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, []byte{0x01, 0x02, 0x0A}, data)
 }
+
+func TestBinaryFormatterWithTextPayloadAndCustomSeparator(t *testing.T) {
+	f, err := New("binary", []byte("\r\n"))
+	require.NoError(t, err)
+
+	msg := sampleMessage()
+	data, err := f.Format(msg)
+	require.NoError(t, err)
+	assert.Equal(t, []byte("hello world\r\n"), data)
+}

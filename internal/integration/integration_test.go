@@ -101,20 +101,6 @@ func (mc *integrationMessageCapture) waitForMessages(count int, timeout time.Dur
 	return mc.get()
 }
 
-func (mc *integrationMessageCapture) waitForCount(count int, timeout time.Duration) bool {
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		mc.mu.Lock()
-		n := len(mc.messages)
-		mc.mu.Unlock()
-		if n >= count {
-			return true
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
-	return false
-}
-
 func integrationStartReadLoop(t *testing.T, srv *ksink.Server) *integrationMessageCapture {
 	t.Helper()
 	capture := &integrationMessageCapture{}

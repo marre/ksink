@@ -123,7 +123,7 @@ output:
 
 	bentoResource, err := pool.RunWithOptions(&dockertest.RunOptions{
 		Repository:   "ghcr.io/warpstreamlabs/bento",
-		Tag:          "latest",
+		Tag:          "1.15.0",
 		Cmd:          []string{"-c", "/config/bento.yaml"},
 		ExposedPorts: []string{"4195/tcp"},
 	}, func(config *docker.HostConfig) {
