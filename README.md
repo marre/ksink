@@ -11,83 +11,6 @@ A lightweight Kafka-protocol-compatible server library and tool for Go. It accep
 - Topic filtering
 - Idempotent producer support
 
-## Installation
-
-```bash
-go get github.com/marre/ksink
-```
-
-## Quick Start
-
-```go
-package main
-
-import (
-    "context"
-    "fmt"
-    "log"
-
-    "github.com/marre/ksink"
-)
-
-func main() {
-    srv, err := ksink.New(ksink.Config{
-        Address: ":9092",
-    })
-    if err != nil {
-        log.Fatal(err)
-    }
-
-    ctx := context.Background()
-    if err := srv.Start(ctx); err != nil {
-        log.Fatal(err)
-    }
-    defer srv.Close(ctx)
-
-    log.Printf("Listening on %s", srv.Addr())
-
-    for {
-        msgs, ack, err := srv.ReadBatch(ctx)
-        if err != nil {
-            log.Fatal(err)
-        }
-
-        for _, msg := range msgs {
-            fmt.Printf("topic=%s key=%s value=%s\n", msg.Topic, msg.Key, msg.Value)
-        }
-
-        ack(nil) // acknowledge successful processing
-    }
-}
-```
-
-Then send messages using any Kafka producer:
-
-```bash
-echo "hello world" | kafka-console-producer.sh --bootstrap-server localhost:9092 --topic test
-```
-
-## Configuration
-
-```go
-cfg := ksink.Config{
-    Address:           ":9092",           // Listen address
-    AdvertisedAddress: "myhost:9092",     // Address advertised to clients
-    Topics:            []string{"events"},// Restrict to specific topics
-    CertFile:          "server.pem",      // TLS certificate
-    KeyFile:           "server-key.pem",  // TLS private key
-    MTLSAuth:          "require_and_verify",
-    MTLSCAsFiles:      []string{"ca.pem"},
-    SASL: []ksink.SASLCredential{
-        {Mechanism: "PLAIN", Username: "user", Password: "pass"},
-    },
-    Timeout:         30 * time.Second,
-    IdleTimeout:     60 * time.Second,
-    MaxMessageBytes: 1048576,
-    IdempotentWrite: false,
-}
-```
-
 ## ksink Tool
 
 The `cmd/ksink` tool forwards received messages to an output sink:
@@ -154,4 +77,83 @@ go run ./cmd/ksink --output-separator-hex "00" --output messages.bin
 # kcat-compatible output formatting
 go run ./cmd/ksink --output-format kcat \
   --output-format-string 'Topic: %t Partition: %p Offset: %o\nKey: %k\nValue: %s\n---\n'
+```
+
+## Library
+
+### Installation
+
+```bash
+go get github.com/marre/ksink
+```
+
+### Quick Start
+
+```go
+package main
+
+import (
+    "context"
+    "fmt"
+    "log"
+
+    "github.com/marre/ksink"
+)
+
+func main() {
+    srv, err := ksink.New(ksink.Config{
+        Address: ":9092",
+    })
+    if err != nil {
+        log.Fatal(err)
+    }
+
+    ctx := context.Background()
+    if err := srv.Start(ctx); err != nil {
+        log.Fatal(err)
+    }
+    defer srv.Close(ctx)
+
+    log.Printf("Listening on %s", srv.Addr())
+
+    for {
+        msgs, ack, err := srv.ReadBatch(ctx)
+        if err != nil {
+            log.Fatal(err)
+        }
+
+        for _, msg := range msgs {
+            fmt.Printf("topic=%s key=%s value=%s\n", msg.Topic, msg.Key, msg.Value)
+        }
+
+        ack(nil) // acknowledge successful processing
+    }
+}
+```
+
+Then send messages using any Kafka producer:
+
+```bash
+echo "hello world" | kafka-console-producer.sh --bootstrap-server localhost:9092 --topic test
+```
+
+### Configuration
+
+```go
+cfg := ksink.Config{
+    Address:           ":9092",           // Listen address
+    AdvertisedAddress: "myhost:9092",     // Address advertised to clients
+    Topics:            []string{"events"},// Restrict to specific topics
+    CertFile:          "server.pem",      // TLS certificate
+    KeyFile:           "server-key.pem",  // TLS private key
+    MTLSAuth:          "require_and_verify",
+    MTLSCAsFiles:      []string{"ca.pem"},
+    SASL: []ksink.SASLCredential{
+        {Mechanism: "PLAIN", Username: "user", Password: "pass"},
+    },
+    Timeout:         30 * time.Second,
+    IdleTimeout:     60 * time.Second,
+    MaxMessageBytes: 1048576,
+    IdempotentWrite: false,
+}
 ```
