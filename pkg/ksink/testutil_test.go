@@ -2,7 +2,6 @@ package ksink
 
 import (
 	"context"
-	"fmt"
 	"net"
 	"sync"
 	"testing"
@@ -66,49 +65,6 @@ func (mc *messageCapture) add(msg receivedMessage) {
 	mc.messages = append(mc.messages, msg)
 }
 
-func (mc *messageCapture) get() []receivedMessage {
-	mc.mu.Lock()
-	defer mc.mu.Unlock()
-	result := make([]receivedMessage, len(mc.messages))
-	copy(result, mc.messages)
-	return result
-}
-
-func (mc *messageCapture) waitForMessages(count int, timeout time.Duration) []receivedMessage {
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		msgs := mc.get()
-		if len(msgs) >= count {
-			return msgs
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
-	return mc.get()
-}
-
-// startTestServer creates and starts a server for testing, returning the server and its address.
-func startTestServer(t *testing.T, cfg Config) (*Server, string) {
-	t.Helper()
-
-	port := getFreePort(t)
-	cfg.Address = fmt.Sprintf("127.0.0.1:%d", port)
-
-	srv, err := New(cfg, WithLogger(&testLogger{t}))
-	require.NoError(t, err)
-
-	err = srv.Start(context.Background())
-	require.NoError(t, err)
-
-	addr := srv.Addr().String()
-	waitForTCPReady(t, addr, 5*time.Second)
-
-	t.Cleanup(func() {
-		srv.Close(context.Background())
-	})
-
-	return srv, addr
-}
-
 // startReadLoop starts a goroutine that reads batches from the server and
 // captures messages. It acknowledges each batch with nil (success).
 func startReadLoop(t *testing.T, srv *Server) *messageCapture {
@@ -142,22 +98,4 @@ func startReadLoop(t *testing.T, srv *Server) *messageCapture {
 	}()
 
 	return capture
-}
-
-// startFailReadLoop starts a goroutine that reads batches from the server
-// and always acknowledges with the given error.
-func startFailReadLoop(t *testing.T, srv *Server, ackErr error) {
-	t.Helper()
-	ctx, cancel := context.WithCancel(context.Background())
-	t.Cleanup(cancel)
-
-	go func() {
-		for {
-			_, ack, err := srv.ReadBatch(ctx)
-			if err != nil {
-				return
-			}
-			ack(ackErr)
-		}
-	}()
 }

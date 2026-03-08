@@ -2,14 +2,8 @@ package output_test
 
 import (
     "context"
-    "crypto/rand"
-    "crypto/rsa"
-    "crypto/x509"
-    "crypto/x509/pkix"
     "encoding/json"
-    "encoding/pem"
     "fmt"
-    "math/big"
     "net"
     "strings"
     "testing"
@@ -71,7 +65,7 @@ func startKsinkServer(t *testing.T, ctx context.Context) (*ksink.Server, string)
     })
     require.NoError(t, err)
     require.NoError(t, srv.Start(ctx))
-    t.Cleanup(func() { srv.Close(context.Background()) })
+    t.Cleanup(func() { srv.Close(context.Background()) }) //nolint:errcheck
     waitForTCPReady(t, addr, 5*time.Second)
     return srv, addr
 }
@@ -143,71 +137,6 @@ func produceMessages(t *testing.T, ctx context.Context, kafkaAddr string, count 
         results := client.ProduceSync(ctx, record)
         require.NoError(t, results[0].Err, "produce message %d", i)
     }
-}
-
-// testCA holds a test certificate authority for TLS tests.
-type testCA struct {
-    certPEM []byte
-    cert    *x509.Certificate
-    key     *rsa.PrivateKey
-}
-
-func generateTestCA(t *testing.T) *testCA {
-    t.Helper()
-    key, err := rsa.GenerateKey(rand.Reader, 2048)
-    require.NoError(t, err)
-
-    tmpl := &x509.Certificate{
-        SerialNumber:          big.NewInt(1),
-        Subject:               pkix.Name{CommonName: "Test CA"},
-        NotBefore:             time.Now(),
-        NotAfter:              time.Now().Add(24 * time.Hour),
-        KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
-        BasicConstraintsValid: true,
-        IsCA:                  true,
-    }
-
-    certDER, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
-    require.NoError(t, err)
-    cert, err := x509.ParseCertificate(certDER)
-    require.NoError(t, err)
-
-    return &testCA{
-        certPEM: pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER}),
-        cert:    cert,
-        key:     key,
-    }
-}
-
-func (ca *testCA) generateServerCert(t *testing.T) (certPEM, keyPEM []byte) {
-    t.Helper()
-    key, err := rsa.GenerateKey(rand.Reader, 2048)
-    require.NoError(t, err)
-
-    tmpl := &x509.Certificate{
-        SerialNumber:          big.NewInt(2),
-        Subject:               pkix.Name{CommonName: "localhost"},
-        NotBefore:             time.Now(),
-        NotAfter:              time.Now().Add(24 * time.Hour),
-        KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
-        ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
-        BasicConstraintsValid: true,
-        DNSNames:              []string{"localhost"},
-        IPAddresses:           []net.IP{net.ParseIP("127.0.0.1")},
-    }
-
-    certDER, err := x509.CreateCertificate(rand.Reader, tmpl, ca.cert, &key.PublicKey, ca.key)
-    require.NoError(t, err)
-
-    return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER}),
-        pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)})
-}
-
-func (ca *testCA) certPool(t *testing.T) *x509.CertPool {
-    t.Helper()
-    pool := x509.NewCertPool()
-    require.True(t, pool.AppendCertsFromPEM(ca.certPEM))
-    return pool
 }
 
 func splitJSONLines(data []byte) []string {

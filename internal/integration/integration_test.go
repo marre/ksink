@@ -163,7 +163,7 @@ func startIntegrationServer(t *testing.T, port int, cfg ksink.Config) *integrati
 	integrationWaitForTCPReady(t, fmt.Sprintf("127.0.0.1:%d", port), 5*time.Second)
 
 	t.Cleanup(func() {
-		srv.Close(context.Background())
+		srv.Close(context.Background()) //nolint:errcheck
 	})
 
 	return integrationStartReadLoop(t, srv)

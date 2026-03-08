@@ -246,8 +246,7 @@ func run(addr, dst, fmtName, fmtStr string, jsonB64Key, jsonB64Val bool, separat
 	<-sigCh
 
 	log.Println("Shutting down...")
-	srv.Close(context.Background())
-	return nil
+	return srv.Close(context.Background())
 }
 
 // buildSeparator returns the separator bytes. If noSep is true the separator

@@ -535,7 +535,7 @@ func TestFranzTLS(t *testing.T) {
 
 	err = srv.Start(context.Background())
 	require.NoError(t, err)
-	defer srv.Close(context.Background())
+	defer srv.Close(context.Background()) //nolint:errcheck
 
 	// Start read loop
 	readCtx, readCancel := context.WithCancel(context.Background())
@@ -690,7 +690,7 @@ func TestFranzMTLS(t *testing.T) {
 
 	err = srv.Start(context.Background())
 	require.NoError(t, err)
-	defer srv.Close(context.Background())
+	defer srv.Close(context.Background()) //nolint:errcheck
 
 	// Start read loop
 	readCtx, readCancel := context.WithCancel(context.Background())
@@ -908,7 +908,7 @@ func startTestServer(t *testing.T, cfg Config) (*Server, string) {
 	waitForTCPReady(t, addr, 5*time.Second)
 
 	t.Cleanup(func() {
-		srv.Close(context.Background())
+		srv.Close(context.Background()) //nolint:errcheck
 	})
 
 	return srv, addr

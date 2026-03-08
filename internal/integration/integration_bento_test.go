@@ -203,7 +203,7 @@ output:
 	err = srv.Start(ctx)
 	require.NoError(t, err)
 	t.Cleanup(func() {
-		srv.Close(context.Background())
+		srv.Close(context.Background()) //nolint:errcheck
 	})
 
 	integrationWaitForTCPReady(t, ksinkAddr, 5*time.Second)
