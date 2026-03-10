@@ -81,10 +81,33 @@ func (o *TLSOpts) BuildTLSConfig() (*tls.Config, error) {
 	return cfg, nil
 }
 
+// TopicPlaceholder is the placeholder that can be used in output patterns
+// to route messages to per-topic files.
+const TopicPlaceholder = "{topic}"
+
+// SanitizePathSegment removes or replaces characters that could cause path
+// traversal when a user-controlled string is interpolated into a filesystem
+// path. It replaces directory separators (/ and \), colons (:), and ".."
+// sequences with underscores, and trims leading dots.
+func SanitizePathSegment(s string) string {
+	safe := strings.ReplaceAll(s, "/", "_")
+	safe = strings.ReplaceAll(safe, "\\", "_")
+	safe = strings.ReplaceAll(safe, ":", "_")
+	safe = strings.ReplaceAll(safe, "..", "_")
+	safe = strings.TrimLeft(safe, ".")
+
+	if safe == "" {
+		return "_"
+	}
+	return safe
+}
+
 // Open creates a Writer based on the output string.
 // The special value "-" writes to standard output.
 // For http:// and https:// URLs, Open creates an HTTP writer with default
 // options (no retries, no DLQ). Use NewHTTPWriter for full configuration.
+// If the destination contains the {topic} placeholder, a pattern-based writer
+// is returned that routes messages to per-topic files.
 func Open(dst string, tlsCfg *tls.Config) (Writer, error) {
 	switch {
 	case dst == "-":
@@ -95,6 +118,9 @@ func Open(dst string, tlsCfg *tls.Config) (Writer, error) {
 		// Reject unknown URL-like schemes explicitly to avoid treating them as file paths.
 		if strings.Contains(dst, "://") {
 			return nil, fmt.Errorf("unsupported output scheme in %q; only -, http(s), or file paths are supported", dst)
+		}
+		if strings.Contains(dst, TopicPlaceholder) {
+			return newPatternFileWriter(dst), nil
 		}
 		return newFileWriter(dst)
 	}

@@ -38,6 +38,14 @@ go run ./cmd/ksink json-schema
 # Enable transactional produce support
 go run ./cmd/ksink --addr :9092 --transactional --output 'messages-{txnID}.jsonl'
 
+# Route messages to per-topic files using the {topic} placeholder
+go run ./cmd/ksink --addr :9092 --output '{topic}.jsonl'
+# produces orders.jsonl, events.jsonl, etc. — one file per topic
+
+# Combine {topic} with transactional output
+go run ./cmd/ksink --addr :9092 --transactional --output '{topic}-{txnID}.jsonl'
+# produces orders-my-txn.jsonl, events-my-txn.jsonl, etc.
+
 # Transactional file output — the --output pattern must contain {txnID}.
 # Messages are written to per-transaction temp files; on commit the temp
 # file is renamed; on abort the temp file is deleted:
@@ -222,7 +230,7 @@ intentionally simplified:
 | The transaction coordinator tracks transaction state across broker restarts. | No persistent transaction state. If ksink restarts, in-flight transactions are lost (uncommitted temp files are cleaned up on `Close()`). |
 | `sendOffsetsToTransaction` atomically commits consumer offsets with the transaction. | Not supported. ksink is a sink, not a full broker with consumer groups. |
 | Zombie fencing: restarting a producer with the same `transactional.id` aborts the old instance's pending transaction. | Not implemented. Each `transactional.id` is treated independently with no epoch tracking. |
-| Transactions can span multiple topic-partitions atomically. | Supported at the file level — all messages with the same `transactional.id` go to the same temp file regardless of topic/partition. |
+| Transactions can span multiple topic-partitions atomically. | Supported at the file level — all messages with the same `transactional.id` go to the same temp file regardless of topic/partition. When the `{topic}` placeholder is used, each topic within a transaction gets its own file; all are committed or aborted together. |
 | Aborted records are never visible to `read_committed` consumers. | Aborted records were already delivered to `ReadBatch`. The `TxnEndFunc` callback deletes the temp file, but application-level processing that happened before the abort is not rolled back. |
 | `isolation.level` consumer configuration. | Not applicable — ksink does not implement the consumer protocol. |
 

@@ -103,8 +103,11 @@ kcat format specifiers (--output-format-string):
 		"Enable transactional produce support (per-transaction files with rename-as-commit/delete-as-abort). Requires {txnID} in --output.")
 	rootCmd.Flags().StringVar(&dst, "output", "-",
 		`Output destination: "-" for stdout (default), file path, or http(s):// URL.
-With --transactional, must be a pattern containing {txnID}
-(e.g. "messages-{txnID}.jsonl" produces "messages-my-txn.jsonl").`)
+The path may contain {topic} to route messages to per-topic files
+(e.g. "{topic}.jsonl" produces "orders.jsonl", "events.jsonl", etc.).
+With --transactional, must also contain {txnID}
+(e.g. "{topic}-{txnID}.jsonl" produces "orders-my-txn.jsonl").
+Topic names are sanitised to prevent path traversal.`)
 	rootCmd.Flags().StringVar(&fmtName, "output-format", "binary",
 		"Message format: binary, jsonl, kcat")
 	rootCmd.Flags().StringVar(&fmtStr, "output-format-string", "",
