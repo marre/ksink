@@ -371,14 +371,14 @@ func TestTxnStateZombiFencing(t *testing.T) {
 	srv.txnMu.Lock()
 	existing := srv.txnStates["txn-1"]
 	require.True(t, existing.active, "should be active before fencing")
-	if existing.active {
-		if srv.txnEndFn != nil {
-			srv.txnEndFn("txn-1", false)
-		}
-		existing.active = false
-	}
+	existing.active = false
 	existing.epoch++
 	srv.txnMu.Unlock()
+
+	// Invoke callback outside the lock, mirroring real server behaviour.
+	if srv.txnEndFn != nil {
+		srv.txnEndFn("txn-1", false)
+	}
 
 	assert.Equal(t, []string{"txn-1"}, aborted, "in-flight txn should have been aborted")
 	assert.Equal(t, int16(1), existing.epoch, "epoch should be bumped")
@@ -406,14 +406,16 @@ func TestTxnStateEpochBumpNoActiveTransaction(t *testing.T) {
 	// Simulate a second InitProducerID — no active txn so no abort.
 	srv.txnMu.Lock()
 	existing := srv.txnStates["txn-2"]
-	if existing.active {
-		if srv.txnEndFn != nil {
-			srv.txnEndFn("txn-2", false)
-		}
+	needsAbort := existing.active
+	if needsAbort {
 		existing.active = false
 	}
 	existing.epoch++
 	srv.txnMu.Unlock()
+
+	if needsAbort && srv.txnEndFn != nil {
+		srv.txnEndFn("txn-2", false)
+	}
 
 	assert.Empty(t, aborted, "no abort should be fired when txn is not active")
 	assert.Equal(t, int16(1), existing.epoch, "epoch should still be bumped")

@@ -291,16 +291,19 @@ func (s *Server) handleInitProducerId(conn net.Conn, connID uint64, correlationI
 		if ok {
 			// Zombie fencing: abort any in-flight transaction from the
 			// previous producer instance before bumping the epoch.
-			if existing.active {
+			needsAbort := existing.active
+			if needsAbort {
 				s.logger.Infof("[conn:%d] InitProducerId: fencing zombie txnID=%s (aborting in-flight transaction, epoch %d→%d)",
 					connID, txnID, existing.epoch, existing.epoch+1)
-				if s.txnEndFn != nil {
-					s.txnEndFn(txnID, false)
-				}
 				existing.active = false
 			}
 			existing.epoch++
 			s.txnMu.Unlock()
+
+			// Invoke the callback outside the lock to avoid deadlocks.
+			if needsAbort && s.txnEndFn != nil {
+				s.txnEndFn(txnID, false)
+			}
 
 			resp := &kmsg.InitProducerIDResponse{
 				Version:       apiVersion,
@@ -317,6 +320,7 @@ func (s *Server) handleInitProducerId(conn net.Conn, connID uint64, correlationI
 		s.txnStates[txnID] = &txnState{
 			producerID: producerID,
 			epoch:      0,
+			active:     false,
 		}
 		s.txnMu.Unlock()
 
