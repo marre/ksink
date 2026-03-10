@@ -298,6 +298,9 @@ func (s *Server) handleInitProducerId(conn net.Conn, connID uint64, correlationI
 				existing.active = false
 			}
 			existing.epoch++
+			// Copy fields before releasing the lock to avoid a data race.
+			producerID := existing.producerID
+			epoch := existing.epoch
 			s.txnMu.Unlock()
 
 			// Invoke the callback outside the lock to avoid deadlocks.
@@ -307,11 +310,24 @@ func (s *Server) handleInitProducerId(conn net.Conn, connID uint64, correlationI
 
 			resp := &kmsg.InitProducerIDResponse{
 				Version:       apiVersion,
-				ProducerID:    existing.producerID,
-				ProducerEpoch: existing.epoch,
+				ProducerID:    producerID,
+				ProducerEpoch: epoch,
 			}
 			s.logger.Debugf("[conn:%d] InitProducerId: txnID=%s, producerID=%d, epoch=%d (existing)",
-				connID, txnID, existing.producerID, existing.epoch)
+				connID, txnID, producerID, epoch)
+			return s.sendResponse(conn, connID, correlationID, resp)
+		}
+
+		// Cap the number of tracked transactional IDs to prevent unbounded
+		// memory growth from misbehaving or malicious clients.
+		if len(s.txnStates) >= maxTxnStates {
+			s.txnMu.Unlock()
+			s.logger.Warnf("[conn:%d] Rejecting InitProducerId: too many transactional IDs tracked (%d)", connID, maxTxnStates)
+			resp := &kmsg.InitProducerIDResponse{
+				Version:    apiVersion,
+				ErrorCode:  kerr.TransactionalIDAuthorizationFailed.Code,
+				ProducerID: -1,
+			}
 			return s.sendResponse(conn, connID, correlationID, resp)
 		}
 

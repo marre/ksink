@@ -935,6 +935,7 @@ func TestFranzZombieFencing(t *testing.T) {
 		kgo.TransactionalID("zombie-txn"),
 	)
 	require.NoError(t, err)
+	t.Cleanup(client1.Close)
 
 	require.NoError(t, client1.BeginTransaction())
 	results := client1.ProduceSync(ctx, &kgo.Record{Topic: "t", Value: []byte("v1")})
@@ -956,9 +957,6 @@ func TestFranzZombieFencing(t *testing.T) {
 	results = client2.ProduceSync(ctx, &kgo.Record{Topic: "t", Value: []byte("v2")})
 	require.NoError(t, results[0].Err)
 	require.NoError(t, client2.EndTransaction(ctx, kgo.TryCommit))
-
-	// Close client1 after client2 has committed.
-	client1.Close()
 
 	// Poll for the zombie abort + commit callbacks.
 	deadline := time.Now().Add(5 * time.Second)

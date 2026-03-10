@@ -42,6 +42,11 @@ const (
 
 	// maxClientIDLength is the maximum allowed client ID length to prevent DoS attacks.
 	maxClientIDLength = 10000
+
+	// maxTxnStates is the maximum number of distinct transactional IDs tracked
+	// in memory. This prevents unbounded memory growth from misbehaving or
+	// malicious clients.
+	maxTxnStates = 10000
 )
 
 // Message represents a received Kafka message.

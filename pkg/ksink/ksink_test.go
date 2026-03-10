@@ -347,42 +347,116 @@ func TestReadBatchServerClosed(t *testing.T) {
 	assert.ErrorIs(t, err, ErrServerClosed)
 }
 
-func TestTxnStateZombiFencing(t *testing.T) {
+// sendRawRequest writes a Kafka-protocol request to conn and returns the
+// response body (after the 4-byte length prefix and 4-byte correlationID).
+func sendRawRequest(t *testing.T, conn net.Conn, apiKey int16, apiVersion int16, correlationID int32, body []byte) []byte {
+	t.Helper()
+
+	header := make([]byte, 0)
+	header = kbin.AppendInt16(header, apiKey)
+	header = kbin.AppendInt16(header, apiVersion)
+	header = kbin.AppendInt32(header, correlationID)
+	header = kbin.AppendInt16(header, -1) // no clientID
+	fullReq := append(header, body...)
+	sizeBuf := kbin.AppendInt32(nil, int32(len(fullReq)))
+	_, err := conn.Write(append(sizeBuf, fullReq...))
+	require.NoError(t, err)
+
+	require.NoError(t, conn.SetReadDeadline(time.Now().Add(5*time.Second)))
+	respSizeBuf := make([]byte, 4)
+	_, err = io.ReadFull(conn, respSizeBuf)
+	require.NoError(t, err)
+	respSize := (&kbin.Reader{Src: respSizeBuf}).Int32()
+	respBuf := make([]byte, respSize)
+	_, err = io.ReadFull(conn, respBuf)
+	require.NoError(t, err)
+	// Skip correlationID (4 bytes)
+	return respBuf[4:]
+}
+
+// sendInitProducerID sends an InitProducerID request (version 0) and returns
+// the parsed response.
+func sendInitProducerID(t *testing.T, conn net.Conn, correlationID int32, txnID *string, timeoutMs int32) *kmsg.InitProducerIDResponse {
+	t.Helper()
+
+	req := kmsg.NewInitProducerIDRequest()
+	req.Version = 0
+	req.TransactionalID = txnID
+	req.TransactionTimeoutMillis = timeoutMs
+	body := req.AppendTo(nil)
+
+	respBuf := sendRawRequest(t, conn, int16(kmsg.InitProducerID), 0, correlationID, body)
+
+	resp := &kmsg.InitProducerIDResponse{Version: 0}
+	err := resp.ReadFrom(respBuf)
+	require.NoError(t, err)
+	return resp
+}
+
+// sendAddPartitionsToTxn sends an AddPartitionsToTxn request (version 0) to
+// mark a transaction as active on the server.
+func sendAddPartitionsToTxn(t *testing.T, conn net.Conn, correlationID int32, txnID string, producerID int64, epoch int16, topic string) {
+	t.Helper()
+
+	req := kmsg.NewAddPartitionsToTxnRequest()
+	req.Version = 0
+	req.TransactionalID = txnID
+	req.ProducerID = producerID
+	req.ProducerEpoch = epoch
+	topicReq := kmsg.NewAddPartitionsToTxnRequestTopic()
+	topicReq.Topic = topic
+	topicReq.Partitions = []int32{0}
+	req.Topics = append(req.Topics, topicReq)
+	body := req.AppendTo(nil)
+
+	_ = sendRawRequest(t, conn, int16(kmsg.AddPartitionsToTxn), 0, correlationID, body)
+}
+
+func TestTxnStateZombieFencing(t *testing.T) {
 	// Verify that zombie fencing aborts an in-flight transaction and bumps
 	// the epoch when InitProducerID is called with an existing txnID.
 	var aborted []string
 	srv, err := New(Config{
 		Address:            "127.0.0.1:0",
 		TransactionalWrite: true,
-	}, WithTxnEndFunc(func(txnID string, commit bool) {
+		Timeout:            5 * time.Second,
+	}, WithLogger(&testLogger{t}), WithTxnEndFunc(func(txnID string, commit bool) {
 		if !commit {
 			aborted = append(aborted, txnID)
 		}
 	}))
 	require.NoError(t, err)
+	require.NoError(t, srv.Start(context.Background()))
+	defer srv.Close(context.Background()) //nolint:errcheck
+	startReadLoop(t, srv)
 
-	// Simulate first InitProducerID for "txn-1"
-	srv.txnMu.Lock()
-	srv.txnStates["txn-1"] = &txnState{producerID: 1, epoch: 0, active: true}
-	srv.txnMu.Unlock()
+	addr := srv.Addr().String()
+	waitForTCPReady(t, addr, 5*time.Second)
 
-	// Simulate a second InitProducerID from a new producer with the same txnID.
-	// This should abort the in-flight transaction and bump the epoch.
-	srv.txnMu.Lock()
-	existing := srv.txnStates["txn-1"]
-	require.True(t, existing.active, "should be active before fencing")
-	existing.active = false
-	existing.epoch++
-	srv.txnMu.Unlock()
+	conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
+	require.NoError(t, err)
+	defer conn.Close() //nolint:errcheck
 
-	// Invoke callback outside the lock, mirroring real server behaviour.
-	if srv.txnEndFn != nil {
-		srv.txnEndFn("txn-1", false)
-	}
+	// First, send ApiVersions (required handshake).
+	apiReq := &kmsg.ApiVersionsRequest{Version: 0}
+	sendRawRequest(t, conn, int16(kmsg.ApiVersions), 0, 0, apiReq.AppendTo(nil))
 
-	assert.Equal(t, []string{"txn-1"}, aborted, "in-flight txn should have been aborted")
-	assert.Equal(t, int16(1), existing.epoch, "epoch should be bumped")
-	assert.False(t, existing.active, "txn should no longer be active")
+	// First InitProducerID — creates a new txn state.
+	txnID := "txn-fence"
+	resp1 := sendInitProducerID(t, conn, 1, &txnID, 30000)
+	assert.Equal(t, int16(0), resp1.ErrorCode)
+	assert.Equal(t, int16(0), resp1.ProducerEpoch)
+	pid := resp1.ProducerID
+
+	// Mark the transaction as active via AddPartitionsToTxn.
+	sendAddPartitionsToTxn(t, conn, 2, txnID, pid, 0, "test-topic")
+
+	// Second InitProducerID with the same txnID — should fence zombie.
+	resp2 := sendInitProducerID(t, conn, 3, &txnID, 30000)
+	assert.Equal(t, int16(0), resp2.ErrorCode)
+	assert.Equal(t, pid, resp2.ProducerID, "should reuse the same producer ID")
+	assert.Equal(t, int16(1), resp2.ProducerEpoch, "epoch should be bumped")
+	assert.Equal(t, []string{"txn-fence"}, aborted, "in-flight txn should have been aborted")
 }
 
 func TestTxnStateEpochBumpNoActiveTransaction(t *testing.T) {
@@ -392,33 +466,39 @@ func TestTxnStateEpochBumpNoActiveTransaction(t *testing.T) {
 	srv, err := New(Config{
 		Address:            "127.0.0.1:0",
 		TransactionalWrite: true,
-	}, WithTxnEndFunc(func(txnID string, commit bool) {
+		Timeout:            5 * time.Second,
+	}, WithLogger(&testLogger{t}), WithTxnEndFunc(func(txnID string, commit bool) {
 		if !commit {
 			aborted = append(aborted, txnID)
 		}
 	}))
 	require.NoError(t, err)
+	require.NoError(t, srv.Start(context.Background()))
+	defer srv.Close(context.Background()) //nolint:errcheck
+	startReadLoop(t, srv)
 
-	srv.txnMu.Lock()
-	srv.txnStates["txn-2"] = &txnState{producerID: 2, epoch: 0, active: false}
-	srv.txnMu.Unlock()
+	addr := srv.Addr().String()
+	waitForTCPReady(t, addr, 5*time.Second)
 
-	// Simulate a second InitProducerID — no active txn so no abort.
-	srv.txnMu.Lock()
-	existing := srv.txnStates["txn-2"]
-	needsAbort := existing.active
-	if needsAbort {
-		existing.active = false
-	}
-	existing.epoch++
-	srv.txnMu.Unlock()
+	conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
+	require.NoError(t, err)
+	defer conn.Close() //nolint:errcheck
 
-	if needsAbort && srv.txnEndFn != nil {
-		srv.txnEndFn("txn-2", false)
-	}
+	apiReq := &kmsg.ApiVersionsRequest{Version: 0}
+	sendRawRequest(t, conn, int16(kmsg.ApiVersions), 0, 0, apiReq.AppendTo(nil))
 
+	// First InitProducerID — creates a new txn state (not active yet).
+	txnID := "txn-no-active"
+	resp1 := sendInitProducerID(t, conn, 1, &txnID, 30000)
+	assert.Equal(t, int16(0), resp1.ErrorCode)
+	assert.Equal(t, int16(0), resp1.ProducerEpoch)
+
+	// Second InitProducerID — no active txn so epoch bumps but no abort.
+	resp2 := sendInitProducerID(t, conn, 2, &txnID, 30000)
+	assert.Equal(t, int16(0), resp2.ErrorCode)
+	assert.Equal(t, resp1.ProducerID, resp2.ProducerID, "should reuse the same producer ID")
+	assert.Equal(t, int16(1), resp2.ProducerEpoch, "epoch should be bumped")
 	assert.Empty(t, aborted, "no abort should be fired when txn is not active")
-	assert.Equal(t, int16(1), existing.epoch, "epoch should still be bumped")
 }
 
 func TestTxnStateInitialized(t *testing.T) {
@@ -429,5 +509,40 @@ func TestTxnStateInitialized(t *testing.T) {
 	require.NoError(t, err)
 	assert.NotNil(t, srv.txnStates, "txnStates map should be initialized")
 	assert.Empty(t, srv.txnStates, "txnStates map should be empty initially")
+}
+
+func TestTxnStatesMaxSize(t *testing.T) {
+	// Verify that the server rejects new transactional IDs when the max
+	// number of tracked IDs is reached.
+	srv, err := New(Config{
+		Address:            "127.0.0.1:0",
+		TransactionalWrite: true,
+		Timeout:            5 * time.Second,
+	}, WithLogger(&testLogger{t}))
+	require.NoError(t, err)
+	require.NoError(t, srv.Start(context.Background()))
+	defer srv.Close(context.Background()) //nolint:errcheck
+	startReadLoop(t, srv)
+
+	// Pre-fill txnStates to the max.
+	srv.txnMu.Lock()
+	for i := 0; i < maxTxnStates; i++ {
+		srv.txnStates[fmt.Sprintf("fill-%d", i)] = &txnState{}
+	}
+	srv.txnMu.Unlock()
+
+	addr := srv.Addr().String()
+	waitForTCPReady(t, addr, 5*time.Second)
+
+	conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
+	require.NoError(t, err)
+	defer conn.Close() //nolint:errcheck
+
+	apiReq := &kmsg.ApiVersionsRequest{Version: 0}
+	sendRawRequest(t, conn, int16(kmsg.ApiVersions), 0, 0, apiReq.AppendTo(nil))
+
+	txnID := "one-too-many"
+	resp := sendInitProducerID(t, conn, 1, &txnID, 30000)
+	assert.NotEqual(t, int16(0), resp.ErrorCode, "should reject when txnStates is full")
 }
 
