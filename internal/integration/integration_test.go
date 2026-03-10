@@ -43,7 +43,7 @@ func getIntegrationFreePort(t *testing.T) int {
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	require.NoError(t, err)
 	port := l.Addr().(*net.TCPAddr).Port
-	l.Close()
+	require.NoError(t, l.Close())
 	return port
 }
 
@@ -53,7 +53,7 @@ func integrationWaitForTCPReady(t *testing.T, addr string, timeout time.Duration
 	for time.Now().Before(deadline) {
 		conn, err := net.DialTimeout("tcp", addr, 500*time.Millisecond)
 		if err == nil {
-			conn.Close()
+			conn.Close() //nolint:errcheck
 			return
 		}
 		time.Sleep(50 * time.Millisecond)
@@ -163,7 +163,7 @@ func startIntegrationServer(t *testing.T, port int, cfg ksink.Config) *integrati
 	integrationWaitForTCPReady(t, fmt.Sprintf("127.0.0.1:%d", port), 5*time.Second)
 
 	t.Cleanup(func() {
-		srv.Close(context.Background())
+		srv.Close(context.Background()) //nolint:errcheck
 	})
 
 	return integrationStartReadLoop(t, srv)

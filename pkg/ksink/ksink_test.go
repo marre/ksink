@@ -165,7 +165,7 @@ func TestServerAddr(t *testing.T) {
 
 	err = srv.Start(context.Background())
 	require.NoError(t, err)
-	defer srv.Close(context.Background())
+	defer srv.Close(context.Background()) //nolint:errcheck
 
 	// After Start, Addr should not be nil
 	assert.NotNil(t, srv.Addr())
@@ -185,7 +185,7 @@ func TestServerAdvertisedAddress(t *testing.T) {
 
 	err = srv.Start(context.Background())
 	require.NoError(t, err)
-	defer srv.Close(context.Background())
+	defer srv.Close(context.Background()) //nolint:errcheck
 
 	// Start a read loop so produce requests don't block
 	startReadLoop(t, srv)
@@ -196,7 +196,7 @@ func TestServerAdvertisedAddress(t *testing.T) {
 	// Connect and verify via raw protocol that the advertised address is returned
 	conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
 	require.NoError(t, err)
-	defer conn.Close()
+	defer conn.Close() //nolint:errcheck
 
 	// Send ApiVersions request
 	req := &kmsg.ApiVersionsRequest{Version: 0}
@@ -213,7 +213,7 @@ func TestServerAdvertisedAddress(t *testing.T) {
 	require.NoError(t, err)
 
 	// Read ApiVersions response
-	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	require.NoError(t, conn.SetReadDeadline(time.Now().Add(5*time.Second)))
 	respSizeBuf := make([]byte, 4)
 	_, err = io.ReadFull(conn, respSizeBuf)
 	require.NoError(t, err)
@@ -330,7 +330,7 @@ func TestReadBatchServerClosed(t *testing.T) {
 	require.NoError(t, err)
 
 	// Close the server
-	srv.Close(context.Background())
+	require.NoError(t, srv.Close(context.Background()))
 
 	msgs, ack, err := srv.ReadBatch(context.Background())
 	assert.Nil(t, msgs)

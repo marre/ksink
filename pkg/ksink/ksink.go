@@ -384,7 +384,9 @@ func (s *Server) Close(ctx context.Context) error {
 	}
 
 	if s.listener != nil {
-		s.listener.Close()
+		if err := s.listener.Close(); err != nil {
+			return fmt.Errorf("failed to close listener: %w", err)
+		}
 	}
 
 	// Wait for accept loop to exit before waiting on connections,

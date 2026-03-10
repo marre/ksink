@@ -1,4 +1,4 @@
-.PHONY: build test vet clean
+.PHONY: build test vet lint clean
 
 build:
 	go build ./...
@@ -8,6 +8,9 @@ test:
 
 vet:
 	go vet ./...
+
+lint:
+	golangci-lint run ./...
 
 clean:
 	rm -rf dist/

@@ -168,7 +168,7 @@ output:
 		if reqErr != nil {
 			return reqErr
 		}
-		defer resp.Body.Close()
+		defer resp.Body.Close() //nolint:errcheck
 		if resp.StatusCode != http.StatusOK {
 			return fmt.Errorf("bento not ready: status %d", resp.StatusCode)
 		}
@@ -183,7 +183,7 @@ output:
 		Timeout: 10 * time.Second,
 	}, bentoTLSCfg)
 	require.NoError(t, err)
-	defer httpWriter.Close()
+	defer httpWriter.Close() //nolint:errcheck
 
 	// Create message formatter (binary format with newline separator)
 	fmtr, err := format.New("binary", []byte("\n"))
@@ -203,7 +203,7 @@ output:
 	err = srv.Start(ctx)
 	require.NoError(t, err)
 	t.Cleanup(func() {
-		srv.Close(context.Background())
+		srv.Close(context.Background()) //nolint:errcheck
 	})
 
 	integrationWaitForTCPReady(t, ksinkAddr, 5*time.Second)

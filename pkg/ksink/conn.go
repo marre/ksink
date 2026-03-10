@@ -48,7 +48,9 @@ func (s *Server) acceptLoop(ctx context.Context) {
 
 func (s *Server) handleConnection(ctx context.Context, conn net.Conn, connID uint64) {
 	defer func() {
-		conn.Close()
+		if err := conn.Close(); err != nil {
+			s.logger.Debugf("[conn:%d] Error closing connection: %v", connID, err)
+		}
 		s.logger.Debugf("[conn:%d] Connection closed", connID)
 	}()
 

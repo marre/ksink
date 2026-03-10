@@ -37,7 +37,7 @@ func TestOutputHTTP(t *testing.T) {
 
 	w, err := output.Open(ts.URL, nil)
 	require.NoError(t, err)
-	t.Cleanup(func() { w.Close() })
+	t.Cleanup(func() { w.Close() }) //nolint:errcheck
 
 	srv, kafkaAddr := startKsinkServer(t, ctx)
 	startReadWriteLoop(t, srv, w)

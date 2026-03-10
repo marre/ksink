@@ -192,7 +192,7 @@ func run(addr, dst, fmtName, fmtStr string, jsonB64Key, jsonB64Val bool, separat
 	if err != nil {
 		return err
 	}
-	defer w.Close()
+	defer w.Close() //nolint:errcheck
 
 	srv, err := ksink.New(ksink.Config{
 		Address: addr,
@@ -246,7 +246,9 @@ func run(addr, dst, fmtName, fmtStr string, jsonB64Key, jsonB64Val bool, separat
 	<-sigCh
 
 	log.Println("Shutting down...")
-	srv.Close(context.Background())
+	if err := srv.Close(context.Background()); err != nil {
+		return fmt.Errorf("failed to shut down server: %w", err)
+	}
 	return nil
 }
 
