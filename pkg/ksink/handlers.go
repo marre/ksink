@@ -298,6 +298,15 @@ func (s *Server) handleInitProducerId(conn net.Conn, connID uint64, correlationI
 				existing.active = false
 			}
 			existing.epoch++
+			if existing.epoch < 0 {
+				// int16 overflow — reset to a fresh producer to avoid
+				// negative epochs confusing clients.
+				producerID := s.producerIDCounter.Add(1)
+				existing.producerID = producerID
+				existing.epoch = 0
+				s.logger.Warnf("[conn:%d] InitProducerId: epoch overflow for txnID=%s, rotated to new producerID=%d",
+					connID, txnID, producerID)
+			}
 			// Copy fields before releasing the lock to avoid a data race.
 			producerID := existing.producerID
 			epoch := existing.epoch
@@ -325,7 +334,7 @@ func (s *Server) handleInitProducerId(conn net.Conn, connID uint64, correlationI
 			s.logger.Warnf("[conn:%d] Rejecting InitProducerId: too many transactional IDs tracked (%d)", connID, maxTxnStates)
 			resp := &kmsg.InitProducerIDResponse{
 				Version:    apiVersion,
-				ErrorCode:  kerr.TransactionalIDAuthorizationFailed.Code,
+				ErrorCode:  kerr.UnknownServerError.Code,
 				ProducerID: -1,
 			}
 			return s.sendResponse(conn, connID, correlationID, resp)
@@ -445,11 +454,22 @@ func (s *Server) handleAddPartitionsToTxn(conn net.Conn, connID uint64, correlat
 		resp.Topics = append(resp.Topics, topicResp)
 	}
 
-	// Mark the transaction as active.
+	// Validate producerID/epoch against txnState and mark the transaction as active.
 	s.txnMu.Lock()
-	if st, ok := s.txnStates[req.TransactionalID]; ok {
-		st.active = true
+	st, stOK := s.txnStates[req.TransactionalID]
+	if !stOK || st.producerID != req.ProducerID || st.epoch != req.ProducerEpoch {
+		s.txnMu.Unlock()
+		// Return ProducerFenced for all partitions.
+		for ti := range resp.Topics {
+			for pi := range resp.Topics[ti].Partitions {
+				resp.Topics[ti].Partitions[pi].ErrorCode = kerr.ProducerFenced.Code
+			}
+		}
+		s.logger.Warnf("[conn:%d] AddPartitionsToTxn fenced: txnID=%s, producerID=%d, epoch=%d",
+			connID, req.TransactionalID, req.ProducerID, req.ProducerEpoch)
+		return s.sendResponse(conn, connID, correlationID, resp)
 	}
+	st.active = true
 	s.txnMu.Unlock()
 
 	s.logger.Debugf("[conn:%d] AddPartitionsToTxn: txnID=%s, topics=%d", connID, req.TransactionalID, len(req.Topics))
@@ -484,12 +504,26 @@ func (s *Server) handleEndTxn(conn net.Conn, connID uint64, correlationID int32,
 		Version: apiVersion,
 	}
 
-	// Mark the transaction as no longer active.
+	// Validate producerID/epoch against txnState before allowing the commit/abort.
+	fenced := false
 	s.txnMu.Lock()
 	if st, ok := s.txnStates[req.TransactionalID]; ok {
-		st.active = false
+		if st.producerID != req.ProducerID || st.epoch != req.ProducerEpoch {
+			fenced = true
+		} else {
+			st.active = false
+		}
+	} else {
+		fenced = true
 	}
 	s.txnMu.Unlock()
+
+	if fenced {
+		resp.ErrorCode = kerr.ProducerFenced.Code
+		s.logger.Warnf("[conn:%d] EndTxn fenced: txnID=%s, producerID=%d, epoch=%d",
+			connID, req.TransactionalID, req.ProducerID, req.ProducerEpoch)
+		return s.sendResponse(conn, connID, correlationID, resp)
+	}
 
 	if s.txnEndFn != nil {
 		s.txnEndFn(req.TransactionalID, req.Commit)

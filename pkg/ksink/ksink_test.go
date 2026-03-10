@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"sync"
 	"testing"
 	"time"
 
@@ -415,12 +416,17 @@ func sendAddPartitionsToTxn(t *testing.T, conn net.Conn, correlationID int32, tx
 func TestTxnStateZombieFencing(t *testing.T) {
 	// Verify that zombie fencing aborts an in-flight transaction and bumps
 	// the epoch when InitProducerID is called with an existing txnID.
-	var aborted []string
+	var (
+		aborted []string
+		mu      sync.Mutex
+	)
 	srv, err := New(Config{
 		Address:            "127.0.0.1:0",
 		TransactionalWrite: true,
 		Timeout:            5 * time.Second,
 	}, WithLogger(&testLogger{t}), WithTxnEndFunc(func(txnID string, commit bool) {
+		mu.Lock()
+		defer mu.Unlock()
 		if !commit {
 			aborted = append(aborted, txnID)
 		}
@@ -456,18 +462,25 @@ func TestTxnStateZombieFencing(t *testing.T) {
 	assert.Equal(t, int16(0), resp2.ErrorCode)
 	assert.Equal(t, pid, resp2.ProducerID, "should reuse the same producer ID")
 	assert.Equal(t, int16(1), resp2.ProducerEpoch, "epoch should be bumped")
+	mu.Lock()
 	assert.Equal(t, []string{"txn-fence"}, aborted, "in-flight txn should have been aborted")
+	mu.Unlock()
 }
 
 func TestTxnStateEpochBumpNoActiveTransaction(t *testing.T) {
 	// When InitProducerID is called for an existing txnID that does not
 	// have an active transaction, the epoch is bumped but no abort is fired.
-	var aborted []string
+	var (
+		aborted []string
+		mu      sync.Mutex
+	)
 	srv, err := New(Config{
 		Address:            "127.0.0.1:0",
 		TransactionalWrite: true,
 		Timeout:            5 * time.Second,
 	}, WithLogger(&testLogger{t}), WithTxnEndFunc(func(txnID string, commit bool) {
+		mu.Lock()
+		defer mu.Unlock()
 		if !commit {
 			aborted = append(aborted, txnID)
 		}
@@ -498,7 +511,9 @@ func TestTxnStateEpochBumpNoActiveTransaction(t *testing.T) {
 	assert.Equal(t, int16(0), resp2.ErrorCode)
 	assert.Equal(t, resp1.ProducerID, resp2.ProducerID, "should reuse the same producer ID")
 	assert.Equal(t, int16(1), resp2.ProducerEpoch, "epoch should be bumped")
+	mu.Lock()
 	assert.Empty(t, aborted, "no abort should be fired when txn is not active")
+	mu.Unlock()
 }
 
 func TestTxnStateInitialized(t *testing.T) {
