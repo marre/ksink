@@ -64,10 +64,11 @@ func integrationWaitForTCPReady(t *testing.T, addr string, timeout time.Duration
 // --- Integration message capture ---
 
 type integrationReceivedMessage struct {
-	Topic   string
-	Key     string
-	Value   string
-	Headers map[string]string
+	Topic           string
+	Key             string
+	Value           string
+	Headers         map[string]string
+	TransactionalID string
 }
 
 type integrationMessageCapture struct {
@@ -115,9 +116,10 @@ func integrationStartReadLoop(t *testing.T, srv *ksink.Server) *integrationMessa
 			}
 			for _, msg := range msgs {
 				rm := integrationReceivedMessage{
-					Topic:   msg.Topic,
-					Value:   string(msg.Value),
-					Headers: make(map[string]string),
+					Topic:           msg.Topic,
+					Value:           string(msg.Value),
+					Headers:         make(map[string]string),
+					TransactionalID: msg.TransactionalID,
 				}
 				if msg.Key != nil {
 					rm.Key = string(msg.Key)

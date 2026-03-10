@@ -35,17 +35,18 @@ func (stdLogger) Errorf(format string, args ...any) { log.Printf("[ERROR] "+form
 
 func main() {
 	var (
-		addr        string
-		dst         string
-		fmtName     string
-		fmtStr      string
-		jsonB64Key  bool
-		jsonB64Val  bool
-		separator   string
-		sepHex      string
-		noSeparator bool
-		tOpts       output.TLSOpts
-		httpOpts    output.HTTPOpts
+		addr          string
+		dst           string
+		fmtName       string
+		fmtStr        string
+		jsonB64Key    bool
+		jsonB64Val    bool
+		separator     string
+		sepHex        string
+		noSeparator   bool
+		transactional bool
+		tOpts         output.TLSOpts
+		httpOpts      output.HTTPOpts
 	)
 
 	rootCmd := &cobra.Command{
@@ -93,13 +94,20 @@ kcat format specifiers (--output-format-string):
 					return fmt.Errorf("--output-separator, --output-separator-hex, and --no-separator are only supported with --output-format=binary")
 				}
 			}
-			return run(addr, dst, fmtName, fmtStr, jsonB64Key, jsonB64Val, separator, sepHex, noSeparator, tOpts, httpOpts)
+			return run(addr, dst, fmtName, fmtStr, jsonB64Key, jsonB64Val, separator, sepHex, noSeparator, transactional, tOpts, httpOpts)
 		},
 	}
 
 	rootCmd.Flags().StringVar(&addr, "addr", ":9092", "Address to listen on")
+	rootCmd.Flags().BoolVar(&transactional, "transactional", false,
+		"Enable transactional produce support (per-transaction files with rename-as-commit/delete-as-abort). Requires {txnID} in --output.")
 	rootCmd.Flags().StringVar(&dst, "output", "-",
-		`Output destination: "-" for stdout (default), file path, or http(s):// URL`)
+		`Output destination: "-" for stdout (default), file path, or http(s):// URL.
+The path may contain {topic} to route messages to per-topic files
+(e.g. "{topic}.jsonl" produces "orders.jsonl", "events.jsonl", etc.).
+With --transactional, must also contain {txnID}
+(e.g. "{topic}-{txnID}.jsonl" produces "orders-my-txn.jsonl").
+Topic names are sanitised to prevent path traversal.`)
 	rootCmd.Flags().StringVar(&fmtName, "output-format", "binary",
 		"Message format: binary, jsonl, kcat")
 	rootCmd.Flags().StringVar(&fmtStr, "output-format-string", "",
@@ -145,7 +153,7 @@ kcat format specifiers (--output-format-string):
 	}
 }
 
-func run(addr, dst, fmtName, fmtStr string, jsonB64Key, jsonB64Val bool, separator, sepHex string, noSeparator bool, tOpts output.TLSOpts, httpOpts output.HTTPOpts) error {
+func run(addr, dst, fmtName, fmtStr string, jsonB64Key, jsonB64Val bool, separator, sepHex string, noSeparator, transactional bool, tOpts output.TLSOpts, httpOpts output.HTTPOpts) error {
 	var sep []byte
 	if fmtName == "binary" {
 		var err error
@@ -184,9 +192,18 @@ func run(addr, dst, fmtName, fmtStr string, jsonB64Key, jsonB64Val bool, separat
 	}
 
 	var w output.Writer
-	if strings.HasPrefix(dst, "http://") || strings.HasPrefix(dst, "https://") {
+	isHTTP := strings.HasPrefix(dst, "http://") || strings.HasPrefix(dst, "https://")
+	if isHTTP {
+		if transactional {
+			return fmt.Errorf("--transactional is not supported with HTTP output")
+		}
 		w, err = output.NewHTTPWriter(dst, httpOpts, tlsCfg)
+	} else if transactional && dst != "-" {
+		w, err = output.NewTxnFileWriter(dst)
 	} else {
+		if transactional && dst == "-" {
+			return fmt.Errorf("--transactional is not supported with stdout output")
+		}
 		w, err = output.Open(dst, tlsCfg)
 	}
 	if err != nil {
@@ -194,9 +211,27 @@ func run(addr, dst, fmtName, fmtStr string, jsonB64Key, jsonB64Val bool, separat
 	}
 	defer w.Close() //nolint:errcheck
 
+	serverOpts := []ksink.Option{ksink.WithLogger(stdLogger{})}
+	if transactional {
+		if tw, ok := w.(output.TransactionalWriter); ok {
+			serverOpts = append(serverOpts, ksink.WithTxnEndFunc(func(txnID string, commit bool) {
+				if commit {
+					if err := tw.CommitTxn(txnID); err != nil {
+						log.Printf("[ERROR] commit txn %s: %v", txnID, err)
+					}
+				} else {
+					if err := tw.AbortTxn(txnID); err != nil {
+						log.Printf("[ERROR] abort txn %s: %v", txnID, err)
+					}
+				}
+			}))
+		}
+	}
+
 	srv, err := ksink.New(ksink.Config{
-		Address: addr,
-	}, ksink.WithLogger(stdLogger{}))
+		Address:            addr,
+		TransactionalWrite: transactional,
+	}, serverOpts...)
 	if err != nil {
 		return fmt.Errorf("failed to create server: %w", err)
 	}

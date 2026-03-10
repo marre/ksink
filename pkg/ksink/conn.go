@@ -176,6 +176,18 @@ func (s *Server) handleConnection(ctx context.Context, conn net.Conn, connID uin
 			} else {
 				handleErr = s.handleFindCoordinator(conn, connID, correlationID, apiVersion, req)
 			}
+		case *kmsg.AddPartitionsToTxnRequest:
+			if err := req.ReadFrom(bodyData); err != nil {
+				handleErr = fmt.Errorf("failed to parse add partitions to txn request: %w", err)
+			} else {
+				handleErr = s.handleAddPartitionsToTxn(conn, connID, correlationID, apiVersion, req, state)
+			}
+		case *kmsg.EndTxnRequest:
+			if err := req.ReadFrom(bodyData); err != nil {
+				handleErr = fmt.Errorf("failed to parse end txn request: %w", err)
+			} else {
+				handleErr = s.handleEndTxn(conn, connID, correlationID, apiVersion, req, state)
+			}
 		default:
 			s.logger.Warnf("[conn:%d] Unsupported API key: %d", connID, apiKey)
 			handleErr = fmt.Errorf("unsupported API key: %d", apiKey)

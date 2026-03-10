@@ -46,15 +46,16 @@ const (
 
 // Message represents a received Kafka message.
 type Message struct {
-	Topic      string
-	Partition  int32
-	Offset     int64
-	Key        []byte
-	Value      []byte
-	Headers    map[string]string
-	Timestamp  time.Time
-	Tombstone  bool
-	ClientAddr string
+	Topic           string
+	Partition       int32
+	Offset          int64
+	Key             []byte
+	Value           []byte
+	Headers         map[string]string
+	Timestamp       time.Time
+	Tombstone       bool
+	ClientAddr      string
+	TransactionalID string // non-empty when produced inside a transaction
 }
 
 // SASLCredential holds a SASL authentication credential.
@@ -104,6 +105,12 @@ type Config struct {
 
 	// IdempotentWrite enables idempotent produce support.
 	IdempotentWrite bool
+
+	// TransactionalWrite enables fake transactional produce support.
+	// When enabled, the server accepts transactional protocol requests
+	// (AddPartitionsToTxn, EndTxn) but does not enforce transactional
+	// semantics. This implies IdempotentWrite.
+	TransactionalWrite bool
 }
 
 func (c *Config) setDefaults() {
@@ -118,6 +125,9 @@ func (c *Config) setDefaults() {
 	}
 	if c.MaxMessageBytes == 0 {
 		c.MaxMessageBytes = defaultMaxMessageBytes
+	}
+	if c.TransactionalWrite {
+		c.IdempotentWrite = true
 	}
 }
 
@@ -159,6 +169,20 @@ func WithLogger(l Logger) Option {
 	}
 }
 
+// TxnEndFunc is called when a transactional producer commits or aborts a
+// transaction. txnID is the transactional ID and commit indicates whether
+// the transaction was committed (true) or aborted (false).
+type TxnEndFunc func(txnID string, commit bool)
+
+// WithTxnEndFunc registers a callback that is invoked when a transaction
+// ends. This allows output backends to take action on commit (e.g. rename
+// a temporary file) or abort (e.g. delete a temporary file).
+func WithTxnEndFunc(fn TxnEndFunc) Option {
+	return func(s *Server) {
+		s.txnEndFn = fn
+	}
+}
+
 // Server is a Kafka-protocol-compatible server that accepts produce requests.
 // Use [ReadBatch] to receive message batches from connected producers.
 type Server struct {
@@ -184,6 +208,9 @@ type Server struct {
 
 	// Idempotent producer tracking
 	producerIDCounter atomic.Int64
+
+	// Transaction end callback
+	txnEndFn TxnEndFunc
 
 	// Decompressor for parsing record batches
 	decompressor kgo.Decompressor

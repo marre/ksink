@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/marre/ksink/pkg/ksink"
@@ -22,6 +23,15 @@ import (
 type Writer interface {
 	io.Closer
 	Write(data []byte, msg *ksink.Message) error
+}
+
+// TransactionalWriter extends [Writer] with transaction commit and abort
+// operations. File-based backends can implement this to write into temporary
+// files during a transaction and then rename on commit or delete on abort.
+type TransactionalWriter interface {
+	Writer
+	CommitTxn(txnID string) error
+	AbortTxn(txnID string) error
 }
 
 // TLSOpts holds TLS configuration options for output connections.
@@ -72,10 +82,27 @@ func (o *TLSOpts) BuildTLSConfig() (*tls.Config, error) {
 	return cfg, nil
 }
 
+// TopicPlaceholder is the placeholder that can be used in output patterns
+// to route messages to per-topic files.
+const TopicPlaceholder = "{topic}"
+
+// SanitizePathSegment returns a safe single-component file name from an
+// untrusted string. It uses [filepath.Clean] and [filepath.Base] to strip
+// any directory traversal, then rejects the special names "." and "..".
+func SanitizePathSegment(s string) string {
+	safe := filepath.Base(filepath.Clean(s))
+	if safe == "." || safe == ".." || safe == string(filepath.Separator) {
+		return "_"
+	}
+	return safe
+}
+
 // Open creates a Writer based on the output string.
 // The special value "-" writes to standard output.
 // For http:// and https:// URLs, Open creates an HTTP writer with default
 // options (no retries, no DLQ). Use NewHTTPWriter for full configuration.
+// If the destination contains the {topic} placeholder, a pattern-based writer
+// is returned that routes messages to per-topic files.
 func Open(dst string, tlsCfg *tls.Config) (Writer, error) {
 	switch {
 	case dst == "-":
@@ -86,6 +113,9 @@ func Open(dst string, tlsCfg *tls.Config) (Writer, error) {
 		// Reject unknown URL-like schemes explicitly to avoid treating them as file paths.
 		if strings.Contains(dst, "://") {
 			return nil, fmt.Errorf("unsupported output scheme in %q; only -, http(s), or file paths are supported", dst)
+		}
+		if strings.Contains(dst, TopicPlaceholder) {
+			return newPatternFileWriter(dst), nil
 		}
 		return newFileWriter(dst)
 	}

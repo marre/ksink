@@ -42,6 +42,14 @@ func (s *Server) handleApiVersions(conn net.Conn, connID uint64, correlationID i
 		)
 	}
 
+	// Only advertise transactional APIs when TransactionalWrite is enabled
+	if s.cfg.TransactionalWrite {
+		resp.ApiKeys = append(resp.ApiKeys,
+			kmsg.ApiVersionsResponseApiKey{ApiKey: int16(kmsg.AddPartitionsToTxn), MinVersion: 0, MaxVersion: 3},
+			kmsg.ApiVersionsResponseApiKey{ApiKey: int16(kmsg.EndTxn), MinVersion: 0, MaxVersion: 3},
+		)
+	}
+
 	s.logger.Debugf("[conn:%d] Sending ApiVersions response with %d keys", connID, len(resp.ApiKeys))
 
 	// ApiVersions always uses non-flexible encoding
@@ -145,6 +153,10 @@ func (s *Server) handleProduce(ctx context.Context, conn net.Conn, connID uint64
 	}
 
 	remoteAddr := conn.RemoteAddr().String()
+	txnID := ""
+	if req.TransactionID != nil {
+		txnID = *req.TransactionID
+	}
 
 	// First pass: parse all records and track per-partition status
 	type partResult struct {
@@ -174,6 +186,11 @@ func (s *Server) handleProduce(ctx context.Context, conn net.Conn, connID uint64
 			}
 
 			results[key] = partResult{}
+			if txnID != "" {
+				for _, msg := range batch {
+					msg.TransactionalID = txnID
+				}
+			}
 			allMsgs = append(allMsgs, batch...)
 		}
 	}
@@ -317,6 +334,82 @@ func (s *Server) handleFindCoordinator(conn net.Conn, connID uint64, correlation
 	}
 
 	s.logger.Debugf("[conn:%d] FindCoordinator response: host=%s, port=%d", connID, host, port)
+	return s.sendResponse(conn, connID, correlationID, resp)
+}
+
+func (s *Server) handleAddPartitionsToTxn(conn net.Conn, connID uint64, correlationID int32, apiVersion int16, req *kmsg.AddPartitionsToTxnRequest, state *connState) error {
+	if s.saslEnabled && !state.authenticated {
+		s.logger.Warnf("[conn:%d] Rejecting AddPartitionsToTxn: not authenticated", connID)
+		resp := &kmsg.AddPartitionsToTxnResponse{
+			Version:   apiVersion,
+			ErrorCode: kerr.SaslAuthenticationFailed.Code,
+		}
+		return s.sendResponse(conn, connID, correlationID, resp)
+	}
+
+	if !s.cfg.TransactionalWrite {
+		s.logger.Warnf("[conn:%d] Rejecting AddPartitionsToTxn: transactional_write is disabled", connID)
+		resp := &kmsg.AddPartitionsToTxnResponse{
+			Version:   apiVersion,
+			ErrorCode: kerr.TransactionalIDAuthorizationFailed.Code,
+		}
+		return s.sendResponse(conn, connID, correlationID, resp)
+	}
+
+	resp := &kmsg.AddPartitionsToTxnResponse{
+		Version: apiVersion,
+	}
+
+	for _, topic := range req.Topics {
+		topicResp := kmsg.AddPartitionsToTxnResponseTopic{
+			Topic: topic.Topic,
+		}
+		for _, partition := range topic.Partitions {
+			topicResp.Partitions = append(topicResp.Partitions, kmsg.AddPartitionsToTxnResponseTopicPartition{
+				Partition: partition,
+				ErrorCode: 0,
+			})
+		}
+		resp.Topics = append(resp.Topics, topicResp)
+	}
+
+	s.logger.Debugf("[conn:%d] AddPartitionsToTxn: txnID=%s, topics=%d", connID, req.TransactionalID, len(req.Topics))
+	return s.sendResponse(conn, connID, correlationID, resp)
+}
+
+func (s *Server) handleEndTxn(conn net.Conn, connID uint64, correlationID int32, apiVersion int16, req *kmsg.EndTxnRequest, state *connState) error {
+	if s.saslEnabled && !state.authenticated {
+		s.logger.Warnf("[conn:%d] Rejecting EndTxn: not authenticated", connID)
+		resp := &kmsg.EndTxnResponse{
+			Version:   apiVersion,
+			ErrorCode: kerr.SaslAuthenticationFailed.Code,
+		}
+		return s.sendResponse(conn, connID, correlationID, resp)
+	}
+
+	if !s.cfg.TransactionalWrite {
+		s.logger.Warnf("[conn:%d] Rejecting EndTxn: transactional_write is disabled", connID)
+		resp := &kmsg.EndTxnResponse{
+			Version:   apiVersion,
+			ErrorCode: kerr.TransactionalIDAuthorizationFailed.Code,
+		}
+		return s.sendResponse(conn, connID, correlationID, resp)
+	}
+
+	action := "commit"
+	if !req.Commit {
+		action = "abort"
+	}
+
+	resp := &kmsg.EndTxnResponse{
+		Version: apiVersion,
+	}
+
+	if s.txnEndFn != nil {
+		s.txnEndFn(req.TransactionalID, req.Commit)
+	}
+
+	s.logger.Debugf("[conn:%d] EndTxn: txnID=%s, action=%s", connID, req.TransactionalID, action)
 	return s.sendResponse(conn, connID, correlationID, resp)
 }
 
