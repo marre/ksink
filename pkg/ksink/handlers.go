@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"fmt"
+	"math"
 	"net"
 	"strconv"
 
@@ -297,15 +298,16 @@ func (s *Server) handleInitProducerId(conn net.Conn, connID uint64, correlationI
 					connID, txnID, existing.epoch, existing.epoch+1)
 				existing.active = false
 			}
-			existing.epoch++
-			if existing.epoch < 0 {
-				// int16 overflow — reset to a fresh producer to avoid
-				// negative epochs confusing clients.
-				producerID := s.producerIDCounter.Add(1)
-				existing.producerID = producerID
+			if existing.epoch == math.MaxInt16 {
+				// int16 would overflow — rotate to a new producer ID
+				// and reset the epoch to avoid confusing clients.
+				newPID := s.producerIDCounter.Add(1)
+				existing.producerID = newPID
 				existing.epoch = 0
 				s.logger.Warnf("[conn:%d] InitProducerId: epoch overflow for txnID=%s, rotated to new producerID=%d",
-					connID, txnID, producerID)
+					connID, txnID, newPID)
+			} else {
+				existing.epoch++
 			}
 			// Copy fields before releasing the lock to avoid a data race.
 			producerID := existing.producerID
