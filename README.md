@@ -11,6 +11,7 @@ A lightweight Kafka-protocol-compatible server library and tool for Go. It accep
 - Topic filtering
 - Idempotent producer support
 - Fake transactional producer support (accepts transactional protocol requests without enforcing transactional semantics)
+- Filesystem-based fake transactions: per-transaction temp files, rename-as-commit, delete-as-abort
 
 ## ksink Tool
 
@@ -37,6 +38,13 @@ go run ./cmd/ksink json-schema
 
 # Enable fake transactional produce support (stub)
 go run ./cmd/ksink --addr :9092 --transactional
+
+# Transactional file output — messages are written to per-transaction temp
+# files and renamed on commit or deleted on abort:
+#   During transaction: messages.jsonl.txn-<txnID>.tmp
+#   After commit:       messages.jsonl.txn-<txnID>
+#   After abort:        temp file is deleted
+go run ./cmd/ksink --addr :9092 --transactional --output messages.jsonl
 ```
 
 ### Message Formats
@@ -161,4 +169,22 @@ cfg := ksink.Config{
     IdempotentWrite:    false,
     TransactionalWrite: false,
 }
+```
+
+### Transaction Callbacks
+
+When `TransactionalWrite` is enabled, messages carry a `TransactionalID` field
+identifying the transaction they belong to. Use `WithTxnEndFunc` to receive
+commit/abort events:
+
+```go
+srv, _ := ksink.New(cfg,
+    ksink.WithTxnEndFunc(func(txnID string, commit bool) {
+        if commit {
+            // e.g. rename temp file
+        } else {
+            // e.g. delete temp file
+        }
+    }),
+)
 ```

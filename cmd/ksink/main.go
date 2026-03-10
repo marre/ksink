@@ -187,9 +187,18 @@ func run(addr, dst, fmtName, fmtStr string, jsonB64Key, jsonB64Val bool, separat
 	}
 
 	var w output.Writer
-	if strings.HasPrefix(dst, "http://") || strings.HasPrefix(dst, "https://") {
+	isHTTP := strings.HasPrefix(dst, "http://") || strings.HasPrefix(dst, "https://")
+	if isHTTP {
+		if transactional {
+			return fmt.Errorf("--transactional is not supported with HTTP output")
+		}
 		w, err = output.NewHTTPWriter(dst, httpOpts, tlsCfg)
+	} else if transactional && dst != "-" {
+		w = output.NewTxnFileWriter(dst)
 	} else {
+		if transactional && dst == "-" {
+			return fmt.Errorf("--transactional is not supported with stdout output")
+		}
 		w, err = output.Open(dst, tlsCfg)
 	}
 	if err != nil {
@@ -197,10 +206,27 @@ func run(addr, dst, fmtName, fmtStr string, jsonB64Key, jsonB64Val bool, separat
 	}
 	defer w.Close()
 
+	serverOpts := []ksink.Option{ksink.WithLogger(stdLogger{})}
+	if transactional {
+		if tw, ok := w.(output.TransactionalWriter); ok {
+			serverOpts = append(serverOpts, ksink.WithTxnEndFunc(func(txnID string, commit bool) {
+				if commit {
+					if err := tw.CommitTxn(txnID); err != nil {
+						log.Printf("[ERROR] commit txn %s: %v", txnID, err)
+					}
+				} else {
+					if err := tw.AbortTxn(txnID); err != nil {
+						log.Printf("[ERROR] abort txn %s: %v", txnID, err)
+					}
+				}
+			}))
+		}
+	}
+
 	srv, err := ksink.New(ksink.Config{
 		Address:            addr,
 		TransactionalWrite: transactional,
-	}, ksink.WithLogger(stdLogger{}))
+	}, serverOpts...)
 	if err != nil {
 		return fmt.Errorf("failed to create server: %w", err)
 	}

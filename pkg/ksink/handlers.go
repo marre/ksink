@@ -153,6 +153,10 @@ func (s *Server) handleProduce(ctx context.Context, conn net.Conn, connID uint64
 	}
 
 	remoteAddr := conn.RemoteAddr().String()
+	txnID := ""
+	if req.TransactionID != nil {
+		txnID = *req.TransactionID
+	}
 
 	// First pass: parse all records and track per-partition status
 	type partResult struct {
@@ -182,6 +186,11 @@ func (s *Server) handleProduce(ctx context.Context, conn net.Conn, connID uint64
 			}
 
 			results[key] = partResult{}
+			if txnID != "" {
+				for _, msg := range batch {
+					msg.TransactionalID = txnID
+				}
+			}
 			allMsgs = append(allMsgs, batch...)
 		}
 	}
@@ -394,6 +403,10 @@ func (s *Server) handleEndTxn(conn net.Conn, connID uint64, correlationID int32,
 
 	resp := &kmsg.EndTxnResponse{
 		Version: apiVersion,
+	}
+
+	if s.txnEndFn != nil {
+		s.txnEndFn(req.TransactionalID, req.Commit)
 	}
 
 	s.logger.Debugf("[conn:%d] EndTxn: txnID=%s, action=%s", connID, req.TransactionalID, action)

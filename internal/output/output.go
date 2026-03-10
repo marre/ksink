@@ -24,6 +24,15 @@ type Writer interface {
 	Write(data []byte, msg *ksink.Message) error
 }
 
+// TransactionalWriter extends [Writer] with transaction commit and abort
+// operations. File-based backends can implement this to write into temporary
+// files during a transaction and then rename on commit or delete on abort.
+type TransactionalWriter interface {
+	Writer
+	CommitTxn(txnID string) error
+	AbortTxn(txnID string) error
+}
+
 // TLSOpts holds TLS configuration options for output connections.
 type TLSOpts struct {
 	CertFile   string
