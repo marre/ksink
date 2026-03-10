@@ -26,6 +26,15 @@ func TestConfigDefaults(t *testing.T) {
 	assert.Equal(t, defaultMaxMessageBytes, cfg.MaxMessageBytes)
 }
 
+func TestConfigTransactionalWriteEnablesIdempotent(t *testing.T) {
+	cfg := Config{TransactionalWrite: true}
+	assert.False(t, cfg.IdempotentWrite)
+
+	cfg.setDefaults()
+
+	assert.True(t, cfg.IdempotentWrite, "setDefaults must enable IdempotentWrite when TransactionalWrite is true")
+}
+
 func TestConfigDoesNotOverrideSet(t *testing.T) {
 	cfg := Config{
 		Address:         "127.0.0.1:1234",

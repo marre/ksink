@@ -28,6 +28,29 @@ type txnFileWriter struct {
 	txnFiles map[string]*os.File // txnID → open temp file
 }
 
+// sanitizeTxnID normalises a TransactionalID so it cannot introduce new path
+// components or escape the intended directory when interpolated into a
+// filesystem path. It replaces directory separators, colons (volume prefixes)
+// and ".." sequences with underscores.
+func sanitizeTxnID(txnID string) string {
+	safe := strings.ReplaceAll(txnID, "/", "_")
+	safe = strings.ReplaceAll(safe, "\\", "_")
+	safe = strings.ReplaceAll(safe, ":", "_")
+
+	for strings.Contains(safe, "..") {
+		safe = strings.ReplaceAll(safe, "..", "_")
+	}
+
+	for strings.HasPrefix(safe, ".") {
+		safe = strings.TrimPrefix(safe, ".")
+	}
+
+	if safe == "" {
+		return "txn"
+	}
+	return safe
+}
+
 // NewTxnFileWriter creates a [TransactionalWriter] backed by the filesystem.
 // Each transaction writes to a temporary file that is renamed on commit or
 // deleted on abort.
@@ -90,7 +113,24 @@ func (w *txnFileWriter) CommitTxn(txnID string) error {
 	}
 	delete(w.txnFiles, txnID)
 
-	if err := os.Rename(w.tmpPath(txnID), w.committedPath(txnID)); err != nil {
+	tmpPath := w.tmpPath(txnID)
+	committedPath := w.committedPath(txnID)
+
+	// Remove an existing destination before rename so behaviour is
+	// consistent across platforms (os.Rename replaces on Unix but
+	// fails on Windows when the destination already exists).
+	if info, err := os.Stat(committedPath); err == nil {
+		if info.IsDir() {
+			return fmt.Errorf("committed path for transaction %s is a directory", txnID)
+		}
+		if err := os.Remove(committedPath); err != nil {
+			return fmt.Errorf("failed to remove existing committed file for transaction %s: %w", txnID, err)
+		}
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("failed to stat committed file for transaction %s: %w", txnID, err)
+	}
+
+	if err := os.Rename(tmpPath, committedPath); err != nil {
 		return fmt.Errorf("failed to commit transaction %s: %w", txnID, err)
 	}
 	return nil
@@ -140,5 +180,5 @@ func (w *txnFileWriter) tmpPath(txnID string) string {
 }
 
 func (w *txnFileWriter) committedPath(txnID string) string {
-	return strings.ReplaceAll(w.pattern, TxnIDPlaceholder, txnID)
+	return strings.ReplaceAll(w.pattern, TxnIDPlaceholder, sanitizeTxnID(txnID))
 }

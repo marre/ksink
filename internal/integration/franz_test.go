@@ -15,6 +15,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -447,6 +448,7 @@ func TestFranzTransactionalProducer(t *testing.T) {
 	assert.Equal(t, "txn-topic", msgs[0].Topic)
 	assert.Equal(t, "txn-key", msgs[0].Key)
 	assert.Equal(t, "txn-message", msgs[0].Value)
+	assert.Equal(t, "test-txn-id", msgs[0].TransactionalID)
 }
 
 func TestFranzTransactionalProducerAbort(t *testing.T) {
@@ -487,6 +489,90 @@ func TestFranzTransactionalProducerAbort(t *testing.T) {
 	msgs := capture.waitForMessages(1, 5*time.Second)
 	require.Len(t, msgs, 1)
 	assert.Equal(t, "aborted-message", msgs[0].Value)
+}
+
+// TestFranzTxnEndFuncCallback verifies that the TxnEndFunc callback is invoked
+// with the correct txnID and commit flag for both commit and abort.
+func TestFranzTxnEndFuncCallback(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	type txnEvent struct {
+		txnID  string
+		commit bool
+	}
+	var events []txnEvent
+	var mu sync.Mutex
+
+	port := getFreePort(t)
+	addr := fmt.Sprintf("127.0.0.1:%d", port)
+	srv, err := New(Config{
+		Address:            addr,
+		Timeout:            5 * time.Second,
+		TransactionalWrite: true,
+	}, WithLogger(&integrationLogger{t}),
+		ksink.WithTxnEndFunc(func(txnID string, commit bool) {
+			mu.Lock()
+			defer mu.Unlock()
+			events = append(events, txnEvent{txnID, commit})
+		}),
+	)
+	require.NoError(t, err)
+	require.NoError(t, srv.Start(context.Background()))
+	t.Cleanup(func() { srv.Close(context.Background()) }) //nolint:errcheck
+	waitForTCPReady(t, addr, 5*time.Second)
+
+	// Start a read loop that acks all batches.
+	readCtx, readCancel := context.WithCancel(context.Background())
+	t.Cleanup(readCancel)
+	go func() {
+		for {
+			_, ack, err := srv.ReadBatch(readCtx)
+			if err != nil {
+				return
+			}
+			ack(nil)
+		}
+	}()
+
+	// Commit transaction
+	client1, err := kgo.NewClient(
+		kgo.SeedBrokers(addr),
+		kgo.RequestTimeoutOverhead(5*time.Second),
+		kgo.TransactionalID("cb-commit"),
+	)
+	require.NoError(t, err)
+	defer client1.Close()
+
+	require.NoError(t, client1.BeginTransaction())
+	results := client1.ProduceSync(ctx, &kgo.Record{Topic: "t", Value: []byte("v")})
+	require.NoError(t, results[0].Err)
+	require.NoError(t, client1.EndTransaction(ctx, kgo.TryCommit))
+
+	// Abort transaction
+	client2, err := kgo.NewClient(
+		kgo.SeedBrokers(addr),
+		kgo.RequestTimeoutOverhead(5*time.Second),
+		kgo.TransactionalID("cb-abort"),
+	)
+	require.NoError(t, err)
+	defer client2.Close()
+
+	require.NoError(t, client2.BeginTransaction())
+	results = client2.ProduceSync(ctx, &kgo.Record{Topic: "t", Value: []byte("v")})
+	require.NoError(t, results[0].Err)
+	require.NoError(t, client2.EndTransaction(ctx, kgo.TryAbort))
+
+	// Allow time for callbacks.
+	time.Sleep(500 * time.Millisecond)
+
+	mu.Lock()
+	defer mu.Unlock()
+	require.Len(t, events, 2)
+	assert.Equal(t, "cb-commit", events[0].txnID)
+	assert.True(t, events[0].commit)
+	assert.Equal(t, "cb-abort", events[1].txnID)
+	assert.False(t, events[1].commit)
 }
 
 // TestFranzTransactionalFileCommit verifies that messages produced inside a

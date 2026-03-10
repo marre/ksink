@@ -138,6 +138,50 @@ func TestTxnFileWriterCommitNoData(t *testing.T) {
 	require.NoError(t, w.AbortTxn("nonexistent"))
 }
 
+func TestTxnFileWriterSanitizesTxnID(t *testing.T) {
+	dir := t.TempDir()
+	pattern := filepath.Join(dir, "out-{txnID}.jsonl")
+
+	w, err := output.NewTxnFileWriter(pattern)
+	require.NoError(t, err)
+	t.Cleanup(func() { w.Close() }) //nolint:errcheck
+
+	// A txnID with path separators should be sanitised so the file stays
+	// inside the intended directory.
+	msg := &ksink.Message{TransactionalID: "../../etc/evil"}
+	require.NoError(t, w.Write([]byte("data\n"), msg))
+	require.NoError(t, w.CommitTxn("../../etc/evil"))
+
+	// The committed file must be inside the temp dir, not escaped.
+	expected := filepath.Join(dir, "out-____etc_evil.jsonl")
+	require.FileExists(t, expected)
+
+	// Original traversal path must not exist.
+	requireNoFile(t, filepath.Join(dir, "..", "..", "etc", "evil"))
+}
+
+func TestTxnFileWriterCommitReplacesExistingFile(t *testing.T) {
+	dir := t.TempDir()
+	pattern := filepath.Join(dir, "out-{txnID}.jsonl")
+
+	w, err := output.NewTxnFileWriter(pattern)
+	require.NoError(t, err)
+	t.Cleanup(func() { w.Close() }) //nolint:errcheck
+
+	// Pre-create the committed file to simulate a reused txnID.
+	committedPath := filepath.Join(dir, "out-reuse.jsonl")
+	require.NoError(t, os.WriteFile(committedPath, []byte("old\n"), 0600))
+
+	// Write and commit with the same txnID.
+	msg := &ksink.Message{TransactionalID: "reuse"}
+	require.NoError(t, w.Write([]byte("new\n"), msg))
+	require.NoError(t, w.CommitTxn("reuse"))
+
+	data, err := os.ReadFile(committedPath)
+	require.NoError(t, err)
+	assert.Equal(t, "new\n", string(data))
+}
+
 func requireNoFile(t *testing.T, path string) {
 	t.Helper()
 	_, err := os.Stat(path)
