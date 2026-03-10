@@ -84,6 +84,23 @@ func TestPatternFileWriterSanitizesTopic(t *testing.T) {
 	require.FileExists(t, expected)
 }
 
+func TestPatternFileWriterEmptyTopic(t *testing.T) {
+	dir := t.TempDir()
+	pattern := filepath.Join(dir, "{topic}.jsonl")
+
+	w, err := output.Open(pattern, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { w.Close() }) //nolint:errcheck
+
+	// An empty topic should produce a safe filename via the fallback.
+	msg := &ksink.Message{Topic: ""}
+	require.NoError(t, w.Write([]byte("data\n"), msg))
+	require.NoError(t, w.Close())
+
+	expected := filepath.Join(dir, "_.jsonl")
+	require.FileExists(t, expected)
+}
+
 func TestTxnFileWriterWithTopicPlaceholder(t *testing.T) {
 	dir := t.TempDir()
 	pattern := filepath.Join(dir, "{topic}-{txnID}.jsonl")
