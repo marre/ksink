@@ -404,6 +404,48 @@ func TestFranzIdempotentProducer(t *testing.T) {
 	assert.Equal(t, "idempotent-message", msgs[0].Value)
 }
 
+func TestFranzTransactionalProducer(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	srv, addr := startTestServer(t, Config{
+		Timeout:            5 * time.Second,
+		TransactionalWrite: true,
+	})
+	capture := startReadLoop(t, srv)
+
+	client, err := kgo.NewClient(
+		kgo.SeedBrokers(addr),
+		kgo.RequestTimeoutOverhead(5*time.Second),
+		kgo.TransactionalID("test-txn-id"),
+	)
+	require.NoError(t, err)
+	defer client.Close()
+
+	// Begin transaction
+	err = client.BeginTransaction()
+	require.NoError(t, err)
+
+	// Produce within transaction
+	results := client.ProduceSync(ctx, &kgo.Record{
+		Topic: "txn-topic",
+		Key:   []byte("txn-key"),
+		Value: []byte("txn-message"),
+	})
+	require.Len(t, results, 1)
+	require.NoError(t, results[0].Err)
+
+	// Commit transaction
+	err = client.EndTransaction(ctx, kgo.TryCommit)
+	require.NoError(t, err)
+
+	msgs := capture.waitForMessages(1, 5*time.Second)
+	require.Len(t, msgs, 1)
+	assert.Equal(t, "txn-topic", msgs[0].Topic)
+	assert.Equal(t, "txn-key", msgs[0].Key)
+	assert.Equal(t, "txn-message", msgs[0].Value)
+}
+
 func TestFranzHandlerError(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()

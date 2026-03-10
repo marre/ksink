@@ -104,6 +104,12 @@ type Config struct {
 
 	// IdempotentWrite enables idempotent produce support.
 	IdempotentWrite bool
+
+	// TransactionalWrite enables fake transactional produce support.
+	// When enabled, the server accepts transactional protocol requests
+	// (AddPartitionsToTxn, EndTxn) but does not enforce transactional
+	// semantics. This implies IdempotentWrite.
+	TransactionalWrite bool
 }
 
 func (c *Config) setDefaults() {
@@ -118,6 +124,9 @@ func (c *Config) setDefaults() {
 	}
 	if c.MaxMessageBytes == 0 {
 		c.MaxMessageBytes = defaultMaxMessageBytes
+	}
+	if c.TransactionalWrite {
+		c.IdempotentWrite = true
 	}
 }
 

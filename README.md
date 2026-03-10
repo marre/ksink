@@ -10,6 +10,7 @@ A lightweight Kafka-protocol-compatible server library and tool for Go. It accep
 - TLS and mutual TLS (mTLS)
 - Topic filtering
 - Idempotent producer support
+- Fake transactional producer support (accepts transactional protocol requests without enforcing transactional semantics)
 
 ## ksink Tool
 
@@ -154,6 +155,7 @@ cfg := ksink.Config{
     Timeout:         30 * time.Second,
     IdleTimeout:     60 * time.Second,
     MaxMessageBytes: 1048576,
-    IdempotentWrite: false,
+    IdempotentWrite:    false,
+    TransactionalWrite: false,
 }
 ```
