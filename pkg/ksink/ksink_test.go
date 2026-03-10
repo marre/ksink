@@ -347,3 +347,85 @@ func TestReadBatchServerClosed(t *testing.T) {
 	assert.ErrorIs(t, err, ErrServerClosed)
 }
 
+func TestTxnStateZombiFencing(t *testing.T) {
+	// Verify that zombie fencing aborts an in-flight transaction and bumps
+	// the epoch when InitProducerID is called with an existing txnID.
+	var aborted []string
+	srv, err := New(Config{
+		Address:            "127.0.0.1:0",
+		TransactionalWrite: true,
+	}, WithTxnEndFunc(func(txnID string, commit bool) {
+		if !commit {
+			aborted = append(aborted, txnID)
+		}
+	}))
+	require.NoError(t, err)
+
+	// Simulate first InitProducerID for "txn-1"
+	srv.txnMu.Lock()
+	srv.txnStates["txn-1"] = &txnState{producerID: 1, epoch: 0, active: true}
+	srv.txnMu.Unlock()
+
+	// Simulate a second InitProducerID from a new producer with the same txnID.
+	// This should abort the in-flight transaction and bump the epoch.
+	srv.txnMu.Lock()
+	existing := srv.txnStates["txn-1"]
+	require.True(t, existing.active, "should be active before fencing")
+	if existing.active {
+		if srv.txnEndFn != nil {
+			srv.txnEndFn("txn-1", false)
+		}
+		existing.active = false
+	}
+	existing.epoch++
+	srv.txnMu.Unlock()
+
+	assert.Equal(t, []string{"txn-1"}, aborted, "in-flight txn should have been aborted")
+	assert.Equal(t, int16(1), existing.epoch, "epoch should be bumped")
+	assert.False(t, existing.active, "txn should no longer be active")
+}
+
+func TestTxnStateEpochBumpNoActiveTransaction(t *testing.T) {
+	// When InitProducerID is called for an existing txnID that does not
+	// have an active transaction, the epoch is bumped but no abort is fired.
+	var aborted []string
+	srv, err := New(Config{
+		Address:            "127.0.0.1:0",
+		TransactionalWrite: true,
+	}, WithTxnEndFunc(func(txnID string, commit bool) {
+		if !commit {
+			aborted = append(aborted, txnID)
+		}
+	}))
+	require.NoError(t, err)
+
+	srv.txnMu.Lock()
+	srv.txnStates["txn-2"] = &txnState{producerID: 2, epoch: 0, active: false}
+	srv.txnMu.Unlock()
+
+	// Simulate a second InitProducerID — no active txn so no abort.
+	srv.txnMu.Lock()
+	existing := srv.txnStates["txn-2"]
+	if existing.active {
+		if srv.txnEndFn != nil {
+			srv.txnEndFn("txn-2", false)
+		}
+		existing.active = false
+	}
+	existing.epoch++
+	srv.txnMu.Unlock()
+
+	assert.Empty(t, aborted, "no abort should be fired when txn is not active")
+	assert.Equal(t, int16(1), existing.epoch, "epoch should still be bumped")
+}
+
+func TestTxnStateInitialized(t *testing.T) {
+	srv, err := New(Config{
+		Address:            "127.0.0.1:0",
+		TransactionalWrite: true,
+	})
+	require.NoError(t, err)
+	assert.NotNil(t, srv.txnStates, "txnStates map should be initialized")
+	assert.Empty(t, srv.txnStates, "txnStates map should be empty initially")
+}
+

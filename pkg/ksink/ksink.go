@@ -174,6 +174,16 @@ func WithLogger(l Logger) Option {
 // the transaction was committed (true) or aborted (false).
 type TxnEndFunc func(txnID string, commit bool)
 
+// txnState tracks the state of a transactional producer identified by its
+// transactional.id. It stores the assigned producer ID, the current epoch
+// (bumped on each InitProducerID call), and whether a transaction is
+// currently in progress.
+type txnState struct {
+	producerID int64
+	epoch      int16
+	active     bool // true between AddPartitionsToTxn and EndTxn
+}
+
 // WithTxnEndFunc registers a callback that is invoked when a transaction
 // ends. This allows output backends to take action on commit (e.g. rename
 // a temporary file) or abort (e.g. delete a temporary file).
@@ -209,6 +219,10 @@ type Server struct {
 	// Idempotent producer tracking
 	producerIDCounter atomic.Int64
 
+	// Transaction state tracking: maps transactional.id -> txnState
+	txnMu     sync.Mutex
+	txnStates map[string]*txnState
+
 	// Transaction end callback
 	txnEndFn TxnEndFunc
 
@@ -234,6 +248,7 @@ func New(cfg Config, opts ...Option) (*Server, error) {
 		logger:          noopLogger{},
 		allowedTopics:   make(map[string]struct{}),
 		saslCredentials: make(map[string]map[string]string),
+		txnStates:       make(map[string]*txnState),
 		shutdownCh:      make(chan struct{}),
 		batchCh:         make(chan pendingBatch),
 		decompressor:    kgo.DefaultDecompressor(),

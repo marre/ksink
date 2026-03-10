@@ -168,8 +168,11 @@ func (s *Server) handleConnection(ctx context.Context, conn net.Conn, connID uin
 			_ = req
 			handleErr = s.handleSaslAuthenticate(conn, connID, correlationID, apiVersion, bodyData, state)
 		case *kmsg.InitProducerIDRequest:
-			_ = req
-			handleErr = s.handleInitProducerId(conn, connID, correlationID, apiVersion, state)
+			if err := req.ReadFrom(bodyData); err != nil {
+				handleErr = fmt.Errorf("failed to parse init producer id request: %w", err)
+			} else {
+				handleErr = s.handleInitProducerId(conn, connID, correlationID, apiVersion, req, state)
+			}
 		case *kmsg.FindCoordinatorRequest:
 			if err := req.ReadFrom(bodyData); err != nil {
 				handleErr = fmt.Errorf("failed to parse find coordinator request: %w", err)
