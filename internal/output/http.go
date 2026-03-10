@@ -124,7 +124,7 @@ func (w *httpWriter) doPost(data []byte, msg *ksink.Message) error {
 	if err != nil {
 		return fmt.Errorf("HTTP request failed: %w", err)
 	}
-	defer resp.Body.Close()
+	defer resp.Body.Close() //nolint:errcheck
 	// Drain the body so the connection can be reused.
 	io.Copy(io.Discard, resp.Body) //nolint:errcheck
 

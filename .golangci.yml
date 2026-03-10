@@ -4,6 +4,5 @@ linters:
   settings:
     errcheck:
       exclude-functions:
-        - (io.Closer).Close
         - (net.Listener).Close
         - (net.Conn).Close
