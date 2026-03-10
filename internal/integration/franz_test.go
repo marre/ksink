@@ -883,6 +883,106 @@ func TestFranzTransactionalFileCommitAndAbort(t *testing.T) {
 	assert.True(t, os.IsNotExist(err), "aborted transaction temp file should not exist")
 }
 
+// TestFranzZombieFencing verifies that when a new producer is created with the
+// same transactional.id while a transaction is in-flight, the old transaction
+// is aborted (zombie fencing) and the new producer can proceed.
+func TestFranzZombieFencing(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	type txnEvent struct {
+		txnID  string
+		commit bool
+	}
+	var events []txnEvent
+	var mu sync.Mutex
+
+	port := getFreePort(t)
+	addr := fmt.Sprintf("127.0.0.1:%d", port)
+	srv, err := New(Config{
+		Address:            addr,
+		Timeout:            5 * time.Second,
+		TransactionalWrite: true,
+	}, WithLogger(&integrationLogger{t}),
+		ksink.WithTxnEndFunc(func(txnID string, commit bool) {
+			mu.Lock()
+			defer mu.Unlock()
+			events = append(events, txnEvent{txnID, commit})
+		}),
+	)
+	require.NoError(t, err)
+	require.NoError(t, srv.Start(context.Background()))
+	t.Cleanup(func() { srv.Close(context.Background()) }) //nolint:errcheck
+	waitForTCPReady(t, addr, 5*time.Second)
+
+	// Start a read loop that acks all batches.
+	readCtx, readCancel := context.WithCancel(context.Background())
+	t.Cleanup(readCancel)
+	go func() {
+		for {
+			_, ack, err := srv.ReadBatch(readCtx)
+			if err != nil {
+				return
+			}
+			ack(nil)
+		}
+	}()
+
+	// Producer 1: start a transaction and produce, but don't commit.
+	client1, err := kgo.NewClient(
+		kgo.SeedBrokers(addr),
+		kgo.RequestTimeoutOverhead(5*time.Second),
+		kgo.TransactionalID("zombie-txn"),
+	)
+	require.NoError(t, err)
+	t.Cleanup(client1.Close)
+
+	require.NoError(t, client1.BeginTransaction())
+	results := client1.ProduceSync(ctx, &kgo.Record{Topic: "t", Value: []byte("v1")})
+	require.NoError(t, results[0].Err)
+	// Do NOT commit — leave the transaction in-flight.
+
+	// Producer 2: same transactional.id. Creating a new client triggers
+	// InitProducerID which should fence the zombie (abort client1's txn).
+	client2, err := kgo.NewClient(
+		kgo.SeedBrokers(addr),
+		kgo.RequestTimeoutOverhead(5*time.Second),
+		kgo.TransactionalID("zombie-txn"),
+	)
+	require.NoError(t, err)
+	defer client2.Close()
+
+	// The new producer should be able to run its own transaction.
+	require.NoError(t, client2.BeginTransaction())
+	results = client2.ProduceSync(ctx, &kgo.Record{Topic: "t", Value: []byte("v2")})
+	require.NoError(t, results[0].Err)
+	require.NoError(t, client2.EndTransaction(ctx, kgo.TryCommit))
+
+	// Poll for the zombie abort + commit callbacks.
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		mu.Lock()
+		n := len(events)
+		mu.Unlock()
+		if n >= 2 {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	require.GreaterOrEqual(t, len(events), 2, "should have at least an abort and a commit event")
+
+	// The first event should be the zombie abort.
+	assert.Equal(t, "zombie-txn", events[0].txnID)
+	assert.False(t, events[0].commit, "first event should be an abort (zombie fencing)")
+
+	// The second event should be the new producer's commit.
+	assert.Equal(t, "zombie-txn", events[1].txnID)
+	assert.True(t, events[1].commit, "second event should be a commit")
+}
+
 func TestFranzHandlerError(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()

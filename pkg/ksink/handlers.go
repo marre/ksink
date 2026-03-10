@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"fmt"
+	"math"
 	"net"
 	"strconv"
 
@@ -258,7 +259,7 @@ func (s *Server) deliverBatch(ctx context.Context, msgs []*Message) error {
 	}
 }
 
-func (s *Server) handleInitProducerId(conn net.Conn, connID uint64, correlationID int32, apiVersion int16, state *connState) error {
+func (s *Server) handleInitProducerId(conn net.Conn, connID uint64, correlationID int32, apiVersion int16, req *kmsg.InitProducerIDRequest, state *connState) error {
 	if s.saslEnabled && !state.authenticated {
 		s.logger.Warnf("[conn:%d] Rejecting InitProducerId: not authenticated", connID)
 		resp := &kmsg.InitProducerIDResponse{
@@ -279,6 +280,88 @@ func (s *Server) handleInitProducerId(conn net.Conn, connID uint64, correlationI
 		return s.sendResponse(conn, connID, correlationID, resp)
 	}
 
+	txnID := ""
+	if req.TransactionalID != nil {
+		txnID = *req.TransactionalID
+	}
+
+	// For transactional producers, track state and implement zombie fencing.
+	if txnID != "" && s.cfg.TransactionalWrite {
+		s.txnMu.Lock()
+		existing, ok := s.txnStates[txnID]
+		if ok {
+			// Zombie fencing: abort any in-flight transaction from the
+			// previous producer instance before bumping the epoch.
+			needsAbort := existing.active
+			if needsAbort {
+				s.logger.Infof("[conn:%d] InitProducerId: fencing zombie txnID=%s (aborting in-flight transaction, epoch %d→%d)",
+					connID, txnID, existing.epoch, existing.epoch+1)
+				existing.active = false
+			}
+			if existing.epoch == math.MaxInt16 {
+				// int16 would overflow — rotate to a new producer ID
+				// and reset the epoch to avoid confusing clients.
+				newPID := s.producerIDCounter.Add(1)
+				existing.producerID = newPID
+				existing.epoch = 0
+				s.logger.Warnf("[conn:%d] InitProducerId: epoch overflow for txnID=%s, rotated to new producerID=%d",
+					connID, txnID, newPID)
+			} else {
+				existing.epoch++
+			}
+			// Copy fields before releasing the lock to avoid a data race.
+			producerID := existing.producerID
+			epoch := existing.epoch
+			s.txnMu.Unlock()
+
+			// Invoke the callback outside the lock to avoid deadlocks.
+			if needsAbort && s.txnEndFn != nil {
+				s.txnEndFn(txnID, false)
+			}
+
+			resp := &kmsg.InitProducerIDResponse{
+				Version:       apiVersion,
+				ProducerID:    producerID,
+				ProducerEpoch: epoch,
+			}
+			s.logger.Debugf("[conn:%d] InitProducerId: txnID=%s, producerID=%d, epoch=%d (existing)",
+				connID, txnID, producerID, epoch)
+			return s.sendResponse(conn, connID, correlationID, resp)
+		}
+
+		// Cap the number of tracked transactional IDs to prevent unbounded
+		// memory growth from misbehaving or malicious clients.
+		if len(s.txnStates) >= maxTxnStates {
+			s.txnMu.Unlock()
+			s.logger.Warnf("[conn:%d] Rejecting InitProducerId: too many transactional IDs tracked (%d)", connID, maxTxnStates)
+			resp := &kmsg.InitProducerIDResponse{
+				Version:    apiVersion,
+				ErrorCode:  kerr.UnknownServerError.Code,
+				ProducerID: -1,
+			}
+			return s.sendResponse(conn, connID, correlationID, resp)
+		}
+
+		// New transactional ID — assign a fresh producer ID.
+		producerID := s.producerIDCounter.Add(1)
+		s.txnStates[txnID] = &txnState{
+			producerID: producerID,
+			epoch:      0,
+			active:     false,
+		}
+		s.txnMu.Unlock()
+
+		resp := &kmsg.InitProducerIDResponse{
+			Version:       apiVersion,
+			ProducerID:    producerID,
+			ProducerEpoch: 0,
+		}
+		s.logger.Debugf("[conn:%d] InitProducerId: txnID=%s, producerID=%d, epoch=0 (new)",
+			connID, txnID, producerID)
+		return s.sendResponse(conn, connID, correlationID, resp)
+	}
+
+	// Non-transactional idempotent producer — just assign an ID.
 	producerID := s.producerIDCounter.Add(1)
 
 	resp := &kmsg.InitProducerIDResponse{
@@ -373,6 +456,24 @@ func (s *Server) handleAddPartitionsToTxn(conn net.Conn, connID uint64, correlat
 		resp.Topics = append(resp.Topics, topicResp)
 	}
 
+	// Validate producerID/epoch against txnState and mark the transaction as active.
+	s.txnMu.Lock()
+	st, stOK := s.txnStates[req.TransactionalID]
+	if !stOK || st.producerID != req.ProducerID || st.epoch != req.ProducerEpoch {
+		s.txnMu.Unlock()
+		// Return ProducerFenced for all partitions.
+		for ti := range resp.Topics {
+			for pi := range resp.Topics[ti].Partitions {
+				resp.Topics[ti].Partitions[pi].ErrorCode = kerr.ProducerFenced.Code
+			}
+		}
+		s.logger.Warnf("[conn:%d] AddPartitionsToTxn fenced: txnID=%s, producerID=%d, epoch=%d",
+			connID, req.TransactionalID, req.ProducerID, req.ProducerEpoch)
+		return s.sendResponse(conn, connID, correlationID, resp)
+	}
+	st.active = true
+	s.txnMu.Unlock()
+
 	s.logger.Debugf("[conn:%d] AddPartitionsToTxn: txnID=%s, topics=%d", connID, req.TransactionalID, len(req.Topics))
 	return s.sendResponse(conn, connID, correlationID, resp)
 }
@@ -403,6 +504,27 @@ func (s *Server) handleEndTxn(conn net.Conn, connID uint64, correlationID int32,
 
 	resp := &kmsg.EndTxnResponse{
 		Version: apiVersion,
+	}
+
+	// Validate producerID/epoch against txnState before allowing the commit/abort.
+	fenced := false
+	s.txnMu.Lock()
+	if st, ok := s.txnStates[req.TransactionalID]; ok {
+		if st.producerID != req.ProducerID || st.epoch != req.ProducerEpoch {
+			fenced = true
+		} else {
+			st.active = false
+		}
+	} else {
+		fenced = true
+	}
+	s.txnMu.Unlock()
+
+	if fenced {
+		resp.ErrorCode = kerr.ProducerFenced.Code
+		s.logger.Warnf("[conn:%d] EndTxn fenced: txnID=%s, producerID=%d, epoch=%d",
+			connID, req.TransactionalID, req.ProducerID, req.ProducerEpoch)
+		return s.sendResponse(conn, connID, correlationID, resp)
 	}
 
 	if s.txnEndFn != nil {
