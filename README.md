@@ -34,6 +34,9 @@ go run ./cmd/ksink --addr :9092 --output https://example.com/ingest --output-for
 
 # Print the JSON schema for the jsonl output format
 go run ./cmd/ksink json-schema
+
+# Enable fake transactional produce support (stub)
+go run ./cmd/ksink --addr :9092 --transactional
 ```
 
 ### Message Formats

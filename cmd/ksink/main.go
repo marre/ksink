@@ -35,17 +35,18 @@ func (stdLogger) Errorf(format string, args ...any) { log.Printf("[ERROR] "+form
 
 func main() {
 	var (
-		addr        string
-		dst         string
-		fmtName     string
-		fmtStr      string
-		jsonB64Key  bool
-		jsonB64Val  bool
-		separator   string
-		sepHex      string
-		noSeparator bool
-		tOpts       output.TLSOpts
-		httpOpts    output.HTTPOpts
+		addr          string
+		dst           string
+		fmtName       string
+		fmtStr        string
+		jsonB64Key    bool
+		jsonB64Val    bool
+		separator     string
+		sepHex        string
+		noSeparator   bool
+		transactional bool
+		tOpts         output.TLSOpts
+		httpOpts      output.HTTPOpts
 	)
 
 	rootCmd := &cobra.Command{
@@ -93,11 +94,13 @@ kcat format specifiers (--output-format-string):
 					return fmt.Errorf("--output-separator, --output-separator-hex, and --no-separator are only supported with --output-format=binary")
 				}
 			}
-			return run(addr, dst, fmtName, fmtStr, jsonB64Key, jsonB64Val, separator, sepHex, noSeparator, tOpts, httpOpts)
+			return run(addr, dst, fmtName, fmtStr, jsonB64Key, jsonB64Val, separator, sepHex, noSeparator, transactional, tOpts, httpOpts)
 		},
 	}
 
 	rootCmd.Flags().StringVar(&addr, "addr", ":9092", "Address to listen on")
+	rootCmd.Flags().BoolVar(&transactional, "transactional", false,
+		"Enable fake transactional produce support (stub; accepts transactional requests without enforcing semantics)")
 	rootCmd.Flags().StringVar(&dst, "output", "-",
 		`Output destination: "-" for stdout (default), file path, or http(s):// URL`)
 	rootCmd.Flags().StringVar(&fmtName, "output-format", "binary",
@@ -145,7 +148,7 @@ kcat format specifiers (--output-format-string):
 	}
 }
 
-func run(addr, dst, fmtName, fmtStr string, jsonB64Key, jsonB64Val bool, separator, sepHex string, noSeparator bool, tOpts output.TLSOpts, httpOpts output.HTTPOpts) error {
+func run(addr, dst, fmtName, fmtStr string, jsonB64Key, jsonB64Val bool, separator, sepHex string, noSeparator, transactional bool, tOpts output.TLSOpts, httpOpts output.HTTPOpts) error {
 	var sep []byte
 	if fmtName == "binary" {
 		var err error
@@ -195,7 +198,8 @@ func run(addr, dst, fmtName, fmtStr string, jsonB64Key, jsonB64Val bool, separat
 	defer w.Close()
 
 	srv, err := ksink.New(ksink.Config{
-		Address: addr,
+		Address:            addr,
+		TransactionalWrite: transactional,
 	}, ksink.WithLogger(stdLogger{}))
 	if err != nil {
 		return fmt.Errorf("failed to create server: %w", err)
