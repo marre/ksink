@@ -153,7 +153,7 @@ func TestTxnFileWriterSanitizesTxnID(t *testing.T) {
 	require.NoError(t, w.CommitTxn("../../etc/evil"))
 
 	// The committed file must be inside the temp dir, not escaped.
-	expected := filepath.Join(dir, "out-____etc_evil.jsonl")
+	expected := filepath.Join(dir, "out-evil.jsonl")
 	require.FileExists(t, expected)
 
 	// Original traversal path must not exist.

@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/marre/ksink/pkg/ksink"
@@ -85,18 +86,12 @@ func (o *TLSOpts) BuildTLSConfig() (*tls.Config, error) {
 // to route messages to per-topic files.
 const TopicPlaceholder = "{topic}"
 
-// SanitizePathSegment removes or replaces characters that could cause path
-// traversal when a user-controlled string is interpolated into a filesystem
-// path. It replaces directory separators (/ and \), colons (:), and ".."
-// sequences with underscores, and trims leading dots.
+// SanitizePathSegment returns a safe single-component file name from an
+// untrusted string. It uses [filepath.Clean] and [filepath.Base] to strip
+// any directory traversal, then rejects the special names "." and "..".
 func SanitizePathSegment(s string) string {
-	safe := strings.ReplaceAll(s, "/", "_")
-	safe = strings.ReplaceAll(safe, "\\", "_")
-	safe = strings.ReplaceAll(safe, ":", "_")
-	safe = strings.ReplaceAll(safe, "..", "_")
-	safe = strings.TrimLeft(safe, ".")
-
-	if safe == "" {
+	safe := filepath.Base(filepath.Clean(s))
+	if safe == "." || safe == ".." || safe == string(filepath.Separator) {
 		return "_"
 	}
 	return safe

@@ -18,16 +18,16 @@ func TestSanitizePathSegment(t *testing.T) {
 		want  string
 	}{
 		{"normal", "my-topic", "my-topic"},
-		{"forward slash", "a/b", "a_b"},
-		{"backslash", `a\b`, "a_b"},
-		{"colon", "C:foo", "C_foo"},
-		{"double dot", "../etc", "__etc"},
-		{"path traversal", "../../etc/evil", "____etc_evil"},
-		{"leading dot", ".hidden", "hidden"},
-		{"leading dots", "...tricky", "_.tricky"},
+		{"forward slash", "a/b", "b"},
+		{"backslash", `a\b`, `a\b`},   // On Windows, filepath.Base would return "b"
+		{"colon", "C:foo", "C:foo"},    // On Windows, filepath.Clean recognises the volume prefix
+		{"double dot", "../etc", "etc"},
+		{"path traversal", "../../etc/evil", "evil"},
+		{"leading dot", ".hidden", ".hidden"},
+		{"leading dots", "...tricky", "...tricky"},
 		{"empty string", "", "_"},
 		{"only dots", "..", "_"},
-		{"only slashes", "///", "___"},
+		{"only slashes", "///", "_"},
 	}
 
 	for _, tt := range tests {
@@ -80,7 +80,7 @@ func TestPatternFileWriterSanitizesTopic(t *testing.T) {
 	require.NoError(t, w.Close())
 
 	// File must be inside the temp dir, not escaped.
-	expected := filepath.Join(dir, "____etc_passwd.jsonl")
+	expected := filepath.Join(dir, "passwd.jsonl")
 	require.FileExists(t, expected)
 }
 
