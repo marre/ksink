@@ -3,6 +3,7 @@ package output
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 
@@ -182,5 +183,5 @@ func (w *txnFileWriter) Close() error {
 func (w *txnFileWriter) resolvePath(txnID, topic string) string {
 	path := strings.ReplaceAll(w.pattern, TxnIDPlaceholder, SanitizePathSegment(txnID))
 	path = strings.ReplaceAll(path, TopicPlaceholder, SanitizePathSegment(topic))
-	return path
+	return filepath.Clean(path)
 }

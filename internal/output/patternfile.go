@@ -3,6 +3,7 @@ package output
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 
@@ -66,5 +67,5 @@ func (w *patternFileWriter) Close() error {
 }
 
 func (w *patternFileWriter) resolvePath(topic string) string {
-	return strings.ReplaceAll(w.pattern, TopicPlaceholder, SanitizePathSegment(topic))
+	return filepath.Clean(strings.ReplaceAll(w.pattern, TopicPlaceholder, SanitizePathSegment(topic)))
 }
