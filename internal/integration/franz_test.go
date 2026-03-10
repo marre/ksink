@@ -563,8 +563,17 @@ func TestFranzTxnEndFuncCallback(t *testing.T) {
 	require.NoError(t, results[0].Err)
 	require.NoError(t, client2.EndTransaction(ctx, kgo.TryAbort))
 
-	// Allow time for callbacks.
-	time.Sleep(500 * time.Millisecond)
+	// Poll for both callbacks with timeout instead of fixed sleep.
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		mu.Lock()
+		n := len(events)
+		mu.Unlock()
+		if n >= 2 {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
 
 	mu.Lock()
 	defer mu.Unlock()

@@ -36,14 +36,8 @@ func sanitizeTxnID(txnID string) string {
 	safe := strings.ReplaceAll(txnID, "/", "_")
 	safe = strings.ReplaceAll(safe, "\\", "_")
 	safe = strings.ReplaceAll(safe, ":", "_")
-
-	for strings.Contains(safe, "..") {
-		safe = strings.ReplaceAll(safe, "..", "_")
-	}
-
-	for strings.HasPrefix(safe, ".") {
-		safe = strings.TrimPrefix(safe, ".")
-	}
+	safe = strings.ReplaceAll(safe, "..", "_")
+	safe = strings.TrimLeft(safe, ".")
 
 	if safe == "" {
 		return "txn"
