@@ -446,6 +446,46 @@ func TestFranzTransactionalProducer(t *testing.T) {
 	assert.Equal(t, "txn-message", msgs[0].Value)
 }
 
+func TestFranzTransactionalProducerAbort(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	srv, addr := startTestServer(t, Config{
+		Timeout:            5 * time.Second,
+		TransactionalWrite: true,
+	})
+	capture := startReadLoop(t, srv)
+
+	client, err := kgo.NewClient(
+		kgo.SeedBrokers(addr),
+		kgo.RequestTimeoutOverhead(5*time.Second),
+		kgo.TransactionalID("test-txn-abort"),
+	)
+	require.NoError(t, err)
+	defer client.Close()
+
+	// Begin transaction
+	err = client.BeginTransaction()
+	require.NoError(t, err)
+
+	// Produce within transaction
+	results := client.ProduceSync(ctx, &kgo.Record{
+		Topic: "txn-topic",
+		Value: []byte("aborted-message"),
+	})
+	require.Len(t, results, 1)
+	require.NoError(t, results[0].Err)
+
+	// Abort transaction
+	err = client.EndTransaction(ctx, kgo.TryAbort)
+	require.NoError(t, err)
+
+	// The message was still delivered (fake transactional support)
+	msgs := capture.waitForMessages(1, 5*time.Second)
+	require.Len(t, msgs, 1)
+	assert.Equal(t, "aborted-message", msgs[0].Value)
+}
+
 func TestFranzHandlerError(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
