@@ -10,8 +10,7 @@ A lightweight Kafka-protocol-compatible server library and tool for Go. It accep
 - TLS and mutual TLS (mTLS)
 - Topic filtering
 - Idempotent producer support
-- Fake transactional producer support (accepts transactional protocol requests without enforcing transactional semantics)
-- Filesystem-based fake transactions: per-transaction temp files, rename-as-commit, delete-as-abort
+- Transactional producer support with filesystem-backed commit/abort semantics
 
 ## ksink Tool
 
@@ -36,18 +35,12 @@ go run ./cmd/ksink --addr :9092 --output https://example.com/ingest --output-for
 # Print the JSON schema for the jsonl output format
 go run ./cmd/ksink json-schema
 
-# Enable fake transactional produce support (stub)
-go run ./cmd/ksink --addr :9092 --transactional
+# Enable transactional produce support
+go run ./cmd/ksink --addr :9092 --transactional --output 'messages-{txnID}.jsonl'
 
-# Transactional file output — messages are written to per-transaction temp
-# files and renamed on commit or deleted on abort:
-#   During transaction: messages.jsonl.txn-<txnID>.tmp
-#   After commit:       messages.jsonl.txn-<txnID>
-#   After abort:        temp file is deleted
-go run ./cmd/ksink --addr :9092 --transactional --output messages.jsonl
-
-# Use a {txnID} placeholder to control per-transaction file naming so the
-# file extension stays at the end:
+# Transactional file output — the --output pattern must contain {txnID}.
+# Messages are written to per-transaction temp files; on commit the temp
+# file is renamed; on abort the temp file is deleted:
 #   During transaction: messages-<txnID>.jsonl.tmp
 #   After commit:       messages-<txnID>.jsonl
 #   After abort:        temp file is deleted
@@ -178,20 +171,64 @@ cfg := ksink.Config{
 }
 ```
 
-### Transaction Callbacks
+### Transactional Producer Support
 
-When `TransactionalWrite` is enabled, messages carry a `TransactionalID` field
-identifying the transaction they belong to. Use `WithTxnEndFunc` to receive
-commit/abort events:
+When `TransactionalWrite` is enabled, ksink accepts the Kafka transactional
+protocol requests (`InitProducerID`, `AddPartitionsToTxn`, `EndTxn`) and
+tracks which transaction each message belongs to via the `TransactionalID`
+field on `Message`. Use `WithTxnEndFunc` to receive commit/abort callbacks:
 
 ```go
 srv, _ := ksink.New(cfg,
     ksink.WithTxnEndFunc(func(txnID string, commit bool) {
         if commit {
-            // e.g. rename temp file
+            // e.g. rename temp file to final name
         } else {
             // e.g. delete temp file
         }
     }),
 )
 ```
+
+#### How Kafka Transactions Work (Background)
+
+In a real Kafka cluster, transactions provide exactly-once semantics (EOS)
+for produce workflows:
+
+1. A producer is configured with a unique `transactional.id` and calls
+   `initTransactions()` to register with the cluster's transaction
+   coordinator.
+2. `beginTransaction()` starts a new transaction.
+3. Records are produced to one or more topic-partitions. These records are
+   written to the log but are invisible to consumers using
+   `isolation.level=read_committed` until the transaction commits.
+4. Optionally, consumer offsets can be committed as part of the transaction
+   (`sendOffsetsToTransaction`), enabling atomic read-process-write loops.
+5. `commitTransaction()` makes all records visible atomically, or
+   `abortTransaction()` discards them.
+
+The broker uses the `transactional.id` for **zombie fencing**: when a
+producer restarts with the same ID, the broker aborts any in-flight
+transaction from the previous instance to prevent duplicates.
+
+#### Limitations of ksink's Transaction Support
+
+ksink is **not** a full Kafka broker. Its transactional support is
+intentionally simplified:
+
+| Real Kafka behaviour | ksink behaviour |
+|---|---|
+| Records written inside a transaction are invisible to `read_committed` consumers until commit. | Records are delivered to `ReadBatch` immediately when produced. The `TransactionalID` field is populated so the callback can decide what to do on commit/abort. |
+| The transaction coordinator tracks transaction state across broker restarts. | No persistent transaction state. If ksink restarts, in-flight transactions are lost (uncommitted temp files are cleaned up on `Close()`). |
+| `sendOffsetsToTransaction` atomically commits consumer offsets with the transaction. | Not supported. ksink is a sink, not a full broker with consumer groups. |
+| Zombie fencing: restarting a producer with the same `transactional.id` aborts the old instance's pending transaction. | Not implemented. Each `transactional.id` is treated independently with no epoch tracking. |
+| Transactions can span multiple topic-partitions atomically. | Supported at the file level — all messages with the same `transactional.id` go to the same temp file regardless of topic/partition. |
+| Aborted records are never visible to `read_committed` consumers. | Aborted records were already delivered to `ReadBatch`. The `TxnEndFunc` callback deletes the temp file, but application-level processing that happened before the abort is not rolled back. |
+| `isolation.level` consumer configuration. | Not applicable — ksink does not implement the consumer protocol. |
+
+**In summary:** ksink provides a best-effort transactional file output where
+committed transactions produce a final file and aborted transactions clean
+up their temp file. It does **not** provide the exactly-once guarantees of a
+real Kafka cluster. It is designed for testing and lightweight sink
+scenarios where the rename-as-commit / delete-as-abort file semantics are
+sufficient.

@@ -100,10 +100,10 @@ kcat format specifiers (--output-format-string):
 
 	rootCmd.Flags().StringVar(&addr, "addr", ":9092", "Address to listen on")
 	rootCmd.Flags().BoolVar(&transactional, "transactional", false,
-		"Enable fake transactional produce support (per-transaction files with rename-as-commit/delete-as-abort)")
+		"Enable transactional produce support (per-transaction files with rename-as-commit/delete-as-abort). Requires {txnID} in --output.")
 	rootCmd.Flags().StringVar(&dst, "output", "-",
-		`Output destination: "-" for stdout (default), file path or pattern, or http(s):// URL.
-Use {txnID} in the path with --transactional to control per-transaction file naming
+		`Output destination: "-" for stdout (default), file path, or http(s):// URL.
+With --transactional, must be a pattern containing {txnID}
 (e.g. "messages-{txnID}.jsonl" produces "messages-my-txn.jsonl").`)
 	rootCmd.Flags().StringVar(&fmtName, "output-format", "binary",
 		"Message format: binary, jsonl, kcat")
@@ -196,7 +196,7 @@ func run(addr, dst, fmtName, fmtStr string, jsonB64Key, jsonB64Val bool, separat
 		}
 		w, err = output.NewHTTPWriter(dst, httpOpts, tlsCfg)
 	} else if transactional && dst != "-" {
-		w = output.NewTxnFileWriter(dst)
+		w, err = output.NewTxnFileWriter(dst)
 	} else {
 		if transactional && dst == "-" {
 			return fmt.Errorf("--transactional is not supported with stdout output")

@@ -9,57 +9,44 @@ import (
 	"github.com/marre/ksink/pkg/ksink"
 )
 
-// txnIDPlaceholder is the placeholder that can be used in the output pattern
+// TxnIDPlaceholder is the placeholder that must be used in the output pattern
 // to control the naming of per-transaction files.
-const txnIDPlaceholder = "{txnID}"
+const TxnIDPlaceholder = "{txnID}"
 
 // txnFileWriter writes messages to per-transaction temporary files and uses
 // rename-as-commit / delete-as-rollback semantics.
 //
-// The output path may contain a {txnID} placeholder to control per-transaction
-// file names. When a placeholder is present:
+// The output path must contain a {txnID} placeholder. Per-transaction file
+// names are derived by replacing {txnID} with the actual transaction ID:
 //
 //	During transaction: pattern with {txnID} replaced + ".tmp"
 //	After commit:       pattern with {txnID} replaced
 //	After abort:        temp file is deleted
-//
-// When no placeholder is present, the legacy naming convention is used:
-//
-//	During transaction: <basePath>.txn-<txnID>.tmp
-//	After commit:       <basePath>.txn-<txnID>
-//	After abort:        file is deleted
-//
-// Messages without a TransactionalID are written to basePath directly (the
-// raw pattern string when a placeholder is present).
 type txnFileWriter struct {
-	pattern    string // original output path (may contain {txnID})
-	hasPattern bool   // true when pattern contains {txnID}
-	mu         sync.Mutex
-	txnFiles   map[string]*os.File // txnID → open temp file
-	baseFile   *os.File            // lazily opened for non-transactional writes
+	pattern  string // output path pattern (must contain {txnID})
+	mu       sync.Mutex
+	txnFiles map[string]*os.File // txnID → open temp file
 }
 
 // NewTxnFileWriter creates a [TransactionalWriter] backed by the filesystem.
 // Each transaction writes to a temporary file that is renamed on commit or
 // deleted on abort.
 //
-// The path may contain a {txnID} placeholder which is replaced with the
+// The pattern must contain a {txnID} placeholder which is replaced with the
 // actual transaction ID for each transaction. For example:
 //
 //	"messages-{txnID}.jsonl"
 //
 // produces committed files like "messages-my-txn.jsonl" and temp files like
 // "messages-my-txn.jsonl.tmp".
-//
-// When no {txnID} placeholder is present, the legacy convention is used:
-// committed files are "<path>.txn-<txnID>" and temp files are
-// "<path>.txn-<txnID>.tmp".
-func NewTxnFileWriter(path string) TransactionalWriter {
-	return &txnFileWriter{
-		pattern:    path,
-		hasPattern: strings.Contains(path, txnIDPlaceholder),
-		txnFiles:   make(map[string]*os.File),
+func NewTxnFileWriter(pattern string) (TransactionalWriter, error) {
+	if !strings.Contains(pattern, TxnIDPlaceholder) {
+		return nil, fmt.Errorf("transactional output pattern must contain %s placeholder", TxnIDPlaceholder)
 	}
+	return &txnFileWriter{
+		pattern:  pattern,
+		txnFiles: make(map[string]*os.File),
+	}, nil
 }
 
 func (w *txnFileWriter) Write(data []byte, msg *ksink.Message) error {
@@ -72,7 +59,7 @@ func (w *txnFileWriter) Write(data []byte, msg *ksink.Message) error {
 	}
 
 	if txnID == "" {
-		return w.writeBase(data)
+		return fmt.Errorf("transactional file writer requires a TransactionalID on every message")
 	}
 
 	f, ok := w.txnFiles[txnID]
@@ -86,19 +73,6 @@ func (w *txnFileWriter) Write(data []byte, msg *ksink.Message) error {
 	}
 
 	_, err := f.Write(data)
-	return err
-}
-
-// writeBase writes non-transactional data to the base file.
-func (w *txnFileWriter) writeBase(data []byte) error {
-	if w.baseFile == nil {
-		f, err := os.OpenFile(w.pattern, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
-		if err != nil {
-			return fmt.Errorf("failed to open base output file: %w", err)
-		}
-		w.baseFile = f
-	}
-	_, err := w.baseFile.Write(data)
 	return err
 }
 
@@ -158,12 +132,6 @@ func (w *txnFileWriter) Close() error {
 	}
 	w.txnFiles = nil
 
-	if w.baseFile != nil {
-		if err := w.baseFile.Close(); err != nil && firstErr == nil {
-			firstErr = err
-		}
-	}
-
 	return firstErr
 }
 
@@ -172,8 +140,5 @@ func (w *txnFileWriter) tmpPath(txnID string) string {
 }
 
 func (w *txnFileWriter) committedPath(txnID string) string {
-	if w.hasPattern {
-		return strings.ReplaceAll(w.pattern, txnIDPlaceholder, txnID)
-	}
-	return fmt.Sprintf("%s.txn-%s", w.pattern, txnID)
+	return strings.ReplaceAll(w.pattern, TxnIDPlaceholder, txnID)
 }

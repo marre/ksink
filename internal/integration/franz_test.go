@@ -10,13 +10,16 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
+	"log"
 	"math/big"
 	"net"
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/marre/ksink/internal/format"
+	"github.com/marre/ksink/internal/output"
 	"github.com/marre/ksink/pkg/ksink"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -484,6 +487,305 @@ func TestFranzTransactionalProducerAbort(t *testing.T) {
 	msgs := capture.waitForMessages(1, 5*time.Second)
 	require.Len(t, msgs, 1)
 	assert.Equal(t, "aborted-message", msgs[0].Value)
+}
+
+// TestFranzTransactionalFileCommit verifies that messages produced inside a
+// committed transaction end up in the expected file on disk.
+func TestFranzTransactionalFileCommit(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	dir := t.TempDir()
+	pattern := filepath.Join(dir, "out-{txnID}.jsonl")
+
+	tw, err := output.NewTxnFileWriter(pattern)
+	require.NoError(t, err)
+	t.Cleanup(func() { tw.Close() }) //nolint:errcheck
+
+	port := getFreePort(t)
+	addr := fmt.Sprintf("127.0.0.1:%d", port)
+
+	srv, err := New(Config{
+		Address:            addr,
+		Timeout:            5 * time.Second,
+		TransactionalWrite: true,
+	}, WithLogger(&integrationLogger{t}),
+		ksink.WithTxnEndFunc(func(txnID string, commit bool) {
+			if commit {
+				if err := tw.CommitTxn(txnID); err != nil {
+					log.Printf("[ERROR] commit txn %s: %v", txnID, err)
+				}
+			} else {
+				if err := tw.AbortTxn(txnID); err != nil {
+					log.Printf("[ERROR] abort txn %s: %v", txnID, err)
+				}
+			}
+		}),
+	)
+	require.NoError(t, err)
+	require.NoError(t, srv.Start(context.Background()))
+	t.Cleanup(func() { srv.Close(context.Background()) }) //nolint:errcheck
+	waitForTCPReady(t, addr, 5*time.Second)
+
+	// Start a read loop that writes formatted data through the txn writer.
+	readCtx, readCancel := context.WithCancel(context.Background())
+	t.Cleanup(readCancel)
+	go func() {
+		for {
+			msgs, ack, err := srv.ReadBatch(readCtx)
+			if err != nil {
+				return
+			}
+			var writeErr error
+			for _, msg := range msgs {
+				data := append([]byte(msg.Value), '\n')
+				if werr := tw.Write(data, msg); werr != nil {
+					writeErr = werr
+					break
+				}
+			}
+			ack(writeErr)
+		}
+	}()
+
+	// Produce two messages in a committed transaction.
+	client, err := kgo.NewClient(
+		kgo.SeedBrokers(addr),
+		kgo.RequestTimeoutOverhead(5*time.Second),
+		kgo.TransactionalID("commit-txn"),
+	)
+	require.NoError(t, err)
+	defer client.Close()
+
+	require.NoError(t, client.BeginTransaction())
+	results := client.ProduceSync(ctx,
+		&kgo.Record{Topic: "txn-topic", Value: []byte("msg-1")},
+		&kgo.Record{Topic: "txn-topic", Value: []byte("msg-2")},
+	)
+	for _, r := range results {
+		require.NoError(t, r.Err)
+	}
+	require.NoError(t, client.EndTransaction(ctx, kgo.TryCommit))
+
+	// Wait for the committed file to appear.
+	committedPath := filepath.Join(dir, "out-commit-txn.jsonl")
+	deadline := time.Now().Add(5 * time.Second)
+	var data []byte
+	for time.Now().Before(deadline) {
+		data, err = os.ReadFile(committedPath)
+		if err == nil {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	require.NoError(t, err, "committed file should exist after commit")
+	assert.Equal(t, "msg-1\nmsg-2\n", string(data))
+
+	// Temp file should be gone.
+	_, err = os.Stat(committedPath + ".tmp")
+	assert.True(t, os.IsNotExist(err), "temp file should be removed after commit")
+}
+
+// TestFranzTransactionalFileAbort verifies that messages produced inside an
+// aborted transaction are discarded and the temp file is removed.
+func TestFranzTransactionalFileAbort(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	dir := t.TempDir()
+	pattern := filepath.Join(dir, "out-{txnID}.jsonl")
+
+	tw, err := output.NewTxnFileWriter(pattern)
+	require.NoError(t, err)
+	t.Cleanup(func() { tw.Close() }) //nolint:errcheck
+
+	port := getFreePort(t)
+	addr := fmt.Sprintf("127.0.0.1:%d", port)
+
+	srv, err := New(Config{
+		Address:            addr,
+		Timeout:            5 * time.Second,
+		TransactionalWrite: true,
+	}, WithLogger(&integrationLogger{t}),
+		ksink.WithTxnEndFunc(func(txnID string, commit bool) {
+			if commit {
+				if err := tw.CommitTxn(txnID); err != nil {
+					log.Printf("[ERROR] commit txn %s: %v", txnID, err)
+				}
+			} else {
+				if err := tw.AbortTxn(txnID); err != nil {
+					log.Printf("[ERROR] abort txn %s: %v", txnID, err)
+				}
+			}
+		}),
+	)
+	require.NoError(t, err)
+	require.NoError(t, srv.Start(context.Background()))
+	t.Cleanup(func() { srv.Close(context.Background()) }) //nolint:errcheck
+	waitForTCPReady(t, addr, 5*time.Second)
+
+	readCtx, readCancel := context.WithCancel(context.Background())
+	t.Cleanup(readCancel)
+	go func() {
+		for {
+			msgs, ack, err := srv.ReadBatch(readCtx)
+			if err != nil {
+				return
+			}
+			var writeErr error
+			for _, msg := range msgs {
+				data := append([]byte(msg.Value), '\n')
+				if werr := tw.Write(data, msg); werr != nil {
+					writeErr = werr
+					break
+				}
+			}
+			ack(writeErr)
+		}
+	}()
+
+	// Produce a message inside an aborted transaction.
+	client, err := kgo.NewClient(
+		kgo.SeedBrokers(addr),
+		kgo.RequestTimeoutOverhead(5*time.Second),
+		kgo.TransactionalID("abort-txn"),
+	)
+	require.NoError(t, err)
+	defer client.Close()
+
+	require.NoError(t, client.BeginTransaction())
+	results := client.ProduceSync(ctx, &kgo.Record{
+		Topic: "txn-topic",
+		Value: []byte("should-be-discarded"),
+	})
+	require.NoError(t, results[0].Err)
+	require.NoError(t, client.EndTransaction(ctx, kgo.TryAbort))
+
+	// Give the server time to process the abort callback.
+	time.Sleep(500 * time.Millisecond)
+
+	// Neither the committed file nor the temp file should exist.
+	committedPath := filepath.Join(dir, "out-abort-txn.jsonl")
+	_, err = os.Stat(committedPath)
+	assert.True(t, os.IsNotExist(err), "committed file should not exist after abort")
+
+	_, err = os.Stat(committedPath + ".tmp")
+	assert.True(t, os.IsNotExist(err), "temp file should not exist after abort")
+}
+
+// TestFranzTransactionalFileCommitAndAbort verifies a scenario with two
+// concurrent transactions where one is committed and the other is aborted.
+func TestFranzTransactionalFileCommitAndAbort(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	dir := t.TempDir()
+	pattern := filepath.Join(dir, "out-{txnID}.jsonl")
+
+	tw, err := output.NewTxnFileWriter(pattern)
+	require.NoError(t, err)
+	t.Cleanup(func() { tw.Close() }) //nolint:errcheck
+
+	port := getFreePort(t)
+	addr := fmt.Sprintf("127.0.0.1:%d", port)
+
+	srv, err := New(Config{
+		Address:            addr,
+		Timeout:            5 * time.Second,
+		TransactionalWrite: true,
+	}, WithLogger(&integrationLogger{t}),
+		ksink.WithTxnEndFunc(func(txnID string, commit bool) {
+			if commit {
+				if err := tw.CommitTxn(txnID); err != nil {
+					log.Printf("[ERROR] commit txn %s: %v", txnID, err)
+				}
+			} else {
+				if err := tw.AbortTxn(txnID); err != nil {
+					log.Printf("[ERROR] abort txn %s: %v", txnID, err)
+				}
+			}
+		}),
+	)
+	require.NoError(t, err)
+	require.NoError(t, srv.Start(context.Background()))
+	t.Cleanup(func() { srv.Close(context.Background()) }) //nolint:errcheck
+	waitForTCPReady(t, addr, 5*time.Second)
+
+	readCtx, readCancel := context.WithCancel(context.Background())
+	t.Cleanup(readCancel)
+	go func() {
+		for {
+			msgs, ack, err := srv.ReadBatch(readCtx)
+			if err != nil {
+				return
+			}
+			var writeErr error
+			for _, msg := range msgs {
+				data := append([]byte(msg.Value), '\n')
+				if werr := tw.Write(data, msg); werr != nil {
+					writeErr = werr
+					break
+				}
+			}
+			ack(writeErr)
+		}
+	}()
+
+	// Transaction 1: commit
+	client1, err := kgo.NewClient(
+		kgo.SeedBrokers(addr),
+		kgo.RequestTimeoutOverhead(5*time.Second),
+		kgo.TransactionalID("txn-keep"),
+	)
+	require.NoError(t, err)
+	defer client1.Close()
+
+	require.NoError(t, client1.BeginTransaction())
+	results := client1.ProduceSync(ctx, &kgo.Record{
+		Topic: "txn-topic", Value: []byte("committed-msg"),
+	})
+	require.NoError(t, results[0].Err)
+	require.NoError(t, client1.EndTransaction(ctx, kgo.TryCommit))
+
+	// Transaction 2: abort (using a separate client with a different txn ID)
+	client2, err := kgo.NewClient(
+		kgo.SeedBrokers(addr),
+		kgo.RequestTimeoutOverhead(5*time.Second),
+		kgo.TransactionalID("txn-discard"),
+	)
+	require.NoError(t, err)
+	defer client2.Close()
+
+	require.NoError(t, client2.BeginTransaction())
+	results = client2.ProduceSync(ctx, &kgo.Record{
+		Topic: "txn-topic", Value: []byte("aborted-msg"),
+	})
+	require.NoError(t, results[0].Err)
+	require.NoError(t, client2.EndTransaction(ctx, kgo.TryAbort))
+
+	// Wait for the committed file.
+	committedPath := filepath.Join(dir, "out-txn-keep.jsonl")
+	deadline := time.Now().Add(5 * time.Second)
+	var data []byte
+	for time.Now().Before(deadline) {
+		data, err = os.ReadFile(committedPath)
+		if err == nil {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	require.NoError(t, err)
+	assert.Equal(t, "committed-msg\n", string(data))
+
+	// Give abort time to process.
+	time.Sleep(500 * time.Millisecond)
+
+	// The aborted transaction should have no file.
+	abortedPath := filepath.Join(dir, "out-txn-discard.jsonl")
+	_, err = os.Stat(abortedPath)
+	assert.True(t, os.IsNotExist(err), "aborted transaction file should not exist")
+	_, err = os.Stat(abortedPath + ".tmp")
+	assert.True(t, os.IsNotExist(err), "aborted transaction temp file should not exist")
 }
 
 func TestFranzHandlerError(t *testing.T) {
