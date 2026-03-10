@@ -45,6 +45,13 @@ go run ./cmd/ksink --addr :9092 --transactional
 #   After commit:       messages.jsonl.txn-<txnID>
 #   After abort:        temp file is deleted
 go run ./cmd/ksink --addr :9092 --transactional --output messages.jsonl
+
+# Use a {txnID} placeholder to control per-transaction file naming so the
+# file extension stays at the end:
+#   During transaction: messages-<txnID>.jsonl.tmp
+#   After commit:       messages-<txnID>.jsonl
+#   After abort:        temp file is deleted
+go run ./cmd/ksink --addr :9092 --transactional --output 'messages-{txnID}.jsonl'
 ```
 
 ### Message Formats

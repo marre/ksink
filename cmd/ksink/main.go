@@ -100,9 +100,11 @@ kcat format specifiers (--output-format-string):
 
 	rootCmd.Flags().StringVar(&addr, "addr", ":9092", "Address to listen on")
 	rootCmd.Flags().BoolVar(&transactional, "transactional", false,
-		"Enable fake transactional produce support (stub; accepts transactional requests without enforcing semantics)")
+		"Enable fake transactional produce support (per-transaction files with rename-as-commit/delete-as-abort)")
 	rootCmd.Flags().StringVar(&dst, "output", "-",
-		`Output destination: "-" for stdout (default), file path, or http(s):// URL`)
+		`Output destination: "-" for stdout (default), file path or pattern, or http(s):// URL.
+Use {txnID} in the path with --transactional to control per-transaction file naming
+(e.g. "messages-{txnID}.jsonl" produces "messages-my-txn.jsonl").`)
 	rootCmd.Flags().StringVar(&fmtName, "output-format", "binary",
 		"Message format: binary, jsonl, kcat")
 	rootCmd.Flags().StringVar(&fmtStr, "output-format-string", "",
