@@ -35,7 +35,7 @@ func getFreePort(t *testing.T) int {
     l, err := net.Listen("tcp", "127.0.0.1:0")
     require.NoError(t, err)
     port := l.Addr().(*net.TCPAddr).Port
-    l.Close()
+    require.NoError(t, l.Close())
     return port
 }
 
@@ -45,7 +45,7 @@ func waitForTCPReady(t *testing.T, addr string, timeout time.Duration) {
     for time.Now().Before(deadline) {
         conn, err := net.DialTimeout("tcp", addr, 500*time.Millisecond)
         if err == nil {
-            conn.Close()
+            conn.Close() //nolint:errcheck
             return
         }
         time.Sleep(50 * time.Millisecond)

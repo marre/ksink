@@ -196,7 +196,7 @@ func TestServerAdvertisedAddress(t *testing.T) {
 	// Connect and verify via raw protocol that the advertised address is returned
 	conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
 	require.NoError(t, err)
-	defer conn.Close()
+	defer conn.Close() //nolint:errcheck
 
 	// Send ApiVersions request
 	req := &kmsg.ApiVersionsRequest{Version: 0}

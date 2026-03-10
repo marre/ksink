@@ -1,8 +1,1 @@
 version: "2"
-
-linters:
-  settings:
-    errcheck:
-      exclude-functions:
-        - (net.Listener).Close
-        - (net.Conn).Close
