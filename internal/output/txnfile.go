@@ -51,7 +51,7 @@ func (w *txnFileWriter) Write(data []byte, msg *ksink.Message) error {
 	f, ok := w.txnFiles[txnID]
 	if !ok {
 		var err error
-		f, err = os.OpenFile(w.tmpPath(txnID), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
+		f, err = os.OpenFile(w.tmpPath(txnID), os.O_CREATE|os.O_WRONLY|os.O_TRUNC|os.O_APPEND, 0600)
 		if err != nil {
 			return fmt.Errorf("failed to open txn temp file: %w", err)
 		}
@@ -89,7 +89,10 @@ func (w *txnFileWriter) CommitTxn(txnID string) error {
 	}
 	delete(w.txnFiles, txnID)
 
-	return os.Rename(w.tmpPath(txnID), w.committedPath(txnID))
+	if err := os.Rename(w.tmpPath(txnID), w.committedPath(txnID)); err != nil {
+		return fmt.Errorf("failed to commit transaction %s: %w", txnID, err)
+	}
+	return nil
 }
 
 func (w *txnFileWriter) AbortTxn(txnID string) error {
@@ -106,7 +109,10 @@ func (w *txnFileWriter) AbortTxn(txnID string) error {
 	}
 	delete(w.txnFiles, txnID)
 
-	return os.Remove(w.tmpPath(txnID))
+	if err := os.Remove(w.tmpPath(txnID)); err != nil {
+		return fmt.Errorf("failed to abort transaction %s: %w", txnID, err)
+	}
+	return nil
 }
 
 func (w *txnFileWriter) Close() error {
