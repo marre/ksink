@@ -115,6 +115,10 @@ func integrationStartReadLoop(t *testing.T, srv *ksink.Server) *integrationMessa
 				return
 			}
 			for _, msg := range msgs {
+				// Skip transaction lifecycle events — they are not data messages.
+				if msg.TxnEvent != ksink.TxnNone {
+					continue
+				}
 				rm := integrationReceivedMessage{
 					Topic:           msg.Topic,
 					Value:           string(msg.Value),

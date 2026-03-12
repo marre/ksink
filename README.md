@@ -184,9 +184,42 @@ cfg := ksink.Config{
 When `TransactionalWrite` is enabled, ksink accepts the Kafka transactional
 protocol requests (`InitProducerID`, `AddPartitionsToTxn`, `EndTxn`) and
 tracks which transaction each message belongs to via the `TransactionalID`
-field on `Message`. Use `WithTxnEndFunc` to receive commit/abort callbacks:
+field on `Message`.
+
+Transaction lifecycle events (commit/abort) are delivered through `ReadBatch`
+as messages with a non-zero `TxnEvent` field. This ensures that all data
+messages for a transaction have been processed before the commit/abort event
+is handled:
 
 ```go
+for {
+    msgs, ack, err := srv.ReadBatch(ctx)
+    if err != nil {
+        break
+    }
+    for _, msg := range msgs {
+        switch msg.TxnEvent {
+        case ksink.TxnCommit:
+            // e.g. rename temp file to final name
+        case ksink.TxnAbort:
+            // e.g. delete temp file
+        default:
+            // Normal data message — write to output
+        }
+    }
+    ack(nil)
+}
+```
+
+<details>
+<summary>Deprecated: <code>WithTxnEndFunc</code> callback</summary>
+
+The push-based `WithTxnEndFunc` callback is still supported for backward
+compatibility but is deprecated. Prefer handling `TxnEvent` in the
+`ReadBatch` loop instead.
+
+```go
+// Deprecated — use TxnEvent in ReadBatch instead.
 srv, _ := ksink.New(cfg,
     ksink.WithTxnEndFunc(func(txnID string, commit bool) {
         if commit {
@@ -197,6 +230,8 @@ srv, _ := ksink.New(cfg,
     }),
 )
 ```
+
+</details>
 
 #### How Kafka Transactions Work (Background)
 
@@ -226,12 +261,12 @@ intentionally simplified:
 
 | Real Kafka behaviour | ksink behaviour |
 |---|---|
-| Records written inside a transaction are invisible to `read_committed` consumers until commit. | Records are delivered to `ReadBatch` immediately when produced. The `TransactionalID` field is populated so the callback can decide what to do on commit/abort. |
+| Records written inside a transaction are invisible to `read_committed` consumers until commit. | Records are delivered to `ReadBatch` immediately when produced. The `TransactionalID` field is populated so the consumer can buffer them. When the transaction ends, a `TxnEvent` marker is delivered through `ReadBatch` so the consumer can decide what to do on commit/abort. |
 | The transaction coordinator tracks transaction state across broker restarts. | No persistent transaction state. If ksink restarts, in-flight transactions are lost (uncommitted temp files are cleaned up on `Close()`). |
 | `sendOffsetsToTransaction` atomically commits consumer offsets with the transaction. | Not supported. ksink is a sink, not a full broker with consumer groups. |
-| Zombie fencing: restarting a producer with the same `transactional.id` aborts the old instance's pending transaction. | **Supported.** When `InitProducerID` is called with an existing `transactional.id` that has an in-flight transaction, the old transaction is automatically aborted via the `TxnEndFunc` callback and the producer epoch is bumped. |
+| Zombie fencing: restarting a producer with the same `transactional.id` aborts the old instance's pending transaction. | **Supported.** When `InitProducerID` is called with an existing `transactional.id` that has an in-flight transaction, the old transaction is automatically aborted via a `TxnAbort` event delivered through `ReadBatch` and the producer epoch is bumped. |
 | Transactions can span multiple topic-partitions atomically. | Supported at the file level — all messages with the same `transactional.id` go to the same temp file regardless of topic/partition. When the `{topic}` placeholder is used, each topic within a transaction gets its own file; all are committed or aborted together. |
-| Aborted records are never visible to `read_committed` consumers. | Aborted records were already delivered to `ReadBatch`. The `TxnEndFunc` callback deletes the temp file, but application-level processing that happened before the abort is not rolled back. |
+| Aborted records are never visible to `read_committed` consumers. | Aborted records were already delivered to `ReadBatch`. The `TxnAbort` event signals the consumer to clean up (e.g. delete the temp file), but application-level processing that happened before the abort is not rolled back. |
 | `isolation.level` consumer configuration. | Not applicable — ksink does not implement the consumer protocol. |
 
 **In summary:** ksink provides a best-effort transactional file output where

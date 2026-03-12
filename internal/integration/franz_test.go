@@ -10,7 +10,6 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
-	"log"
 	"math/big"
 	"net"
 	"os"
@@ -491,8 +490,9 @@ func TestFranzTransactionalProducerAbort(t *testing.T) {
 	assert.Equal(t, "aborted-message", msgs[0].Value)
 }
 
-// TestFranzTxnEndFuncCallback verifies that the TxnEndFunc callback is invoked
-// with the correct txnID and commit flag for both commit and abort.
+// TestFranzTxnEndFuncCallback verifies that the deprecated TxnEndFunc callback
+// is still invoked for backward compatibility, and that transaction events are
+// also delivered through ReadBatch.
 func TestFranzTxnEndFuncCallback(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -501,7 +501,8 @@ func TestFranzTxnEndFuncCallback(t *testing.T) {
 		txnID  string
 		commit bool
 	}
-	var events []txnEvent
+	var callbackEvents []txnEvent
+	var readBatchEvents []txnEvent
 	var mu sync.Mutex
 
 	port := getFreePort(t)
@@ -514,7 +515,7 @@ func TestFranzTxnEndFuncCallback(t *testing.T) {
 		ksink.WithTxnEndFunc(func(txnID string, commit bool) {
 			mu.Lock()
 			defer mu.Unlock()
-			events = append(events, txnEvent{txnID, commit})
+			callbackEvents = append(callbackEvents, txnEvent{txnID, commit})
 		}),
 	)
 	require.NoError(t, err)
@@ -522,14 +523,24 @@ func TestFranzTxnEndFuncCallback(t *testing.T) {
 	t.Cleanup(func() { srv.Close(context.Background()) }) //nolint:errcheck
 	waitForTCPReady(t, addr, 5*time.Second)
 
-	// Start a read loop that acks all batches.
+	// Start a read loop that captures txn events from ReadBatch.
 	readCtx, readCancel := context.WithCancel(context.Background())
 	t.Cleanup(readCancel)
 	go func() {
 		for {
-			_, ack, err := srv.ReadBatch(readCtx)
+			msgs, ack, err := srv.ReadBatch(readCtx)
 			if err != nil {
 				return
+			}
+			for _, msg := range msgs {
+				if msg.TxnEvent != ksink.TxnNone {
+					mu.Lock()
+					readBatchEvents = append(readBatchEvents, txnEvent{
+						txnID:  msg.TransactionalID,
+						commit: msg.TxnEvent == ksink.TxnCommit,
+					})
+					mu.Unlock()
+				}
 			}
 			ack(nil)
 		}
@@ -563,11 +574,11 @@ func TestFranzTxnEndFuncCallback(t *testing.T) {
 	require.NoError(t, results[0].Err)
 	require.NoError(t, client2.EndTransaction(ctx, kgo.TryAbort))
 
-	// Poll for both callbacks with timeout instead of fixed sleep.
+	// Poll for both events with timeout.
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
 		mu.Lock()
-		n := len(events)
+		n := len(readBatchEvents)
 		mu.Unlock()
 		if n >= 2 {
 			break
@@ -577,15 +588,25 @@ func TestFranzTxnEndFuncCallback(t *testing.T) {
 
 	mu.Lock()
 	defer mu.Unlock()
-	require.Len(t, events, 2)
-	assert.Equal(t, "cb-commit", events[0].txnID)
-	assert.True(t, events[0].commit)
-	assert.Equal(t, "cb-abort", events[1].txnID)
-	assert.False(t, events[1].commit)
+
+	// Verify events were delivered through ReadBatch.
+	require.Len(t, readBatchEvents, 2)
+	assert.Equal(t, "cb-commit", readBatchEvents[0].txnID)
+	assert.True(t, readBatchEvents[0].commit)
+	assert.Equal(t, "cb-abort", readBatchEvents[1].txnID)
+	assert.False(t, readBatchEvents[1].commit)
+
+	// Backward-compat: the deprecated callback should also have been called.
+	require.Len(t, callbackEvents, 2)
+	assert.Equal(t, "cb-commit", callbackEvents[0].txnID)
+	assert.True(t, callbackEvents[0].commit)
+	assert.Equal(t, "cb-abort", callbackEvents[1].txnID)
+	assert.False(t, callbackEvents[1].commit)
 }
 
 // TestFranzTransactionalFileCommit verifies that messages produced inside a
-// committed transaction end up in the expected file on disk.
+// committed transaction end up in the expected file on disk, using the
+// pull-based transaction flow via ReadBatch.
 func TestFranzTransactionalFileCommit(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -597,6 +618,8 @@ func TestFranzTransactionalFileCommit(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { tw.Close() }) //nolint:errcheck
 
+	txnWriter := tw.(output.TransactionalWriter)
+
 	port := getFreePort(t)
 	addr := fmt.Sprintf("127.0.0.1:%d", port)
 
@@ -604,25 +627,13 @@ func TestFranzTransactionalFileCommit(t *testing.T) {
 		Address:            addr,
 		Timeout:            5 * time.Second,
 		TransactionalWrite: true,
-	}, WithLogger(&integrationLogger{t}),
-		ksink.WithTxnEndFunc(func(txnID string, commit bool) {
-			if commit {
-				if err := tw.CommitTxn(txnID); err != nil {
-					log.Printf("[ERROR] commit txn %s: %v", txnID, err)
-				}
-			} else {
-				if err := tw.AbortTxn(txnID); err != nil {
-					log.Printf("[ERROR] abort txn %s: %v", txnID, err)
-				}
-			}
-		}),
-	)
+	}, WithLogger(&integrationLogger{t}))
 	require.NoError(t, err)
 	require.NoError(t, srv.Start(context.Background()))
 	t.Cleanup(func() { srv.Close(context.Background()) }) //nolint:errcheck
 	waitForTCPReady(t, addr, 5*time.Second)
 
-	// Start a read loop that writes formatted data through the txn writer.
+	// Start a read loop that writes data and handles txn events inline.
 	readCtx, readCancel := context.WithCancel(context.Background())
 	t.Cleanup(readCancel)
 	go func() {
@@ -633,6 +644,20 @@ func TestFranzTransactionalFileCommit(t *testing.T) {
 			}
 			var writeErr error
 			for _, msg := range msgs {
+				if msg.TxnEvent == ksink.TxnCommit {
+					if werr := txnWriter.CommitTxn(msg.TransactionalID); werr != nil {
+						writeErr = werr
+						break
+					}
+					continue
+				}
+				if msg.TxnEvent == ksink.TxnAbort {
+					if werr := txnWriter.AbortTxn(msg.TransactionalID); werr != nil {
+						writeErr = werr
+						break
+					}
+					continue
+				}
 				data := append([]byte(msg.Value), '\n')
 				if werr := tw.Write(data, msg); werr != nil {
 					writeErr = werr
@@ -682,7 +707,8 @@ func TestFranzTransactionalFileCommit(t *testing.T) {
 }
 
 // TestFranzTransactionalFileAbort verifies that messages produced inside an
-// aborted transaction are discarded and the temp file is removed.
+// aborted transaction are discarded and the temp file is removed, using the
+// pull-based transaction flow via ReadBatch.
 func TestFranzTransactionalFileAbort(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -694,6 +720,8 @@ func TestFranzTransactionalFileAbort(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { tw.Close() }) //nolint:errcheck
 
+	txnWriter := tw.(output.TransactionalWriter)
+
 	port := getFreePort(t)
 	addr := fmt.Sprintf("127.0.0.1:%d", port)
 
@@ -701,19 +729,7 @@ func TestFranzTransactionalFileAbort(t *testing.T) {
 		Address:            addr,
 		Timeout:            5 * time.Second,
 		TransactionalWrite: true,
-	}, WithLogger(&integrationLogger{t}),
-		ksink.WithTxnEndFunc(func(txnID string, commit bool) {
-			if commit {
-				if err := tw.CommitTxn(txnID); err != nil {
-					log.Printf("[ERROR] commit txn %s: %v", txnID, err)
-				}
-			} else {
-				if err := tw.AbortTxn(txnID); err != nil {
-					log.Printf("[ERROR] abort txn %s: %v", txnID, err)
-				}
-			}
-		}),
-	)
+	}, WithLogger(&integrationLogger{t}))
 	require.NoError(t, err)
 	require.NoError(t, srv.Start(context.Background()))
 	t.Cleanup(func() { srv.Close(context.Background()) }) //nolint:errcheck
@@ -729,6 +745,20 @@ func TestFranzTransactionalFileAbort(t *testing.T) {
 			}
 			var writeErr error
 			for _, msg := range msgs {
+				if msg.TxnEvent == ksink.TxnCommit {
+					if werr := txnWriter.CommitTxn(msg.TransactionalID); werr != nil {
+						writeErr = werr
+						break
+					}
+					continue
+				}
+				if msg.TxnEvent == ksink.TxnAbort {
+					if werr := txnWriter.AbortTxn(msg.TransactionalID); werr != nil {
+						writeErr = werr
+						break
+					}
+					continue
+				}
 				data := append([]byte(msg.Value), '\n')
 				if werr := tw.Write(data, msg); werr != nil {
 					writeErr = werr
@@ -769,7 +799,8 @@ func TestFranzTransactionalFileAbort(t *testing.T) {
 }
 
 // TestFranzTransactionalFileCommitAndAbort verifies a scenario with two
-// concurrent transactions where one is committed and the other is aborted.
+// concurrent transactions where one is committed and the other is aborted,
+// using the pull-based transaction flow via ReadBatch.
 func TestFranzTransactionalFileCommitAndAbort(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -781,6 +812,8 @@ func TestFranzTransactionalFileCommitAndAbort(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { tw.Close() }) //nolint:errcheck
 
+	txnWriter := tw.(output.TransactionalWriter)
+
 	port := getFreePort(t)
 	addr := fmt.Sprintf("127.0.0.1:%d", port)
 
@@ -788,19 +821,7 @@ func TestFranzTransactionalFileCommitAndAbort(t *testing.T) {
 		Address:            addr,
 		Timeout:            5 * time.Second,
 		TransactionalWrite: true,
-	}, WithLogger(&integrationLogger{t}),
-		ksink.WithTxnEndFunc(func(txnID string, commit bool) {
-			if commit {
-				if err := tw.CommitTxn(txnID); err != nil {
-					log.Printf("[ERROR] commit txn %s: %v", txnID, err)
-				}
-			} else {
-				if err := tw.AbortTxn(txnID); err != nil {
-					log.Printf("[ERROR] abort txn %s: %v", txnID, err)
-				}
-			}
-		}),
-	)
+	}, WithLogger(&integrationLogger{t}))
 	require.NoError(t, err)
 	require.NoError(t, srv.Start(context.Background()))
 	t.Cleanup(func() { srv.Close(context.Background()) }) //nolint:errcheck
@@ -816,6 +837,20 @@ func TestFranzTransactionalFileCommitAndAbort(t *testing.T) {
 			}
 			var writeErr error
 			for _, msg := range msgs {
+				if msg.TxnEvent == ksink.TxnCommit {
+					if werr := txnWriter.CommitTxn(msg.TransactionalID); werr != nil {
+						writeErr = werr
+						break
+					}
+					continue
+				}
+				if msg.TxnEvent == ksink.TxnAbort {
+					if werr := txnWriter.AbortTxn(msg.TransactionalID); werr != nil {
+						writeErr = werr
+						break
+					}
+					continue
+				}
 				data := append([]byte(msg.Value), '\n')
 				if werr := tw.Write(data, msg); werr != nil {
 					writeErr = werr
@@ -885,7 +920,8 @@ func TestFranzTransactionalFileCommitAndAbort(t *testing.T) {
 
 // TestFranzZombieFencing verifies that when a new producer is created with the
 // same transactional.id while a transaction is in-flight, the old transaction
-// is aborted (zombie fencing) and the new producer can proceed.
+// is aborted (zombie fencing) and the new producer can proceed. Transaction
+// events are delivered through ReadBatch.
 func TestFranzZombieFencing(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -903,26 +939,30 @@ func TestFranzZombieFencing(t *testing.T) {
 		Address:            addr,
 		Timeout:            5 * time.Second,
 		TransactionalWrite: true,
-	}, WithLogger(&integrationLogger{t}),
-		ksink.WithTxnEndFunc(func(txnID string, commit bool) {
-			mu.Lock()
-			defer mu.Unlock()
-			events = append(events, txnEvent{txnID, commit})
-		}),
-	)
+	}, WithLogger(&integrationLogger{t}))
 	require.NoError(t, err)
 	require.NoError(t, srv.Start(context.Background()))
 	t.Cleanup(func() { srv.Close(context.Background()) }) //nolint:errcheck
 	waitForTCPReady(t, addr, 5*time.Second)
 
-	// Start a read loop that acks all batches.
+	// Start a read loop that captures txn events from ReadBatch.
 	readCtx, readCancel := context.WithCancel(context.Background())
 	t.Cleanup(readCancel)
 	go func() {
 		for {
-			_, ack, err := srv.ReadBatch(readCtx)
+			msgs, ack, err := srv.ReadBatch(readCtx)
 			if err != nil {
 				return
+			}
+			for _, msg := range msgs {
+				if msg.TxnEvent != ksink.TxnNone {
+					mu.Lock()
+					events = append(events, txnEvent{
+						txnID:  msg.TransactionalID,
+						commit: msg.TxnEvent == ksink.TxnCommit,
+					})
+					mu.Unlock()
+				}
 			}
 			ack(nil)
 		}

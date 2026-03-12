@@ -49,6 +49,19 @@ const (
 	maxTxnStates = 10000
 )
 
+// TxnEvent describes a transaction lifecycle event delivered through [ReadBatch].
+// The zero value (TxnNone) means the message is a normal data message.
+type TxnEvent int8
+
+const (
+	// TxnNone indicates a normal data message (not a transaction event).
+	TxnNone TxnEvent = iota
+	// TxnCommit indicates the transaction identified by [Message.TransactionalID] was committed.
+	TxnCommit
+	// TxnAbort indicates the transaction identified by [Message.TransactionalID] was aborted.
+	TxnAbort
+)
+
 // Message represents a received Kafka message.
 type Message struct {
 	Topic           string
@@ -61,6 +74,11 @@ type Message struct {
 	Tombstone       bool
 	ClientAddr      string
 	TransactionalID string // non-empty when produced inside a transaction
+
+	// TxnEvent is non-zero when this message is a transaction lifecycle marker
+	// (commit or abort) rather than a data message. When set, the
+	// TransactionalID field identifies the transaction.
+	TxnEvent TxnEvent
 }
 
 // SASLCredential holds a SASL authentication credential.
@@ -192,6 +210,12 @@ type txnState struct {
 // WithTxnEndFunc registers a callback that is invoked when a transaction
 // ends. This allows output backends to take action on commit (e.g. rename
 // a temporary file) or abort (e.g. delete a temporary file).
+//
+// Deprecated: Transaction events are now delivered through [ReadBatch] as
+// messages with a non-zero [Message.TxnEvent] field. Handle commit/abort in
+// the ReadBatch loop instead. When a TxnEndFunc is registered, it is still
+// called for backward compatibility, but new code should use the pull-based
+// approach.
 func WithTxnEndFunc(fn TxnEndFunc) Option {
 	return func(s *Server) {
 		s.txnEndFn = fn

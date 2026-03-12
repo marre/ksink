@@ -259,7 +259,7 @@ func (s *Server) deliverBatch(ctx context.Context, msgs []*Message) error {
 	}
 }
 
-func (s *Server) handleInitProducerId(conn net.Conn, connID uint64, correlationID int32, apiVersion int16, req *kmsg.InitProducerIDRequest, state *connState) error {
+func (s *Server) handleInitProducerId(ctx context.Context, conn net.Conn, connID uint64, correlationID int32, apiVersion int16, req *kmsg.InitProducerIDRequest, state *connState) error {
 	if s.saslEnabled && !state.authenticated {
 		s.logger.Warnf("[conn:%d] Rejecting InitProducerId: not authenticated", connID)
 		resp := &kmsg.InitProducerIDResponse{
@@ -315,8 +315,20 @@ func (s *Server) handleInitProducerId(conn net.Conn, connID uint64, correlationI
 			s.txnMu.Unlock()
 
 			// Invoke the callback outside the lock to avoid deadlocks.
-			if needsAbort && s.txnEndFn != nil {
-				s.txnEndFn(txnID, false)
+			if needsAbort {
+				// Deliver abort marker through ReadBatch.
+				abortMsg := &Message{
+					TransactionalID: txnID,
+					TxnEvent:        TxnAbort,
+				}
+				if err := s.deliverBatch(ctx, []*Message{abortMsg}); err != nil {
+					s.logger.Errorf("[conn:%d] InitProducerId: failed to deliver zombie abort event: %v", connID, err)
+				}
+
+				// Backward compatibility: still invoke the callback if registered.
+				if s.txnEndFn != nil {
+					s.txnEndFn(txnID, false)
+				}
 			}
 
 			resp := &kmsg.InitProducerIDResponse{
@@ -478,7 +490,7 @@ func (s *Server) handleAddPartitionsToTxn(conn net.Conn, connID uint64, correlat
 	return s.sendResponse(conn, connID, correlationID, resp)
 }
 
-func (s *Server) handleEndTxn(conn net.Conn, connID uint64, correlationID int32, apiVersion int16, req *kmsg.EndTxnRequest, state *connState) error {
+func (s *Server) handleEndTxn(ctx context.Context, conn net.Conn, connID uint64, correlationID int32, apiVersion int16, req *kmsg.EndTxnRequest, state *connState) error {
 	if s.saslEnabled && !state.authenticated {
 		s.logger.Warnf("[conn:%d] Rejecting EndTxn: not authenticated", connID)
 		resp := &kmsg.EndTxnResponse{
@@ -527,6 +539,21 @@ func (s *Server) handleEndTxn(conn net.Conn, connID uint64, correlationID int32,
 		return s.sendResponse(conn, connID, correlationID, resp)
 	}
 
+	// Deliver a transaction-end marker through ReadBatch so the consumer
+	// can handle commit/abort as part of the pull-based flow.
+	evt := TxnCommit
+	if !req.Commit {
+		evt = TxnAbort
+	}
+	txnMsg := &Message{
+		TransactionalID: req.TransactionalID,
+		TxnEvent:        evt,
+	}
+	if err := s.deliverBatch(ctx, []*Message{txnMsg}); err != nil {
+		s.logger.Errorf("[conn:%d] EndTxn: failed to deliver txn event: %v", connID, err)
+	}
+
+	// Backward compatibility: still invoke the callback if registered.
 	if s.txnEndFn != nil {
 		s.txnEndFn(req.TransactionalID, req.Commit)
 	}

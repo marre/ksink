@@ -212,21 +212,6 @@ func run(addr, dst, fmtName, fmtStr string, jsonB64Key, jsonB64Val bool, separat
 	defer w.Close() //nolint:errcheck
 
 	serverOpts := []ksink.Option{ksink.WithLogger(stdLogger{})}
-	if transactional {
-		if tw, ok := w.(output.TransactionalWriter); ok {
-			serverOpts = append(serverOpts, ksink.WithTxnEndFunc(func(txnID string, commit bool) {
-				if commit {
-					if err := tw.CommitTxn(txnID); err != nil {
-						log.Printf("[ERROR] commit txn %s: %v", txnID, err)
-					}
-				} else {
-					if err := tw.AbortTxn(txnID); err != nil {
-						log.Printf("[ERROR] abort txn %s: %v", txnID, err)
-					}
-				}
-			}))
-		}
-	}
 
 	srv, err := ksink.New(ksink.Config{
 		Address:            addr,
@@ -250,6 +235,7 @@ func run(addr, dst, fmtName, fmtStr string, jsonB64Key, jsonB64Val bool, separat
 	log.Printf("Kafka server listening on %s, output=%s", srv.Addr(), outputLabel)
 
 	// Start read loop
+	txnWriter, _ := w.(output.TransactionalWriter)
 	go func() {
 		for {
 			msgs, ack, readErr := srv.ReadBatch(ctx)
@@ -259,6 +245,22 @@ func run(addr, dst, fmtName, fmtStr string, jsonB64Key, jsonB64Val bool, separat
 
 			var writeErr error
 			for _, msg := range msgs {
+				// Handle transaction lifecycle events.
+				if msg.TxnEvent != ksink.TxnNone && txnWriter != nil {
+					if msg.TxnEvent == ksink.TxnCommit {
+						if err := txnWriter.CommitTxn(msg.TransactionalID); err != nil {
+							writeErr = fmt.Errorf("failed to commit txn %s: %w", msg.TransactionalID, err)
+							break
+						}
+					} else {
+						if err := txnWriter.AbortTxn(msg.TransactionalID); err != nil {
+							writeErr = fmt.Errorf("failed to abort txn %s: %w", msg.TransactionalID, err)
+							break
+						}
+					}
+					continue
+				}
+
 				data, err := fmtr.Format(msg)
 				if err != nil {
 					writeErr = fmt.Errorf("failed to format message: %w", err)
