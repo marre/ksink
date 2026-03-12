@@ -490,10 +490,9 @@ func TestFranzTransactionalProducerAbort(t *testing.T) {
 	assert.Equal(t, "aborted-message", msgs[0].Value)
 }
 
-// TestFranzTxnEndFuncCallback verifies that the deprecated TxnEndFunc callback
-// is still invoked for backward compatibility, and that transaction events are
-// also delivered through ReadBatch.
-func TestFranzTxnEndFuncCallback(t *testing.T) {
+// TestFranzTxnEvents verifies that transaction commit and abort events
+// are delivered through the pull-based Read API with the correct event types.
+func TestFranzTxnEvents(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
@@ -501,8 +500,7 @@ func TestFranzTxnEndFuncCallback(t *testing.T) {
 		txnID  string
 		commit bool
 	}
-	var callbackEvents []txnEvent
-	var readBatchEvents []txnEvent
+	var events []txnEvent
 	var mu sync.Mutex
 
 	port := getFreePort(t)
@@ -511,36 +509,30 @@ func TestFranzTxnEndFuncCallback(t *testing.T) {
 		Address:            addr,
 		Timeout:            5 * time.Second,
 		TransactionalWrite: true,
-	}, WithLogger(&integrationLogger{t}),
-		ksink.WithTxnEndFunc(func(txnID string, commit bool) { //nolint:staticcheck // testing backward compat
-			mu.Lock()
-			defer mu.Unlock()
-			callbackEvents = append(callbackEvents, txnEvent{txnID, commit})
-		}),
-	)
+	}, WithLogger(&integrationLogger{t}))
 	require.NoError(t, err)
 	require.NoError(t, srv.Start(context.Background()))
 	t.Cleanup(func() { srv.Close(context.Background()) }) //nolint:errcheck
 	waitForTCPReady(t, addr, 5*time.Second)
 
-	// Start a read loop that captures txn events from ReadBatch.
+	// Start a read loop that captures txn events from Read.
 	readCtx, readCancel := context.WithCancel(context.Background())
 	t.Cleanup(readCancel)
 	go func() {
 		for {
-			msgs, ack, err := srv.ReadBatch(readCtx)
+			event, ack, err := srv.Read(readCtx)
 			if err != nil {
 				return
 			}
-			for _, msg := range msgs {
-				if msg.TxnEvent != ksink.TxnNone {
-					mu.Lock()
-					readBatchEvents = append(readBatchEvents, txnEvent{
-						txnID:  msg.TransactionalID,
-						commit: msg.TxnEvent == ksink.TxnCommit,
-					})
-					mu.Unlock()
-				}
+			switch e := event.(type) {
+			case *ksink.TxnCommitEvent:
+				mu.Lock()
+				events = append(events, txnEvent{txnID: e.TransactionalID, commit: true})
+				mu.Unlock()
+			case *ksink.TxnAbortEvent:
+				mu.Lock()
+				events = append(events, txnEvent{txnID: e.TransactionalID, commit: false})
+				mu.Unlock()
 			}
 			ack(nil)
 		}
@@ -578,7 +570,7 @@ func TestFranzTxnEndFuncCallback(t *testing.T) {
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
 		mu.Lock()
-		n := len(readBatchEvents)
+		n := len(events)
 		mu.Unlock()
 		if n >= 2 {
 			break
@@ -589,24 +581,17 @@ func TestFranzTxnEndFuncCallback(t *testing.T) {
 	mu.Lock()
 	defer mu.Unlock()
 
-	// Verify events were delivered through ReadBatch.
-	require.Len(t, readBatchEvents, 2)
-	assert.Equal(t, "cb-commit", readBatchEvents[0].txnID)
-	assert.True(t, readBatchEvents[0].commit)
-	assert.Equal(t, "cb-abort", readBatchEvents[1].txnID)
-	assert.False(t, readBatchEvents[1].commit)
-
-	// Backward-compat: the deprecated callback should also have been called.
-	require.Len(t, callbackEvents, 2)
-	assert.Equal(t, "cb-commit", callbackEvents[0].txnID)
-	assert.True(t, callbackEvents[0].commit)
-	assert.Equal(t, "cb-abort", callbackEvents[1].txnID)
-	assert.False(t, callbackEvents[1].commit)
+	// Verify events were delivered through Read.
+	require.Len(t, events, 2)
+	assert.Equal(t, "cb-commit", events[0].txnID)
+	assert.True(t, events[0].commit)
+	assert.Equal(t, "cb-abort", events[1].txnID)
+	assert.False(t, events[1].commit)
 }
 
 // TestFranzTransactionalFileCommit verifies that messages produced inside a
 // committed transaction end up in the expected file on disk, using the
-// pull-based transaction flow via ReadBatch.
+// pull-based transaction flow via Read.
 func TestFranzTransactionalFileCommit(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -673,7 +658,7 @@ func TestFranzTransactionalFileCommit(t *testing.T) {
 
 // TestFranzTransactionalFileAbort verifies that messages produced inside an
 // aborted transaction are discarded and the temp file is removed, using the
-// pull-based transaction flow via ReadBatch.
+// pull-based transaction flow via Read.
 func TestFranzTransactionalFileAbort(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -731,7 +716,7 @@ func TestFranzTransactionalFileAbort(t *testing.T) {
 
 // TestFranzTransactionalFileCommitAndAbort verifies a scenario with two
 // concurrent transactions where one is committed and the other is aborted,
-// using the pull-based transaction flow via ReadBatch.
+// using the pull-based transaction flow via Read.
 func TestFranzTransactionalFileCommitAndAbort(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -818,7 +803,7 @@ func TestFranzTransactionalFileCommitAndAbort(t *testing.T) {
 // TestFranzZombieFencing verifies that when a new producer is created with the
 // same transactional.id while a transaction is in-flight, the old transaction
 // is aborted (zombie fencing) and the new producer can proceed. Transaction
-// events are delivered through ReadBatch.
+// events are delivered through Read.
 func TestFranzZombieFencing(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -842,24 +827,24 @@ func TestFranzZombieFencing(t *testing.T) {
 	t.Cleanup(func() { srv.Close(context.Background()) }) //nolint:errcheck
 	waitForTCPReady(t, addr, 5*time.Second)
 
-	// Start a read loop that captures txn events from ReadBatch.
+	// Start a read loop that captures txn events from Read.
 	readCtx, readCancel := context.WithCancel(context.Background())
 	t.Cleanup(readCancel)
 	go func() {
 		for {
-			msgs, ack, err := srv.ReadBatch(readCtx)
+			event, ack, err := srv.Read(readCtx)
 			if err != nil {
 				return
 			}
-			for _, msg := range msgs {
-				if msg.TxnEvent != ksink.TxnNone {
-					mu.Lock()
-					events = append(events, txnEvent{
-						txnID:  msg.TransactionalID,
-						commit: msg.TxnEvent == ksink.TxnCommit,
-					})
-					mu.Unlock()
-				}
+			switch e := event.(type) {
+			case *ksink.TxnCommitEvent:
+				mu.Lock()
+				events = append(events, txnEvent{txnID: e.TransactionalID, commit: true})
+				mu.Unlock()
+			case *ksink.TxnAbortEvent:
+				mu.Lock()
+				events = append(events, txnEvent{txnID: e.TransactionalID, commit: false})
+				mu.Unlock()
 			}
 			ack(nil)
 		}
@@ -1058,23 +1043,25 @@ func TestFranzTLS(t *testing.T) {
 	defer readCancel()
 	go func() {
 		for {
-			msgs, ack, err := srv.ReadBatch(readCtx)
+			event, ack, err := srv.Read(readCtx)
 			if err != nil {
 				return
 			}
-			for _, msg := range msgs {
-				rm := receivedMessage{
-					Topic:   msg.Topic,
-					Value:   string(msg.Value),
-					Headers: make(map[string]string),
+			if e, ok := event.(*ksink.MessagesEvent); ok {
+				for _, msg := range e.Messages {
+					rm := receivedMessage{
+						Topic:   msg.Topic,
+						Value:   string(msg.Value),
+						Headers: make(map[string]string),
+					}
+					if msg.Key != nil {
+						rm.Key = string(msg.Key)
+					}
+					for k, v := range msg.Headers {
+						rm.Headers[k] = v
+					}
+					capture.add(rm)
 				}
-				if msg.Key != nil {
-					rm.Key = string(msg.Key)
-				}
-				for k, v := range msg.Headers {
-					rm.Headers[k] = v
-				}
-				capture.add(rm)
 			}
 			ack(nil)
 		}
@@ -1213,23 +1200,25 @@ func TestFranzMTLS(t *testing.T) {
 	defer readCancel()
 	go func() {
 		for {
-			msgs, ack, err := srv.ReadBatch(readCtx)
+			event, ack, err := srv.Read(readCtx)
 			if err != nil {
 				return
 			}
-			for _, msg := range msgs {
-				rm := receivedMessage{
-					Topic:   msg.Topic,
-					Value:   string(msg.Value),
-					Headers: make(map[string]string),
+			if e, ok := event.(*ksink.MessagesEvent); ok {
+				for _, msg := range e.Messages {
+					rm := receivedMessage{
+						Topic:   msg.Topic,
+						Value:   string(msg.Value),
+						Headers: make(map[string]string),
+					}
+					if msg.Key != nil {
+						rm.Key = string(msg.Key)
+					}
+					for k, v := range msg.Headers {
+						rm.Headers[k] = v
+					}
+					capture.add(rm)
 				}
-				if msg.Key != nil {
-					rm.Key = string(msg.Key)
-				}
-				for k, v := range msg.Headers {
-					rm.Headers[k] = v
-				}
-				capture.add(rm)
 			}
 			ack(nil)
 		}
@@ -1308,7 +1297,7 @@ func TestFranzJSONOutputMatchesSchema(t *testing.T) {
 		Timeout: 5 * time.Second,
 	})
 
-	// Collect raw *ksink.Message from ReadBatch in a goroutine so that
+	// Collect raw *ksink.Message from Read in a goroutine so that
 	// ProduceSync (which waits for acks) does not deadlock.
 	type batchResult struct {
 		msgs []*ksink.Message
@@ -1316,13 +1305,17 @@ func TestFranzJSONOutputMatchesSchema(t *testing.T) {
 	}
 	batchCh := make(chan batchResult, 1)
 	go func() {
-		msgs, ack, err := srv.ReadBatch(ctx)
+		event, ack, err := srv.Read(ctx)
 		if err != nil {
 			batchCh <- batchResult{err: err}
 			return
 		}
 		ack(nil)
-		batchCh <- batchResult{msgs: msgs}
+		if e, ok := event.(*ksink.MessagesEvent); ok {
+			batchCh <- batchResult{msgs: e.Messages}
+		} else {
+			batchCh <- batchResult{err: fmt.Errorf("unexpected event type: %T", event)}
+		}
 	}()
 
 	client, err := kgo.NewClient(
@@ -1435,8 +1428,8 @@ func startReadLoop(t *testing.T, srv *Server) *messageCapture {
 	return integrationStartReadLoop(t, srv)
 }
 
-// startTxnReadLoop starts a goroutine that reads batches, writes data messages
-// through the given TransactionalWriter, and handles TxnCommit/TxnAbort events
+// startTxnReadLoop starts a goroutine that reads events, writes data messages
+// through the given TransactionalWriter, and handles TxnCommitEvent/TxnAbortEvent
 // by calling CommitTxn/AbortTxn on the same writer.
 func startTxnReadLoop(t *testing.T, srv *Server, tw output.TransactionalWriter) {
 	t.Helper()
@@ -1445,30 +1438,27 @@ func startTxnReadLoop(t *testing.T, srv *Server, tw output.TransactionalWriter) 
 
 	go func() {
 		for {
-			msgs, ack, err := srv.ReadBatch(ctx)
+			event, ack, err := srv.Read(ctx)
 			if err != nil {
 				return
 			}
 			var writeErr error
-			for _, msg := range msgs {
-				if msg.TxnEvent == ksink.TxnCommit {
-					if werr := tw.CommitTxn(msg.TransactionalID); werr != nil {
+			switch e := event.(type) {
+			case *ksink.MessagesEvent:
+				for _, msg := range e.Messages {
+					data := append([]byte(msg.Value), '\n')
+					if werr := tw.Write(data, msg); werr != nil {
 						writeErr = werr
 						break
 					}
-					continue
 				}
-				if msg.TxnEvent == ksink.TxnAbort {
-					if werr := tw.AbortTxn(msg.TransactionalID); werr != nil {
-						writeErr = werr
-						break
-					}
-					continue
-				}
-				data := append([]byte(msg.Value), '\n')
-				if werr := tw.Write(data, msg); werr != nil {
+			case *ksink.TxnCommitEvent:
+				if werr := tw.CommitTxn(e.TransactionalID); werr != nil {
 					writeErr = werr
-					break
+				}
+			case *ksink.TxnAbortEvent:
+				if werr := tw.AbortTxn(e.TransactionalID); werr != nil {
+					writeErr = werr
 				}
 			}
 			ack(writeErr)
@@ -1483,7 +1473,7 @@ func startFailReadLoop(t *testing.T, srv *Server, ackErr error) {
 
 	go func() {
 		for {
-			_, ack, err := srv.ReadBatch(ctx)
+			_, ack, err := srv.Read(ctx)
 			if err != nil {
 				return
 			}

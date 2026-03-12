@@ -49,18 +49,34 @@ const (
 	maxTxnStates = 10000
 )
 
-// TxnEvent describes a transaction lifecycle event delivered through [ReadBatch].
-// The zero value (TxnNone) means the message is a normal data message.
-type TxnEvent int8
+// Event is a sealed interface representing something received from a connected
+// producer.  Use a type switch to distinguish the concrete types:
+//
+//   - [*MessagesEvent]  — a batch of data messages
+//   - [*TxnCommitEvent] — a transaction was committed
+//   - [*TxnAbortEvent]  — a transaction was aborted
+type Event interface {
+	isEvent() // unexported marker – keeps the set closed
+}
 
-const (
-	// TxnNone indicates a normal data message (not a transaction event).
-	TxnNone TxnEvent = iota
-	// TxnCommit indicates the transaction identified by [Message.TransactionalID] was committed.
-	TxnCommit
-	// TxnAbort indicates the transaction identified by [Message.TransactionalID] was aborted.
-	TxnAbort
-)
+// MessagesEvent contains a batch of data messages received from a producer.
+type MessagesEvent struct {
+	Messages []*Message
+}
+
+// TxnCommitEvent indicates the transaction identified by TransactionalID was committed.
+type TxnCommitEvent struct {
+	TransactionalID string
+}
+
+// TxnAbortEvent indicates the transaction identified by TransactionalID was aborted.
+type TxnAbortEvent struct {
+	TransactionalID string
+}
+
+func (*MessagesEvent) isEvent()  {}
+func (*TxnCommitEvent) isEvent() {}
+func (*TxnAbortEvent) isEvent()  {}
 
 // Message represents a received Kafka message.
 type Message struct {
@@ -74,11 +90,6 @@ type Message struct {
 	Tombstone       bool
 	ClientAddr      string
 	TransactionalID string // non-empty when produced inside a transaction
-
-	// TxnEvent is non-zero when this message is a transaction lifecycle marker
-	// (commit or abort) rather than a data message. When set, the
-	// TransactionalID field identifies the transaction.
-	TxnEvent TxnEvent
 }
 
 // SASLCredential holds a SASL authentication credential.
@@ -168,10 +179,10 @@ type Logger interface {
 // Must be called exactly once per batch. Calling more than once is a no-op.
 type AckFunc func(err error)
 
-// pendingBatch is an internal type that pairs messages with an ack channel.
+// pendingBatch is an internal type that pairs an event with an ack channel.
 type pendingBatch struct {
-	messages []*Message
-	ackCh    chan error
+	event Event
+	ackCh chan error
 }
 
 // noopLogger discards all log messages.
@@ -192,11 +203,6 @@ func WithLogger(l Logger) Option {
 	}
 }
 
-// TxnEndFunc is called when a transactional producer commits or aborts a
-// transaction. txnID is the transactional ID and commit indicates whether
-// the transaction was committed (true) or aborted (false).
-type TxnEndFunc func(txnID string, commit bool)
-
 // txnState tracks the state of a transactional producer identified by its
 // transactional.id. It stores the assigned producer ID, the current epoch
 // (bumped on each InitProducerID call), and whether a transaction is
@@ -205,21 +211,6 @@ type txnState struct {
 	producerID int64
 	epoch      int16
 	active     bool // true between AddPartitionsToTxn and EndTxn
-}
-
-// WithTxnEndFunc registers a callback that is invoked when a transaction
-// ends. This allows output backends to take action on commit (e.g. rename
-// a temporary file) or abort (e.g. delete a temporary file).
-//
-// Deprecated: Transaction events are now delivered through [ReadBatch] as
-// messages with a non-zero [Message.TxnEvent] field. Handle commit/abort in
-// the ReadBatch loop instead. When a TxnEndFunc is registered, it is still
-// called for backward compatibility, but new code should use the pull-based
-// approach.
-func WithTxnEndFunc(fn TxnEndFunc) Option {
-	return func(s *Server) {
-		s.txnEndFn = fn
-	}
 }
 
 // Server is a Kafka-protocol-compatible server that accepts produce requests.
@@ -251,9 +242,6 @@ type Server struct {
 	// Transaction state tracking: maps transactional.id -> txnState
 	txnMu     sync.Mutex
 	txnStates map[string]*txnState
-
-	// Transaction end callback
-	txnEndFn TxnEndFunc
 
 	// Decompressor for parsing record batches
 	decompressor kgo.Decompressor
@@ -417,13 +405,23 @@ func (s *Server) Addr() net.Addr {
 	return s.listener.Addr()
 }
 
-// ReadBatch blocks until a batch of messages is available from a connected
-// producer, or the context is cancelled, or the server is closed.
+// Read blocks until an event is available from a connected producer, or the
+// context is cancelled, or the server is closed.
 //
-// Returns the messages, an [AckFunc] to acknowledge processing, and any error.
-// The caller must call the AckFunc after processing the messages — pass nil to
-// indicate success, or an error to reject the batch.
-func (s *Server) ReadBatch(ctx context.Context) ([]*Message, AckFunc, error) {
+// Returns the [Event], an [AckFunc] to acknowledge processing, and any error.
+// Use a type switch to handle the concrete event types:
+//
+//	event, ack, err := srv.Read(ctx)
+//	switch e := event.(type) {
+//	case *ksink.MessagesEvent:
+//	    for _, msg := range e.Messages { /* handle data */ }
+//	case *ksink.TxnCommitEvent:
+//	    commitTxn(e.TransactionalID)
+//	case *ksink.TxnAbortEvent:
+//	    abortTxn(e.TransactionalID)
+//	}
+//	ack(nil)
+func (s *Server) Read(ctx context.Context) (Event, AckFunc, error) {
 	select {
 	case <-ctx.Done():
 		return nil, nil, ctx.Err()
@@ -436,7 +434,29 @@ func (s *Server) ReadBatch(ctx context.Context) ([]*Message, AckFunc, error) {
 			default:
 			}
 		}
-		return batch.messages, ack, nil
+		return batch.event, ack, nil
+	}
+}
+
+// ReadBatch blocks until a batch of messages is available from a connected
+// producer, or the context is cancelled, or the server is closed.
+//
+// Deprecated: Use [Read] instead, which returns typed [Event] values.
+// ReadBatch only returns [*MessagesEvent] batches and silently acknowledges
+// transaction lifecycle events.
+func (s *Server) ReadBatch(ctx context.Context) ([]*Message, AckFunc, error) {
+	for {
+		event, ack, err := s.Read(ctx)
+		if err != nil {
+			return nil, nil, err
+		}
+		switch e := event.(type) {
+		case *MessagesEvent:
+			return e.Messages, ack, nil
+		default:
+			// Silently ack non-message events so legacy callers don't block.
+			ack(nil)
+		}
 	}
 }
 

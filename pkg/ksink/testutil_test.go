@@ -65,8 +65,8 @@ func (mc *messageCapture) add(msg receivedMessage) {
 	mc.messages = append(mc.messages, msg)
 }
 
-// startReadLoop starts a goroutine that reads batches from the server and
-// captures messages. It acknowledges each batch with nil (success).
+// startReadLoop starts a goroutine that reads events from the server and
+// captures messages. It acknowledges each event with nil (success).
 func startReadLoop(t *testing.T, srv *Server) *messageCapture {
 	t.Helper()
 	capture := &messageCapture{}
@@ -75,23 +75,25 @@ func startReadLoop(t *testing.T, srv *Server) *messageCapture {
 
 	go func() {
 		for {
-			msgs, ack, err := srv.ReadBatch(ctx)
+			event, ack, err := srv.Read(ctx)
 			if err != nil {
 				return
 			}
-			for _, msg := range msgs {
-				rm := receivedMessage{
-					Topic:   msg.Topic,
-					Value:   string(msg.Value),
-					Headers: make(map[string]string),
+			if e, ok := event.(*MessagesEvent); ok {
+				for _, msg := range e.Messages {
+					rm := receivedMessage{
+						Topic:   msg.Topic,
+						Value:   string(msg.Value),
+						Headers: make(map[string]string),
+					}
+					if msg.Key != nil {
+						rm.Key = string(msg.Key)
+					}
+					for k, v := range msg.Headers {
+						rm.Headers[k] = v
+					}
+					capture.add(rm)
 				}
-				if msg.Key != nil {
-					rm.Key = string(msg.Key)
-				}
-				for k, v := range msg.Headers {
-					rm.Headers[k] = v
-				}
-				capture.add(rm)
 			}
 			ack(nil)
 		}

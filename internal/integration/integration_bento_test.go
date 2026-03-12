@@ -214,20 +214,22 @@ output:
 
 	go func() {
 		for {
-			msgs, ack, readErr := srv.ReadBatch(readCtx)
+			event, ack, readErr := srv.Read(readCtx)
 			if readErr != nil {
 				return
 			}
 			var writeErr error
-			for _, msg := range msgs {
-				data, fmtErr := fmtr.Format(msg)
-				if fmtErr != nil {
-					writeErr = fmtErr
-					break
-				}
-				if wErr := httpWriter.Write(data, msg); wErr != nil {
-					writeErr = wErr
-					break
+			if e, ok := event.(*ksink.MessagesEvent); ok {
+				for _, msg := range e.Messages {
+					data, fmtErr := fmtr.Format(msg)
+					if fmtErr != nil {
+						writeErr = fmtErr
+						break
+					}
+					if wErr := httpWriter.Write(data, msg); wErr != nil {
+						writeErr = wErr
+						break
+					}
 				}
 			}
 			ack(writeErr)

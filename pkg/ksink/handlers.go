@@ -199,7 +199,7 @@ func (s *Server) handleProduce(ctx context.Context, conn net.Conn, connID uint64
 	// Deliver batch via channel and wait for ack
 	var handlerErr error
 	if len(allMsgs) > 0 {
-		handlerErr = s.deliverBatch(ctx, allMsgs)
+		handlerErr = s.deliverEvent(ctx, &MessagesEvent{Messages: allMsgs})
 		if handlerErr != nil {
 			s.logger.Errorf("[conn:%d] Batch processing error: %v", connID, handlerErr)
 		}
@@ -236,11 +236,11 @@ func (s *Server) handleProduce(ctx context.Context, conn net.Conn, connID uint64
 	return s.sendResponse(conn, connID, correlationID, resp)
 }
 
-// deliverBatch sends a batch to ReadBatch and waits for the ack.
-func (s *Server) deliverBatch(ctx context.Context, msgs []*Message) error {
+// deliverEvent sends an event to Read and waits for the ack.
+func (s *Server) deliverEvent(ctx context.Context, evt Event) error {
 	pending := pendingBatch{
-		messages: msgs,
-		ackCh:    make(chan error, 1),
+		event: evt,
+		ackCh: make(chan error, 1),
 	}
 	select {
 	case s.batchCh <- pending:
@@ -316,18 +316,9 @@ func (s *Server) handleInitProducerId(ctx context.Context, conn net.Conn, connID
 
 			// Invoke the callback outside the lock to avoid deadlocks.
 			if needsAbort {
-				// Deliver abort marker through ReadBatch.
-				abortMsg := &Message{
-					TransactionalID: txnID,
-					TxnEvent:        TxnAbort,
-				}
-				if err := s.deliverBatch(ctx, []*Message{abortMsg}); err != nil {
+				// Deliver abort event through Read.
+				if err := s.deliverEvent(ctx, &TxnAbortEvent{TransactionalID: txnID}); err != nil {
 					s.logger.Errorf("[conn:%d] InitProducerId: failed to deliver zombie abort event: %v", connID, err)
-				}
-
-				// Backward compatibility: still invoke the callback if registered.
-				if s.txnEndFn != nil {
-					s.txnEndFn(txnID, false)
 				}
 			}
 
@@ -539,23 +530,16 @@ func (s *Server) handleEndTxn(ctx context.Context, conn net.Conn, connID uint64,
 		return s.sendResponse(conn, connID, correlationID, resp)
 	}
 
-	// Deliver a transaction-end marker through ReadBatch so the consumer
+	// Deliver a transaction-end event through Read so the consumer
 	// can handle commit/abort as part of the pull-based flow.
-	evt := TxnCommit
-	if !req.Commit {
-		evt = TxnAbort
+	var evt Event
+	if req.Commit {
+		evt = &TxnCommitEvent{TransactionalID: req.TransactionalID}
+	} else {
+		evt = &TxnAbortEvent{TransactionalID: req.TransactionalID}
 	}
-	txnMsg := &Message{
-		TransactionalID: req.TransactionalID,
-		TxnEvent:        evt,
-	}
-	if err := s.deliverBatch(ctx, []*Message{txnMsg}); err != nil {
+	if err := s.deliverEvent(ctx, evt); err != nil {
 		s.logger.Errorf("[conn:%d] EndTxn: failed to deliver txn event: %v", connID, err)
-	}
-
-	// Backward compatibility: still invoke the callback if registered.
-	if s.txnEndFn != nil {
-		s.txnEndFn(req.TransactionalID, req.Commit)
 	}
 
 	s.logger.Debugf("[conn:%d] EndTxn: txnID=%s, action=%s", connID, req.TransactionalID, action)

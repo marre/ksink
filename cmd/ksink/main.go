@@ -238,38 +238,37 @@ func run(addr, dst, fmtName, fmtStr string, jsonB64Key, jsonB64Val bool, separat
 	txnWriter, _ := w.(output.TransactionalWriter)
 	go func() {
 		for {
-			msgs, ack, readErr := srv.ReadBatch(ctx)
+			event, ack, readErr := srv.Read(ctx)
 			if readErr != nil {
 				return
 			}
 
 			var writeErr error
-			for _, msg := range msgs {
-				// Handle transaction lifecycle events.
-				if msg.TxnEvent != ksink.TxnNone && txnWriter != nil {
-					if msg.TxnEvent == ksink.TxnCommit {
-						if err := txnWriter.CommitTxn(msg.TransactionalID); err != nil {
-							writeErr = fmt.Errorf("failed to commit txn %s: %w", msg.TransactionalID, err)
-							break
-						}
-					} else if msg.TxnEvent == ksink.TxnAbort {
-						if err := txnWriter.AbortTxn(msg.TransactionalID); err != nil {
-							writeErr = fmt.Errorf("failed to abort txn %s: %w", msg.TransactionalID, err)
-							break
-						}
+			switch e := event.(type) {
+			case *ksink.MessagesEvent:
+				for _, msg := range e.Messages {
+					data, err := fmtr.Format(msg)
+					if err != nil {
+						writeErr = fmt.Errorf("failed to format message: %w", err)
+						break
 					}
-					continue
-				}
 
-				data, err := fmtr.Format(msg)
-				if err != nil {
-					writeErr = fmt.Errorf("failed to format message: %w", err)
-					break
+					if err := w.Write(data, msg); err != nil {
+						writeErr = fmt.Errorf("failed to write message: %w", err)
+						break
+					}
 				}
-
-				if err := w.Write(data, msg); err != nil {
-					writeErr = fmt.Errorf("failed to write message: %w", err)
-					break
+			case *ksink.TxnCommitEvent:
+				if txnWriter != nil {
+					if err := txnWriter.CommitTxn(e.TransactionalID); err != nil {
+						writeErr = fmt.Errorf("failed to commit txn %s: %w", e.TransactionalID, err)
+					}
+				}
+			case *ksink.TxnAbortEvent:
+				if txnWriter != nil {
+					if err := txnWriter.AbortTxn(e.TransactionalID); err != nil {
+						writeErr = fmt.Errorf("failed to abort txn %s: %w", e.TransactionalID, err)
+					}
 				}
 			}
 
