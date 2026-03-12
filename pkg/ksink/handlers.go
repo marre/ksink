@@ -314,9 +314,8 @@ func (s *Server) handleInitProducerId(ctx context.Context, conn net.Conn, connID
 			epoch := existing.epoch
 			s.txnMu.Unlock()
 
-			// Invoke the callback outside the lock to avoid deadlocks.
+			// Deliver the abort event outside the lock to avoid deadlocks.
 			if needsAbort {
-				// Deliver abort event through Read.
 				if err := s.deliverEvent(ctx, &TxnAbortEvent{TransactionalID: txnID}); err != nil {
 					s.logger.Errorf("[conn:%d] InitProducerId: failed to deliver zombie abort event: %v", connID, err)
 				}
@@ -540,6 +539,8 @@ func (s *Server) handleEndTxn(ctx context.Context, conn net.Conn, connID uint64,
 	}
 	if err := s.deliverEvent(ctx, evt); err != nil {
 		s.logger.Errorf("[conn:%d] EndTxn: failed to deliver txn event: %v", connID, err)
+		resp.ErrorCode = kerr.UnknownServerError.Code
+		return s.sendResponse(conn, connID, correlationID, resp)
 	}
 
 	s.logger.Debugf("[conn:%d] EndTxn: txnID=%s, action=%s", connID, req.TransactionalID, action)

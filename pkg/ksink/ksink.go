@@ -173,10 +173,13 @@ type Logger interface {
 	Errorf(format string, args ...any)
 }
 
-// AckFunc is called to acknowledge processing of a message batch.
-// Pass nil to indicate success (success response sent to the producer).
-// Pass an error to reject the batch (error response sent to the producer).
-// Must be called exactly once per batch. Calling more than once is a no-op.
+// AckFunc is called to acknowledge processing of an [Event] returned by [Read].
+// Pass nil to indicate success. Pass an error to indicate failure.
+// For [*MessagesEvent], the result is sent back to the producer as a produce
+// response (success or error). For [*TxnCommitEvent] and [*TxnAbortEvent], an
+// error causes the EndTxn response to report [kerr.UnknownServerError] to the
+// producer.
+// Must be called exactly once per event. Calling more than once is a no-op.
 type AckFunc func(err error)
 
 // pendingBatch is an internal type that pairs an event with an ack channel.
