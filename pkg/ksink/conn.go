@@ -171,7 +171,7 @@ func (s *Server) handleConnection(ctx context.Context, conn net.Conn, connID uin
 			if err := req.ReadFrom(bodyData); err != nil {
 				handleErr = fmt.Errorf("failed to parse init producer id request: %w", err)
 			} else {
-				handleErr = s.handleInitProducerId(conn, connID, correlationID, apiVersion, req, state)
+				handleErr = s.handleInitProducerId(ctx, conn, connID, correlationID, apiVersion, req, state)
 			}
 		case *kmsg.FindCoordinatorRequest:
 			if err := req.ReadFrom(bodyData); err != nil {
@@ -189,7 +189,7 @@ func (s *Server) handleConnection(ctx context.Context, conn net.Conn, connID uin
 			if err := req.ReadFrom(bodyData); err != nil {
 				handleErr = fmt.Errorf("failed to parse end txn request: %w", err)
 			} else {
-				handleErr = s.handleEndTxn(conn, connID, correlationID, apiVersion, req, state)
+				handleErr = s.handleEndTxn(ctx, conn, connID, correlationID, apiVersion, req, state)
 			}
 		default:
 			s.logger.Warnf("[conn:%d] Unsupported API key: %d", connID, apiKey)

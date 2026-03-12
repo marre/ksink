@@ -10,7 +10,6 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
-	"log"
 	"math/big"
 	"net"
 	"os"
@@ -491,9 +490,9 @@ func TestFranzTransactionalProducerAbort(t *testing.T) {
 	assert.Equal(t, "aborted-message", msgs[0].Value)
 }
 
-// TestFranzTxnEndFuncCallback verifies that the TxnEndFunc callback is invoked
-// with the correct txnID and commit flag for both commit and abort.
-func TestFranzTxnEndFuncCallback(t *testing.T) {
+// TestFranzTxnEvents verifies that transaction commit and abort events
+// are delivered through the pull-based Read API with the correct event types.
+func TestFranzTxnEvents(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
@@ -510,26 +509,30 @@ func TestFranzTxnEndFuncCallback(t *testing.T) {
 		Address:            addr,
 		Timeout:            5 * time.Second,
 		TransactionalWrite: true,
-	}, WithLogger(&integrationLogger{t}),
-		ksink.WithTxnEndFunc(func(txnID string, commit bool) {
-			mu.Lock()
-			defer mu.Unlock()
-			events = append(events, txnEvent{txnID, commit})
-		}),
-	)
+	}, WithLogger(&integrationLogger{t}))
 	require.NoError(t, err)
 	require.NoError(t, srv.Start(context.Background()))
 	t.Cleanup(func() { srv.Close(context.Background()) }) //nolint:errcheck
 	waitForTCPReady(t, addr, 5*time.Second)
 
-	// Start a read loop that acks all batches.
+	// Start a read loop that captures txn events from Read.
 	readCtx, readCancel := context.WithCancel(context.Background())
 	t.Cleanup(readCancel)
 	go func() {
 		for {
-			_, ack, err := srv.ReadBatch(readCtx)
+			event, ack, err := srv.Read(readCtx)
 			if err != nil {
 				return
+			}
+			switch e := event.(type) {
+			case *ksink.TxnCommitEvent:
+				mu.Lock()
+				events = append(events, txnEvent{txnID: e.TransactionalID, commit: true})
+				mu.Unlock()
+			case *ksink.TxnAbortEvent:
+				mu.Lock()
+				events = append(events, txnEvent{txnID: e.TransactionalID, commit: false})
+				mu.Unlock()
 			}
 			ack(nil)
 		}
@@ -563,7 +566,7 @@ func TestFranzTxnEndFuncCallback(t *testing.T) {
 	require.NoError(t, results[0].Err)
 	require.NoError(t, client2.EndTransaction(ctx, kgo.TryAbort))
 
-	// Poll for both callbacks with timeout instead of fixed sleep.
+	// Poll for both events with timeout.
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
 		mu.Lock()
@@ -577,6 +580,8 @@ func TestFranzTxnEndFuncCallback(t *testing.T) {
 
 	mu.Lock()
 	defer mu.Unlock()
+
+	// Verify events were delivered through Read.
 	require.Len(t, events, 2)
 	assert.Equal(t, "cb-commit", events[0].txnID)
 	assert.True(t, events[0].commit)
@@ -585,7 +590,8 @@ func TestFranzTxnEndFuncCallback(t *testing.T) {
 }
 
 // TestFranzTransactionalFileCommit verifies that messages produced inside a
-// committed transaction end up in the expected file on disk.
+// committed transaction end up in the expected file on disk, using the
+// pull-based transaction flow via Read.
 func TestFranzTransactionalFileCommit(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -604,44 +610,13 @@ func TestFranzTransactionalFileCommit(t *testing.T) {
 		Address:            addr,
 		Timeout:            5 * time.Second,
 		TransactionalWrite: true,
-	}, WithLogger(&integrationLogger{t}),
-		ksink.WithTxnEndFunc(func(txnID string, commit bool) {
-			if commit {
-				if err := tw.CommitTxn(txnID); err != nil {
-					log.Printf("[ERROR] commit txn %s: %v", txnID, err)
-				}
-			} else {
-				if err := tw.AbortTxn(txnID); err != nil {
-					log.Printf("[ERROR] abort txn %s: %v", txnID, err)
-				}
-			}
-		}),
-	)
+	}, WithLogger(&integrationLogger{t}))
 	require.NoError(t, err)
 	require.NoError(t, srv.Start(context.Background()))
 	t.Cleanup(func() { srv.Close(context.Background()) }) //nolint:errcheck
 	waitForTCPReady(t, addr, 5*time.Second)
 
-	// Start a read loop that writes formatted data through the txn writer.
-	readCtx, readCancel := context.WithCancel(context.Background())
-	t.Cleanup(readCancel)
-	go func() {
-		for {
-			msgs, ack, err := srv.ReadBatch(readCtx)
-			if err != nil {
-				return
-			}
-			var writeErr error
-			for _, msg := range msgs {
-				data := append([]byte(msg.Value), '\n')
-				if werr := tw.Write(data, msg); werr != nil {
-					writeErr = werr
-					break
-				}
-			}
-			ack(writeErr)
-		}
-	}()
+	startTxnReadLoop(t, srv, tw)
 
 	// Produce two messages in a committed transaction.
 	client, err := kgo.NewClient(
@@ -682,7 +657,8 @@ func TestFranzTransactionalFileCommit(t *testing.T) {
 }
 
 // TestFranzTransactionalFileAbort verifies that messages produced inside an
-// aborted transaction are discarded and the temp file is removed.
+// aborted transaction are discarded and the temp file is removed, using the
+// pull-based transaction flow via Read.
 func TestFranzTransactionalFileAbort(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -701,43 +677,13 @@ func TestFranzTransactionalFileAbort(t *testing.T) {
 		Address:            addr,
 		Timeout:            5 * time.Second,
 		TransactionalWrite: true,
-	}, WithLogger(&integrationLogger{t}),
-		ksink.WithTxnEndFunc(func(txnID string, commit bool) {
-			if commit {
-				if err := tw.CommitTxn(txnID); err != nil {
-					log.Printf("[ERROR] commit txn %s: %v", txnID, err)
-				}
-			} else {
-				if err := tw.AbortTxn(txnID); err != nil {
-					log.Printf("[ERROR] abort txn %s: %v", txnID, err)
-				}
-			}
-		}),
-	)
+	}, WithLogger(&integrationLogger{t}))
 	require.NoError(t, err)
 	require.NoError(t, srv.Start(context.Background()))
 	t.Cleanup(func() { srv.Close(context.Background()) }) //nolint:errcheck
 	waitForTCPReady(t, addr, 5*time.Second)
 
-	readCtx, readCancel := context.WithCancel(context.Background())
-	t.Cleanup(readCancel)
-	go func() {
-		for {
-			msgs, ack, err := srv.ReadBatch(readCtx)
-			if err != nil {
-				return
-			}
-			var writeErr error
-			for _, msg := range msgs {
-				data := append([]byte(msg.Value), '\n')
-				if werr := tw.Write(data, msg); werr != nil {
-					writeErr = werr
-					break
-				}
-			}
-			ack(writeErr)
-		}
-	}()
+	startTxnReadLoop(t, srv, tw)
 
 	// Produce a message inside an aborted transaction.
 	client, err := kgo.NewClient(
@@ -769,7 +715,8 @@ func TestFranzTransactionalFileAbort(t *testing.T) {
 }
 
 // TestFranzTransactionalFileCommitAndAbort verifies a scenario with two
-// concurrent transactions where one is committed and the other is aborted.
+// concurrent transactions where one is committed and the other is aborted,
+// using the pull-based transaction flow via Read.
 func TestFranzTransactionalFileCommitAndAbort(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -788,43 +735,13 @@ func TestFranzTransactionalFileCommitAndAbort(t *testing.T) {
 		Address:            addr,
 		Timeout:            5 * time.Second,
 		TransactionalWrite: true,
-	}, WithLogger(&integrationLogger{t}),
-		ksink.WithTxnEndFunc(func(txnID string, commit bool) {
-			if commit {
-				if err := tw.CommitTxn(txnID); err != nil {
-					log.Printf("[ERROR] commit txn %s: %v", txnID, err)
-				}
-			} else {
-				if err := tw.AbortTxn(txnID); err != nil {
-					log.Printf("[ERROR] abort txn %s: %v", txnID, err)
-				}
-			}
-		}),
-	)
+	}, WithLogger(&integrationLogger{t}))
 	require.NoError(t, err)
 	require.NoError(t, srv.Start(context.Background()))
 	t.Cleanup(func() { srv.Close(context.Background()) }) //nolint:errcheck
 	waitForTCPReady(t, addr, 5*time.Second)
 
-	readCtx, readCancel := context.WithCancel(context.Background())
-	t.Cleanup(readCancel)
-	go func() {
-		for {
-			msgs, ack, err := srv.ReadBatch(readCtx)
-			if err != nil {
-				return
-			}
-			var writeErr error
-			for _, msg := range msgs {
-				data := append([]byte(msg.Value), '\n')
-				if werr := tw.Write(data, msg); werr != nil {
-					writeErr = werr
-					break
-				}
-			}
-			ack(writeErr)
-		}
-	}()
+	startTxnReadLoop(t, srv, tw)
 
 	// Transaction 1: commit
 	client1, err := kgo.NewClient(
@@ -885,7 +802,8 @@ func TestFranzTransactionalFileCommitAndAbort(t *testing.T) {
 
 // TestFranzZombieFencing verifies that when a new producer is created with the
 // same transactional.id while a transaction is in-flight, the old transaction
-// is aborted (zombie fencing) and the new producer can proceed.
+// is aborted (zombie fencing) and the new producer can proceed. Transaction
+// events are delivered through Read.
 func TestFranzZombieFencing(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -903,26 +821,30 @@ func TestFranzZombieFencing(t *testing.T) {
 		Address:            addr,
 		Timeout:            5 * time.Second,
 		TransactionalWrite: true,
-	}, WithLogger(&integrationLogger{t}),
-		ksink.WithTxnEndFunc(func(txnID string, commit bool) {
-			mu.Lock()
-			defer mu.Unlock()
-			events = append(events, txnEvent{txnID, commit})
-		}),
-	)
+	}, WithLogger(&integrationLogger{t}))
 	require.NoError(t, err)
 	require.NoError(t, srv.Start(context.Background()))
 	t.Cleanup(func() { srv.Close(context.Background()) }) //nolint:errcheck
 	waitForTCPReady(t, addr, 5*time.Second)
 
-	// Start a read loop that acks all batches.
+	// Start a read loop that captures txn events from Read.
 	readCtx, readCancel := context.WithCancel(context.Background())
 	t.Cleanup(readCancel)
 	go func() {
 		for {
-			_, ack, err := srv.ReadBatch(readCtx)
+			event, ack, err := srv.Read(readCtx)
 			if err != nil {
 				return
+			}
+			switch e := event.(type) {
+			case *ksink.TxnCommitEvent:
+				mu.Lock()
+				events = append(events, txnEvent{txnID: e.TransactionalID, commit: true})
+				mu.Unlock()
+			case *ksink.TxnAbortEvent:
+				mu.Lock()
+				events = append(events, txnEvent{txnID: e.TransactionalID, commit: false})
+				mu.Unlock()
 			}
 			ack(nil)
 		}
@@ -1121,23 +1043,25 @@ func TestFranzTLS(t *testing.T) {
 	defer readCancel()
 	go func() {
 		for {
-			msgs, ack, err := srv.ReadBatch(readCtx)
+			event, ack, err := srv.Read(readCtx)
 			if err != nil {
 				return
 			}
-			for _, msg := range msgs {
-				rm := receivedMessage{
-					Topic:   msg.Topic,
-					Value:   string(msg.Value),
-					Headers: make(map[string]string),
+			if e, ok := event.(*ksink.MessagesEvent); ok {
+				for _, msg := range e.Messages {
+					rm := receivedMessage{
+						Topic:   msg.Topic,
+						Value:   string(msg.Value),
+						Headers: make(map[string]string),
+					}
+					if msg.Key != nil {
+						rm.Key = string(msg.Key)
+					}
+					for k, v := range msg.Headers {
+						rm.Headers[k] = v
+					}
+					capture.add(rm)
 				}
-				if msg.Key != nil {
-					rm.Key = string(msg.Key)
-				}
-				for k, v := range msg.Headers {
-					rm.Headers[k] = v
-				}
-				capture.add(rm)
 			}
 			ack(nil)
 		}
@@ -1276,23 +1200,25 @@ func TestFranzMTLS(t *testing.T) {
 	defer readCancel()
 	go func() {
 		for {
-			msgs, ack, err := srv.ReadBatch(readCtx)
+			event, ack, err := srv.Read(readCtx)
 			if err != nil {
 				return
 			}
-			for _, msg := range msgs {
-				rm := receivedMessage{
-					Topic:   msg.Topic,
-					Value:   string(msg.Value),
-					Headers: make(map[string]string),
+			if e, ok := event.(*ksink.MessagesEvent); ok {
+				for _, msg := range e.Messages {
+					rm := receivedMessage{
+						Topic:   msg.Topic,
+						Value:   string(msg.Value),
+						Headers: make(map[string]string),
+					}
+					if msg.Key != nil {
+						rm.Key = string(msg.Key)
+					}
+					for k, v := range msg.Headers {
+						rm.Headers[k] = v
+					}
+					capture.add(rm)
 				}
-				if msg.Key != nil {
-					rm.Key = string(msg.Key)
-				}
-				for k, v := range msg.Headers {
-					rm.Headers[k] = v
-				}
-				capture.add(rm)
 			}
 			ack(nil)
 		}
@@ -1371,7 +1297,7 @@ func TestFranzJSONOutputMatchesSchema(t *testing.T) {
 		Timeout: 5 * time.Second,
 	})
 
-	// Collect raw *ksink.Message from ReadBatch in a goroutine so that
+	// Collect raw *ksink.Message from Read in a goroutine so that
 	// ProduceSync (which waits for acks) does not deadlock.
 	type batchResult struct {
 		msgs []*ksink.Message
@@ -1379,13 +1305,17 @@ func TestFranzJSONOutputMatchesSchema(t *testing.T) {
 	}
 	batchCh := make(chan batchResult, 1)
 	go func() {
-		msgs, ack, err := srv.ReadBatch(ctx)
+		event, ack, err := srv.Read(ctx)
 		if err != nil {
 			batchCh <- batchResult{err: err}
 			return
 		}
 		ack(nil)
-		batchCh <- batchResult{msgs: msgs}
+		if e, ok := event.(*ksink.MessagesEvent); ok {
+			batchCh <- batchResult{msgs: e.Messages}
+		} else {
+			batchCh <- batchResult{err: fmt.Errorf("unexpected event type: %T", event)}
+		}
 	}()
 
 	client, err := kgo.NewClient(
@@ -1498,6 +1428,44 @@ func startReadLoop(t *testing.T, srv *Server) *messageCapture {
 	return integrationStartReadLoop(t, srv)
 }
 
+// startTxnReadLoop starts a goroutine that reads events, writes data messages
+// through the given TransactionalWriter, and handles TxnCommitEvent/TxnAbortEvent
+// by calling CommitTxn/AbortTxn on the same writer.
+func startTxnReadLoop(t *testing.T, srv *Server, tw output.TransactionalWriter) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	go func() {
+		for {
+			event, ack, err := srv.Read(ctx)
+			if err != nil {
+				return
+			}
+			var writeErr error
+			switch e := event.(type) {
+			case *ksink.MessagesEvent:
+				for _, msg := range e.Messages {
+					data := append([]byte(msg.Value), '\n')
+					if werr := tw.Write(data, msg); werr != nil {
+						writeErr = werr
+						break
+					}
+				}
+			case *ksink.TxnCommitEvent:
+				if werr := tw.CommitTxn(e.TransactionalID); werr != nil {
+					writeErr = werr
+				}
+			case *ksink.TxnAbortEvent:
+				if werr := tw.AbortTxn(e.TransactionalID); werr != nil {
+					writeErr = werr
+				}
+			}
+			ack(writeErr)
+		}
+	}()
+}
+
 func startFailReadLoop(t *testing.T, srv *Server, ackErr error) {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
@@ -1505,7 +1473,7 @@ func startFailReadLoop(t *testing.T, srv *Server, ackErr error) {
 
 	go func() {
 		for {
-			_, ack, err := srv.ReadBatch(ctx)
+			_, ack, err := srv.Read(ctx)
 			if err != nil {
 				return
 			}

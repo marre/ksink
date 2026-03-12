@@ -319,20 +319,20 @@ func TestValidateSASLPlain(t *testing.T) {
 	}
 }
 
-func TestReadBatchContextCancelled(t *testing.T) {
+func TestReadContextCancelled(t *testing.T) {
 	srv, err := New(Config{Address: "127.0.0.1:0"})
 	require.NoError(t, err)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // cancel immediately
 
-	msgs, ack, err := srv.ReadBatch(ctx)
-	assert.Nil(t, msgs)
+	event, ack, err := srv.Read(ctx)
+	assert.Nil(t, event)
 	assert.Nil(t, ack)
 	assert.ErrorIs(t, err, context.Canceled)
 }
 
-func TestReadBatchServerClosed(t *testing.T) {
+func TestReadServerClosed(t *testing.T) {
 	srv, err := New(Config{Address: "127.0.0.1:0"})
 	require.NoError(t, err)
 
@@ -342,8 +342,8 @@ func TestReadBatchServerClosed(t *testing.T) {
 	// Close the server
 	require.NoError(t, srv.Close(context.Background()))
 
-	msgs, ack, err := srv.ReadBatch(context.Background())
-	assert.Nil(t, msgs)
+	event, ack, err := srv.Read(context.Background())
+	assert.Nil(t, event)
 	assert.Nil(t, ack)
 	assert.ErrorIs(t, err, ErrServerClosed)
 }
@@ -417,24 +417,35 @@ func TestTxnStateZombieFencing(t *testing.T) {
 	// Verify that zombie fencing aborts an in-flight transaction and bumps
 	// the epoch when InitProducerID is called with an existing txnID.
 	var (
-		aborted []string
-		mu      sync.Mutex
+		abortedIDs []string
+		mu         sync.Mutex
 	)
 	srv, err := New(Config{
 		Address:            "127.0.0.1:0",
 		TransactionalWrite: true,
 		Timeout:            5 * time.Second,
-	}, WithLogger(&testLogger{t}), WithTxnEndFunc(func(txnID string, commit bool) {
-		mu.Lock()
-		defer mu.Unlock()
-		if !commit {
-			aborted = append(aborted, txnID)
-		}
-	}))
+	}, WithLogger(&testLogger{t}))
 	require.NoError(t, err)
 	require.NoError(t, srv.Start(context.Background()))
 	defer srv.Close(context.Background()) //nolint:errcheck
-	startReadLoop(t, srv)
+
+	// Start a read loop that captures abort events.
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	go func() {
+		for {
+			event, ack, err := srv.Read(ctx)
+			if err != nil {
+				return
+			}
+			if e, ok := event.(*TxnAbortEvent); ok {
+				mu.Lock()
+				abortedIDs = append(abortedIDs, e.TransactionalID)
+				mu.Unlock()
+			}
+			ack(nil)
+		}
+	}()
 
 	addr := srv.Addr().String()
 	waitForTCPReady(t, addr, 5*time.Second)
@@ -463,7 +474,7 @@ func TestTxnStateZombieFencing(t *testing.T) {
 	assert.Equal(t, pid, resp2.ProducerID, "should reuse the same producer ID")
 	assert.Equal(t, int16(1), resp2.ProducerEpoch, "epoch should be bumped")
 	mu.Lock()
-	assert.Equal(t, []string{"txn-fence"}, aborted, "in-flight txn should have been aborted")
+	assert.Equal(t, []string{"txn-fence"}, abortedIDs, "in-flight txn should have been aborted")
 	mu.Unlock()
 }
 
@@ -471,24 +482,35 @@ func TestTxnStateEpochBumpNoActiveTransaction(t *testing.T) {
 	// When InitProducerID is called for an existing txnID that does not
 	// have an active transaction, the epoch is bumped but no abort is fired.
 	var (
-		aborted []string
-		mu      sync.Mutex
+		abortedIDs []string
+		mu         sync.Mutex
 	)
 	srv, err := New(Config{
 		Address:            "127.0.0.1:0",
 		TransactionalWrite: true,
 		Timeout:            5 * time.Second,
-	}, WithLogger(&testLogger{t}), WithTxnEndFunc(func(txnID string, commit bool) {
-		mu.Lock()
-		defer mu.Unlock()
-		if !commit {
-			aborted = append(aborted, txnID)
-		}
-	}))
+	}, WithLogger(&testLogger{t}))
 	require.NoError(t, err)
 	require.NoError(t, srv.Start(context.Background()))
 	defer srv.Close(context.Background()) //nolint:errcheck
-	startReadLoop(t, srv)
+
+	// Start a read loop that captures abort events.
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	go func() {
+		for {
+			event, ack, err := srv.Read(ctx)
+			if err != nil {
+				return
+			}
+			if e, ok := event.(*TxnAbortEvent); ok {
+				mu.Lock()
+				abortedIDs = append(abortedIDs, e.TransactionalID)
+				mu.Unlock()
+			}
+			ack(nil)
+		}
+	}()
 
 	addr := srv.Addr().String()
 	waitForTCPReady(t, addr, 5*time.Second)
@@ -512,7 +534,7 @@ func TestTxnStateEpochBumpNoActiveTransaction(t *testing.T) {
 	assert.Equal(t, resp1.ProducerID, resp2.ProducerID, "should reuse the same producer ID")
 	assert.Equal(t, int16(1), resp2.ProducerEpoch, "epoch should be bumped")
 	mu.Lock()
-	assert.Empty(t, aborted, "no abort should be fired when txn is not active")
+	assert.Empty(t, abortedIDs, "no abort should be fired when txn is not active")
 	mu.Unlock()
 }
 

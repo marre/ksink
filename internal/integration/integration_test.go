@@ -110,24 +110,26 @@ func integrationStartReadLoop(t *testing.T, srv *ksink.Server) *integrationMessa
 
 	go func() {
 		for {
-			msgs, ack, err := srv.ReadBatch(ctx)
+			event, ack, err := srv.Read(ctx)
 			if err != nil {
 				return
 			}
-			for _, msg := range msgs {
-				rm := integrationReceivedMessage{
-					Topic:           msg.Topic,
-					Value:           string(msg.Value),
-					Headers:         make(map[string]string),
-					TransactionalID: msg.TransactionalID,
+			if e, ok := event.(*ksink.MessagesEvent); ok {
+				for _, msg := range e.Messages {
+					rm := integrationReceivedMessage{
+						Topic:           msg.Topic,
+						Value:           string(msg.Value),
+						Headers:         make(map[string]string),
+						TransactionalID: msg.TransactionalID,
+					}
+					if msg.Key != nil {
+						rm.Key = string(msg.Key)
+					}
+					for k, v := range msg.Headers {
+						rm.Headers[k] = v
+					}
+					capture.add(rm)
 				}
-				if msg.Key != nil {
-					rm.Key = string(msg.Key)
-				}
-				for k, v := range msg.Headers {
-					rm.Headers[k] = v
-				}
-				capture.add(rm)
 			}
 			ack(nil)
 		}

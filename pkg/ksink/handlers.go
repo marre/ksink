@@ -199,7 +199,7 @@ func (s *Server) handleProduce(ctx context.Context, conn net.Conn, connID uint64
 	// Deliver batch via channel and wait for ack
 	var handlerErr error
 	if len(allMsgs) > 0 {
-		handlerErr = s.deliverBatch(ctx, allMsgs)
+		handlerErr = s.deliverEvent(ctx, &MessagesEvent{Messages: allMsgs})
 		if handlerErr != nil {
 			s.logger.Errorf("[conn:%d] Batch processing error: %v", connID, handlerErr)
 		}
@@ -236,11 +236,11 @@ func (s *Server) handleProduce(ctx context.Context, conn net.Conn, connID uint64
 	return s.sendResponse(conn, connID, correlationID, resp)
 }
 
-// deliverBatch sends a batch to ReadBatch and waits for the ack.
-func (s *Server) deliverBatch(ctx context.Context, msgs []*Message) error {
+// deliverEvent sends an event to Read and waits for the ack.
+func (s *Server) deliverEvent(ctx context.Context, evt Event) error {
 	pending := pendingBatch{
-		messages: msgs,
-		ackCh:    make(chan error, 1),
+		event: evt,
+		ackCh: make(chan error, 1),
 	}
 	select {
 	case s.batchCh <- pending:
@@ -259,7 +259,7 @@ func (s *Server) deliverBatch(ctx context.Context, msgs []*Message) error {
 	}
 }
 
-func (s *Server) handleInitProducerId(conn net.Conn, connID uint64, correlationID int32, apiVersion int16, req *kmsg.InitProducerIDRequest, state *connState) error {
+func (s *Server) handleInitProducerId(ctx context.Context, conn net.Conn, connID uint64, correlationID int32, apiVersion int16, req *kmsg.InitProducerIDRequest, state *connState) error {
 	if s.saslEnabled && !state.authenticated {
 		s.logger.Warnf("[conn:%d] Rejecting InitProducerId: not authenticated", connID)
 		resp := &kmsg.InitProducerIDResponse{
@@ -314,9 +314,11 @@ func (s *Server) handleInitProducerId(conn net.Conn, connID uint64, correlationI
 			epoch := existing.epoch
 			s.txnMu.Unlock()
 
-			// Invoke the callback outside the lock to avoid deadlocks.
-			if needsAbort && s.txnEndFn != nil {
-				s.txnEndFn(txnID, false)
+			// Deliver the abort event outside the lock to avoid deadlocks.
+			if needsAbort {
+				if err := s.deliverEvent(ctx, &TxnAbortEvent{TransactionalID: txnID}); err != nil {
+					s.logger.Errorf("[conn:%d] InitProducerId: failed to deliver zombie abort event: %v", connID, err)
+				}
 			}
 
 			resp := &kmsg.InitProducerIDResponse{
@@ -478,7 +480,7 @@ func (s *Server) handleAddPartitionsToTxn(conn net.Conn, connID uint64, correlat
 	return s.sendResponse(conn, connID, correlationID, resp)
 }
 
-func (s *Server) handleEndTxn(conn net.Conn, connID uint64, correlationID int32, apiVersion int16, req *kmsg.EndTxnRequest, state *connState) error {
+func (s *Server) handleEndTxn(ctx context.Context, conn net.Conn, connID uint64, correlationID int32, apiVersion int16, req *kmsg.EndTxnRequest, state *connState) error {
 	if s.saslEnabled && !state.authenticated {
 		s.logger.Warnf("[conn:%d] Rejecting EndTxn: not authenticated", connID)
 		resp := &kmsg.EndTxnResponse{
@@ -527,8 +529,18 @@ func (s *Server) handleEndTxn(conn net.Conn, connID uint64, correlationID int32,
 		return s.sendResponse(conn, connID, correlationID, resp)
 	}
 
-	if s.txnEndFn != nil {
-		s.txnEndFn(req.TransactionalID, req.Commit)
+	// Deliver a transaction-end event through Read so the consumer
+	// can handle commit/abort as part of the pull-based flow.
+	var evt Event
+	if req.Commit {
+		evt = &TxnCommitEvent{TransactionalID: req.TransactionalID}
+	} else {
+		evt = &TxnAbortEvent{TransactionalID: req.TransactionalID}
+	}
+	if err := s.deliverEvent(ctx, evt); err != nil {
+		s.logger.Errorf("[conn:%d] EndTxn: failed to deliver txn event: %v", connID, err)
+		resp.ErrorCode = kerr.UnknownServerError.Code
+		return s.sendResponse(conn, connID, correlationID, resp)
 	}
 
 	s.logger.Debugf("[conn:%d] EndTxn: txnID=%s, action=%s", connID, req.TransactionalID, action)

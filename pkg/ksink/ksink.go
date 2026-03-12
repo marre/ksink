@@ -21,7 +21,7 @@ import (
 	"github.com/xdg-go/scram"
 )
 
-// ErrServerClosed is returned by ReadBatch when the server has been closed.
+// ErrServerClosed is returned by [Read] when the server has been closed.
 var ErrServerClosed = errors.New("server closed")
 
 // Server configuration constants.
@@ -48,6 +48,35 @@ const (
 	// malicious clients.
 	maxTxnStates = 10000
 )
+
+// Event is a sealed interface representing something received from a connected
+// producer.  Use a type switch to distinguish the concrete types:
+//
+//   - [*MessagesEvent]  — a batch of data messages
+//   - [*TxnCommitEvent] — a transaction was committed
+//   - [*TxnAbortEvent]  — a transaction was aborted
+type Event interface {
+	isEvent() // unexported marker – keeps the set closed
+}
+
+// MessagesEvent contains a batch of data messages received from a producer.
+type MessagesEvent struct {
+	Messages []*Message
+}
+
+// TxnCommitEvent indicates the transaction identified by TransactionalID was committed.
+type TxnCommitEvent struct {
+	TransactionalID string
+}
+
+// TxnAbortEvent indicates the transaction identified by TransactionalID was aborted.
+type TxnAbortEvent struct {
+	TransactionalID string
+}
+
+func (*MessagesEvent) isEvent()  {}
+func (*TxnCommitEvent) isEvent() {}
+func (*TxnAbortEvent) isEvent()  {}
 
 // Message represents a received Kafka message.
 type Message struct {
@@ -144,16 +173,19 @@ type Logger interface {
 	Errorf(format string, args ...any)
 }
 
-// AckFunc is called to acknowledge processing of a message batch.
-// Pass nil to indicate success (success response sent to the producer).
-// Pass an error to reject the batch (error response sent to the producer).
-// Must be called exactly once per batch. Calling more than once is a no-op.
+// AckFunc is called to acknowledge processing of an [Event] returned by [Read].
+// Pass nil to indicate success. Pass an error to indicate failure.
+// For [*MessagesEvent], the result is sent back to the producer as a produce
+// response (success or error). For [*TxnCommitEvent] and [*TxnAbortEvent], an
+// error causes the EndTxn response to report [kerr.UnknownServerError] to the
+// producer.
+// Must be called exactly once per event. Calling more than once is a no-op.
 type AckFunc func(err error)
 
-// pendingBatch is an internal type that pairs messages with an ack channel.
+// pendingBatch is an internal type that pairs an event with an ack channel.
 type pendingBatch struct {
-	messages []*Message
-	ackCh    chan error
+	event Event
+	ackCh chan error
 }
 
 // noopLogger discards all log messages.
@@ -174,11 +206,6 @@ func WithLogger(l Logger) Option {
 	}
 }
 
-// TxnEndFunc is called when a transactional producer commits or aborts a
-// transaction. txnID is the transactional ID and commit indicates whether
-// the transaction was committed (true) or aborted (false).
-type TxnEndFunc func(txnID string, commit bool)
-
 // txnState tracks the state of a transactional producer identified by its
 // transactional.id. It stores the assigned producer ID, the current epoch
 // (bumped on each InitProducerID call), and whether a transaction is
@@ -189,17 +216,8 @@ type txnState struct {
 	active     bool // true between AddPartitionsToTxn and EndTxn
 }
 
-// WithTxnEndFunc registers a callback that is invoked when a transaction
-// ends. This allows output backends to take action on commit (e.g. rename
-// a temporary file) or abort (e.g. delete a temporary file).
-func WithTxnEndFunc(fn TxnEndFunc) Option {
-	return func(s *Server) {
-		s.txnEndFn = fn
-	}
-}
-
 // Server is a Kafka-protocol-compatible server that accepts produce requests.
-// Use [ReadBatch] to receive message batches from connected producers.
+// Use [Read] to receive events from connected producers.
 type Server struct {
 	cfg    Config
 	logger Logger
@@ -228,13 +246,10 @@ type Server struct {
 	txnMu     sync.Mutex
 	txnStates map[string]*txnState
 
-	// Transaction end callback
-	txnEndFn TxnEndFunc
-
 	// Decompressor for parsing record batches
 	decompressor kgo.Decompressor
 
-	// Batch delivery channel for ReadBatch
+	// Event delivery channel for Read
 	batchCh chan pendingBatch
 
 	// Shutdown
@@ -393,13 +408,23 @@ func (s *Server) Addr() net.Addr {
 	return s.listener.Addr()
 }
 
-// ReadBatch blocks until a batch of messages is available from a connected
-// producer, or the context is cancelled, or the server is closed.
+// Read blocks until an event is available from a connected producer, or the
+// context is cancelled, or the server is closed.
 //
-// Returns the messages, an [AckFunc] to acknowledge processing, and any error.
-// The caller must call the AckFunc after processing the messages — pass nil to
-// indicate success, or an error to reject the batch.
-func (s *Server) ReadBatch(ctx context.Context) ([]*Message, AckFunc, error) {
+// Returns the [Event], an [AckFunc] to acknowledge processing, and any error.
+// Use a type switch to handle the concrete event types:
+//
+//	event, ack, err := srv.Read(ctx)
+//	switch e := event.(type) {
+//	case *ksink.MessagesEvent:
+//	    for _, msg := range e.Messages { /* handle data */ }
+//	case *ksink.TxnCommitEvent:
+//	    commitTxn(e.TransactionalID)
+//	case *ksink.TxnAbortEvent:
+//	    abortTxn(e.TransactionalID)
+//	}
+//	ack(nil)
+func (s *Server) Read(ctx context.Context) (Event, AckFunc, error) {
 	select {
 	case <-ctx.Done():
 		return nil, nil, ctx.Err()
@@ -412,7 +437,7 @@ func (s *Server) ReadBatch(ctx context.Context) ([]*Message, AckFunc, error) {
 			default:
 			}
 		}
-		return batch.messages, ack, nil
+		return batch.event, ack, nil
 	}
 }
 

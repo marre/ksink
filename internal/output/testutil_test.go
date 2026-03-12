@@ -78,35 +78,37 @@ func startReadWriteLoop(t *testing.T, srv *ksink.Server, w output.Writer) {
 
     go func() {
         for {
-            msgs, ack, err := srv.ReadBatch(ctx)
+            event, ack, err := srv.Read(ctx)
             if err != nil {
                 return
             }
             var writeErr error
-            for _, msg := range msgs {
-                rec := messageRecord{
-                    Topic:      msg.Topic,
-                    Partition:  msg.Partition,
-                    Offset:     msg.Offset,
-                    Value:      string(msg.Value),
-                    Headers:    msg.Headers,
-                    ClientAddr: msg.ClientAddr,
-                }
-                if msg.Key != nil {
-                    rec.Key = string(msg.Key)
-                }
-                if !msg.Timestamp.IsZero() {
-                    rec.Timestamp = msg.Timestamp.String()
-                }
-                data, jerr := json.Marshal(rec)
-                if jerr != nil {
-                    writeErr = jerr
-                    break
-                }
-                data = append(data, '\n')
-                if werr := w.Write(data, msg); werr != nil {
-                    writeErr = werr
-                    break
+            if e, ok := event.(*ksink.MessagesEvent); ok {
+                for _, msg := range e.Messages {
+                    rec := messageRecord{
+                        Topic:      msg.Topic,
+                        Partition:  msg.Partition,
+                        Offset:     msg.Offset,
+                        Value:      string(msg.Value),
+                        Headers:    msg.Headers,
+                        ClientAddr: msg.ClientAddr,
+                    }
+                    if msg.Key != nil {
+                        rec.Key = string(msg.Key)
+                    }
+                    if !msg.Timestamp.IsZero() {
+                        rec.Timestamp = msg.Timestamp.String()
+                    }
+                    data, jerr := json.Marshal(rec)
+                    if jerr != nil {
+                        writeErr = jerr
+                        break
+                    }
+                    data = append(data, '\n')
+                    if werr := w.Write(data, msg); werr != nil {
+                        writeErr = werr
+                        break
+                    }
                 }
             }
             ack(writeErr)

@@ -212,21 +212,6 @@ func run(addr, dst, fmtName, fmtStr string, jsonB64Key, jsonB64Val bool, separat
 	defer w.Close() //nolint:errcheck
 
 	serverOpts := []ksink.Option{ksink.WithLogger(stdLogger{})}
-	if transactional {
-		if tw, ok := w.(output.TransactionalWriter); ok {
-			serverOpts = append(serverOpts, ksink.WithTxnEndFunc(func(txnID string, commit bool) {
-				if commit {
-					if err := tw.CommitTxn(txnID); err != nil {
-						log.Printf("[ERROR] commit txn %s: %v", txnID, err)
-					}
-				} else {
-					if err := tw.AbortTxn(txnID); err != nil {
-						log.Printf("[ERROR] abort txn %s: %v", txnID, err)
-					}
-				}
-			}))
-		}
-	}
 
 	srv, err := ksink.New(ksink.Config{
 		Address:            addr,
@@ -250,24 +235,40 @@ func run(addr, dst, fmtName, fmtStr string, jsonB64Key, jsonB64Val bool, separat
 	log.Printf("Kafka server listening on %s, output=%s", srv.Addr(), outputLabel)
 
 	// Start read loop
+	txnWriter, _ := w.(output.TransactionalWriter)
 	go func() {
 		for {
-			msgs, ack, readErr := srv.ReadBatch(ctx)
+			event, ack, readErr := srv.Read(ctx)
 			if readErr != nil {
 				return
 			}
 
 			var writeErr error
-			for _, msg := range msgs {
-				data, err := fmtr.Format(msg)
-				if err != nil {
-					writeErr = fmt.Errorf("failed to format message: %w", err)
-					break
-				}
+			switch e := event.(type) {
+			case *ksink.MessagesEvent:
+				for _, msg := range e.Messages {
+					data, err := fmtr.Format(msg)
+					if err != nil {
+						writeErr = fmt.Errorf("failed to format message: %w", err)
+						break
+					}
 
-				if err := w.Write(data, msg); err != nil {
-					writeErr = fmt.Errorf("failed to write message: %w", err)
-					break
+					if err := w.Write(data, msg); err != nil {
+						writeErr = fmt.Errorf("failed to write message: %w", err)
+						break
+					}
+				}
+			case *ksink.TxnCommitEvent:
+				if txnWriter != nil {
+					if err := txnWriter.CommitTxn(e.TransactionalID); err != nil {
+						writeErr = fmt.Errorf("failed to commit txn %s: %w", e.TransactionalID, err)
+					}
+				}
+			case *ksink.TxnAbortEvent:
+				if txnWriter != nil {
+					if err := txnWriter.AbortTxn(e.TransactionalID); err != nil {
+						writeErr = fmt.Errorf("failed to abort txn %s: %w", e.TransactionalID, err)
+					}
 				}
 			}
 
