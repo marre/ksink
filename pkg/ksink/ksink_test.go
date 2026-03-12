@@ -424,7 +424,7 @@ func TestTxnStateZombieFencing(t *testing.T) {
 		Address:            "127.0.0.1:0",
 		TransactionalWrite: true,
 		Timeout:            5 * time.Second,
-	}, WithLogger(&testLogger{t}), WithTxnEndFunc(func(txnID string, commit bool) {
+	}, WithLogger(&testLogger{t}), WithTxnEndFunc(func(txnID string, commit bool) { //nolint:staticcheck // testing backward compat
 		mu.Lock()
 		defer mu.Unlock()
 		if !commit {
@@ -478,7 +478,7 @@ func TestTxnStateEpochBumpNoActiveTransaction(t *testing.T) {
 		Address:            "127.0.0.1:0",
 		TransactionalWrite: true,
 		Timeout:            5 * time.Second,
-	}, WithLogger(&testLogger{t}), WithTxnEndFunc(func(txnID string, commit bool) {
+	}, WithLogger(&testLogger{t}), WithTxnEndFunc(func(txnID string, commit bool) { //nolint:staticcheck // testing backward compat
 		mu.Lock()
 		defer mu.Unlock()
 		if !commit {

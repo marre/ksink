@@ -512,7 +512,7 @@ func TestFranzTxnEndFuncCallback(t *testing.T) {
 		Timeout:            5 * time.Second,
 		TransactionalWrite: true,
 	}, WithLogger(&integrationLogger{t}),
-		ksink.WithTxnEndFunc(func(txnID string, commit bool) {
+		ksink.WithTxnEndFunc(func(txnID string, commit bool) { //nolint:staticcheck // testing backward compat
 			mu.Lock()
 			defer mu.Unlock()
 			callbackEvents = append(callbackEvents, txnEvent{txnID, commit})
@@ -618,8 +618,6 @@ func TestFranzTransactionalFileCommit(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { tw.Close() }) //nolint:errcheck
 
-	txnWriter := tw.(output.TransactionalWriter)
-
 	port := getFreePort(t)
 	addr := fmt.Sprintf("127.0.0.1:%d", port)
 
@@ -645,14 +643,14 @@ func TestFranzTransactionalFileCommit(t *testing.T) {
 			var writeErr error
 			for _, msg := range msgs {
 				if msg.TxnEvent == ksink.TxnCommit {
-					if werr := txnWriter.CommitTxn(msg.TransactionalID); werr != nil {
+					if werr := tw.CommitTxn(msg.TransactionalID); werr != nil {
 						writeErr = werr
 						break
 					}
 					continue
 				}
 				if msg.TxnEvent == ksink.TxnAbort {
-					if werr := txnWriter.AbortTxn(msg.TransactionalID); werr != nil {
+					if werr := tw.AbortTxn(msg.TransactionalID); werr != nil {
 						writeErr = werr
 						break
 					}
@@ -720,8 +718,6 @@ func TestFranzTransactionalFileAbort(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { tw.Close() }) //nolint:errcheck
 
-	txnWriter := tw.(output.TransactionalWriter)
-
 	port := getFreePort(t)
 	addr := fmt.Sprintf("127.0.0.1:%d", port)
 
@@ -746,14 +742,14 @@ func TestFranzTransactionalFileAbort(t *testing.T) {
 			var writeErr error
 			for _, msg := range msgs {
 				if msg.TxnEvent == ksink.TxnCommit {
-					if werr := txnWriter.CommitTxn(msg.TransactionalID); werr != nil {
+					if werr := tw.CommitTxn(msg.TransactionalID); werr != nil {
 						writeErr = werr
 						break
 					}
 					continue
 				}
 				if msg.TxnEvent == ksink.TxnAbort {
-					if werr := txnWriter.AbortTxn(msg.TransactionalID); werr != nil {
+					if werr := tw.AbortTxn(msg.TransactionalID); werr != nil {
 						writeErr = werr
 						break
 					}
@@ -812,8 +808,6 @@ func TestFranzTransactionalFileCommitAndAbort(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { tw.Close() }) //nolint:errcheck
 
-	txnWriter := tw.(output.TransactionalWriter)
-
 	port := getFreePort(t)
 	addr := fmt.Sprintf("127.0.0.1:%d", port)
 
@@ -838,14 +832,14 @@ func TestFranzTransactionalFileCommitAndAbort(t *testing.T) {
 			var writeErr error
 			for _, msg := range msgs {
 				if msg.TxnEvent == ksink.TxnCommit {
-					if werr := txnWriter.CommitTxn(msg.TransactionalID); werr != nil {
+					if werr := tw.CommitTxn(msg.TransactionalID); werr != nil {
 						writeErr = werr
 						break
 					}
 					continue
 				}
 				if msg.TxnEvent == ksink.TxnAbort {
-					if werr := txnWriter.AbortTxn(msg.TransactionalID); werr != nil {
+					if werr := tw.AbortTxn(msg.TransactionalID); werr != nil {
 						writeErr = werr
 						break
 					}
