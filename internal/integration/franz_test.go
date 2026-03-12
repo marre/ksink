@@ -631,40 +631,7 @@ func TestFranzTransactionalFileCommit(t *testing.T) {
 	t.Cleanup(func() { srv.Close(context.Background()) }) //nolint:errcheck
 	waitForTCPReady(t, addr, 5*time.Second)
 
-	// Start a read loop that writes data and handles txn events inline.
-	readCtx, readCancel := context.WithCancel(context.Background())
-	t.Cleanup(readCancel)
-	go func() {
-		for {
-			msgs, ack, err := srv.ReadBatch(readCtx)
-			if err != nil {
-				return
-			}
-			var writeErr error
-			for _, msg := range msgs {
-				if msg.TxnEvent == ksink.TxnCommit {
-					if werr := tw.CommitTxn(msg.TransactionalID); werr != nil {
-						writeErr = werr
-						break
-					}
-					continue
-				}
-				if msg.TxnEvent == ksink.TxnAbort {
-					if werr := tw.AbortTxn(msg.TransactionalID); werr != nil {
-						writeErr = werr
-						break
-					}
-					continue
-				}
-				data := append([]byte(msg.Value), '\n')
-				if werr := tw.Write(data, msg); werr != nil {
-					writeErr = werr
-					break
-				}
-			}
-			ack(writeErr)
-		}
-	}()
+	startTxnReadLoop(t, srv, tw)
 
 	// Produce two messages in a committed transaction.
 	client, err := kgo.NewClient(
@@ -731,39 +698,7 @@ func TestFranzTransactionalFileAbort(t *testing.T) {
 	t.Cleanup(func() { srv.Close(context.Background()) }) //nolint:errcheck
 	waitForTCPReady(t, addr, 5*time.Second)
 
-	readCtx, readCancel := context.WithCancel(context.Background())
-	t.Cleanup(readCancel)
-	go func() {
-		for {
-			msgs, ack, err := srv.ReadBatch(readCtx)
-			if err != nil {
-				return
-			}
-			var writeErr error
-			for _, msg := range msgs {
-				if msg.TxnEvent == ksink.TxnCommit {
-					if werr := tw.CommitTxn(msg.TransactionalID); werr != nil {
-						writeErr = werr
-						break
-					}
-					continue
-				}
-				if msg.TxnEvent == ksink.TxnAbort {
-					if werr := tw.AbortTxn(msg.TransactionalID); werr != nil {
-						writeErr = werr
-						break
-					}
-					continue
-				}
-				data := append([]byte(msg.Value), '\n')
-				if werr := tw.Write(data, msg); werr != nil {
-					writeErr = werr
-					break
-				}
-			}
-			ack(writeErr)
-		}
-	}()
+	startTxnReadLoop(t, srv, tw)
 
 	// Produce a message inside an aborted transaction.
 	client, err := kgo.NewClient(
@@ -821,39 +756,7 @@ func TestFranzTransactionalFileCommitAndAbort(t *testing.T) {
 	t.Cleanup(func() { srv.Close(context.Background()) }) //nolint:errcheck
 	waitForTCPReady(t, addr, 5*time.Second)
 
-	readCtx, readCancel := context.WithCancel(context.Background())
-	t.Cleanup(readCancel)
-	go func() {
-		for {
-			msgs, ack, err := srv.ReadBatch(readCtx)
-			if err != nil {
-				return
-			}
-			var writeErr error
-			for _, msg := range msgs {
-				if msg.TxnEvent == ksink.TxnCommit {
-					if werr := tw.CommitTxn(msg.TransactionalID); werr != nil {
-						writeErr = werr
-						break
-					}
-					continue
-				}
-				if msg.TxnEvent == ksink.TxnAbort {
-					if werr := tw.AbortTxn(msg.TransactionalID); werr != nil {
-						writeErr = werr
-						break
-					}
-					continue
-				}
-				data := append([]byte(msg.Value), '\n')
-				if werr := tw.Write(data, msg); werr != nil {
-					writeErr = werr
-					break
-				}
-			}
-			ack(writeErr)
-		}
-	}()
+	startTxnReadLoop(t, srv, tw)
 
 	// Transaction 1: commit
 	client1, err := kgo.NewClient(
@@ -1530,6 +1433,47 @@ func startTestServer(t *testing.T, cfg Config) (*Server, string) {
 func startReadLoop(t *testing.T, srv *Server) *messageCapture {
 	t.Helper()
 	return integrationStartReadLoop(t, srv)
+}
+
+// startTxnReadLoop starts a goroutine that reads batches, writes data messages
+// through the given TransactionalWriter, and handles TxnCommit/TxnAbort events
+// by calling CommitTxn/AbortTxn on the same writer.
+func startTxnReadLoop(t *testing.T, srv *Server, tw output.TransactionalWriter) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	go func() {
+		for {
+			msgs, ack, err := srv.ReadBatch(ctx)
+			if err != nil {
+				return
+			}
+			var writeErr error
+			for _, msg := range msgs {
+				if msg.TxnEvent == ksink.TxnCommit {
+					if werr := tw.CommitTxn(msg.TransactionalID); werr != nil {
+						writeErr = werr
+						break
+					}
+					continue
+				}
+				if msg.TxnEvent == ksink.TxnAbort {
+					if werr := tw.AbortTxn(msg.TransactionalID); werr != nil {
+						writeErr = werr
+						break
+					}
+					continue
+				}
+				data := append([]byte(msg.Value), '\n')
+				if werr := tw.Write(data, msg); werr != nil {
+					writeErr = werr
+					break
+				}
+			}
+			ack(writeErr)
+		}
+	}()
 }
 
 func startFailReadLoop(t *testing.T, srv *Server, ackErr error) {

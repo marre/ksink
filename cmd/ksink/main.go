@@ -252,7 +252,7 @@ func run(addr, dst, fmtName, fmtStr string, jsonB64Key, jsonB64Val bool, separat
 							writeErr = fmt.Errorf("failed to commit txn %s: %w", msg.TransactionalID, err)
 							break
 						}
-					} else {
+					} else if msg.TxnEvent == ksink.TxnAbort {
 						if err := txnWriter.AbortTxn(msg.TransactionalID); err != nil {
 							writeErr = fmt.Errorf("failed to abort txn %s: %w", msg.TransactionalID, err)
 							break
