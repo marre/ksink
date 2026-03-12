@@ -21,7 +21,7 @@ import (
 	"github.com/xdg-go/scram"
 )
 
-// ErrServerClosed is returned by ReadBatch when the server has been closed.
+// ErrServerClosed is returned by [Read] when the server has been closed.
 var ErrServerClosed = errors.New("server closed")
 
 // Server configuration constants.
@@ -214,7 +214,7 @@ type txnState struct {
 }
 
 // Server is a Kafka-protocol-compatible server that accepts produce requests.
-// Use [ReadBatch] to receive message batches from connected producers.
+// Use [Read] to receive events from connected producers.
 type Server struct {
 	cfg    Config
 	logger Logger
@@ -246,7 +246,7 @@ type Server struct {
 	// Decompressor for parsing record batches
 	decompressor kgo.Decompressor
 
-	// Batch delivery channel for ReadBatch
+	// Event delivery channel for Read
 	batchCh chan pendingBatch
 
 	// Shutdown
@@ -435,28 +435,6 @@ func (s *Server) Read(ctx context.Context) (Event, AckFunc, error) {
 			}
 		}
 		return batch.event, ack, nil
-	}
-}
-
-// ReadBatch blocks until a batch of messages is available from a connected
-// producer, or the context is cancelled, or the server is closed.
-//
-// Deprecated: Use [Read] instead, which returns typed [Event] values.
-// ReadBatch only returns [*MessagesEvent] batches and silently acknowledges
-// transaction lifecycle events.
-func (s *Server) ReadBatch(ctx context.Context) ([]*Message, AckFunc, error) {
-	for {
-		event, ack, err := s.Read(ctx)
-		if err != nil {
-			return nil, nil, err
-		}
-		switch e := event.(type) {
-		case *MessagesEvent:
-			return e.Messages, ack, nil
-		default:
-			// Silently ack non-message events so legacy callers don't block.
-			ack(nil)
-		}
 	}
 }
 
