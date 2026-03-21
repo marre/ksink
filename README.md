@@ -246,15 +246,15 @@ transaction from the previous instance to prevent duplicates.
 ksink is **not** a full Kafka broker. Its transactional support is
 intentionally simplified:
 
-| Real Kafka behaviour | ksink behaviour |
-|---|---|
-| Records written inside a transaction are invisible to `read_committed` consumers until commit. | Records are delivered to `Read` as `*MessagesEvent` immediately when produced. The `TransactionalID` field is populated so the consumer can buffer them. When the transaction ends, a `*TxnCommitEvent` or `*TxnAbortEvent` is delivered so the consumer can decide what to do. |
-| The transaction coordinator tracks transaction state across broker restarts. | No persistent transaction state. If ksink restarts, in-flight transactions are lost (uncommitted temp files are cleaned up on `Close()`). |
-| `sendOffsetsToTransaction` atomically commits consumer offsets with the transaction. | Not supported. ksink is a sink, not a full broker with consumer groups. |
-| Zombie fencing: restarting a producer with the same `transactional.id` aborts the old instance's pending transaction. | **Supported.** When `InitProducerID` is called with an existing `transactional.id` that has an in-flight transaction, the old transaction is automatically aborted via a `*TxnAbortEvent` delivered through `Read` and the producer epoch is bumped. |
-| Transactions can span multiple topic-partitions atomically. | Supported at the file level — all messages with the same `transactional.id` go to the same temp file regardless of topic/partition. When the `{topic}` placeholder is used, each topic within a transaction gets its own file; all are committed or aborted together. |
-| Aborted records are never visible to `read_committed` consumers. | Aborted records were already delivered to `Read`. The `*TxnAbortEvent` signals the consumer to clean up (e.g. delete the temp file), but application-level processing that happened before the abort is not rolled back. |
-| `isolation.level` consumer configuration. | Not applicable — ksink does not implement the consumer protocol. |
+| Real Kafka behaviour | ksink API behaviour | ksink tool behaviour |
+|---|---|---|
+| Records written inside a transaction are invisible to `read_committed` consumers until commit. | Records are delivered to `Read` as `*MessagesEvent` immediately when produced. The `TransactionalID` field is populated so the consumer can buffer them. When the transaction ends, a `*TxnCommitEvent` or `*TxnAbortEvent` is delivered so the consumer can decide what to do. | Messages are written to a temp file (`.tmp` suffix) during the transaction. On commit the temp file is renamed to the final path; on abort it is deleted. |
+| The transaction coordinator tracks transaction state across broker restarts. | No persistent transaction state. If ksink restarts, in-flight transactions are lost. | Uncommitted temp files are cleaned up on `Close()`. |
+| `sendOffsetsToTransaction` atomically commits consumer offsets with the transaction. | Not supported. ksink is a sink, not a full broker with consumer groups. | Not supported. |
+| Zombie fencing: restarting a producer with the same `transactional.id` aborts the old instance's pending transaction. | **Supported.** When `InitProducerID` is called with an existing `transactional.id` that has an in-flight transaction, the old transaction is automatically aborted via a `*TxnAbortEvent` delivered through `Read` and the producer epoch is bumped. | The old transaction's temp file is deleted when the abort event is processed. |
+| Transactions can span multiple topic-partitions atomically. | Supported — all events for the same `transactional.id` share the same transaction context regardless of topic/partition. | All messages with the same `transactional.id` go to the same temp file. When the `{topic}` placeholder is used, each topic within a transaction gets its own file; all are committed or aborted together. |
+| Aborted records are never visible to `read_committed` consumers. | Aborted records were already delivered to `Read`. The `*TxnAbortEvent` signals the consumer to clean up, but application-level processing that happened before the abort is not rolled back. | The temp file is deleted on abort. |
+| `isolation.level` consumer configuration. | Not applicable — ksink does not implement the consumer protocol. | Not applicable. |
 
 **In summary:** ksink provides a best-effort transactional file output where
 committed transactions produce a final file and aborted transactions clean
