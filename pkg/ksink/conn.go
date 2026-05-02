@@ -192,12 +192,12 @@ func (s *Server) handleConnection(ctx context.Context, conn net.Conn, connID uin
 				handleErr = s.handleEndTxn(ctx, conn, connID, correlationID, apiVersion, req, state)
 			}
 		default:
-			s.logger.Warnf("[conn:%d] Unsupported API key: %d", connID, apiKey)
-			handleErr = fmt.Errorf("unsupported API key: %d", apiKey)
+			s.logger.Warnf("[conn:%d] Unsupported API key", connID)
+			handleErr = fmt.Errorf("unsupported API key")
 		}
 
 		if handleErr != nil {
-			s.logger.Errorf("[conn:%d] Error handling request (apiKey=%d): %v", connID, apiKey, handleErr)
+			s.logger.Errorf("[conn:%d] Error handling request", connID)
 			return
 		}
 	}
