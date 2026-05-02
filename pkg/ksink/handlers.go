@@ -386,16 +386,17 @@ func (s *Server) handleFindCoordinator(conn net.Conn, connID uint64, correlation
 	if err != nil {
 		return fmt.Errorf("failed to parse address %s: %w", addr, err)
 	}
-	port, err := strconv.Atoi(portStr)
+	parsedPort, err := strconv.ParseUint(portStr, 10, 16)
 	if err != nil {
 		return fmt.Errorf("failed to parse port %s: %w", portStr, err)
 	}
+	port := int32(uint16(parsedPort))
 
 	resp := &kmsg.FindCoordinatorResponse{
 		Version:        apiVersion,
 		NodeID:         1,
 		Host:           host,
-		Port:           int32(port),
+		Port:           port,
 		ErrorCode:      0,
 		ThrottleMillis: 0,
 	}
@@ -413,7 +414,7 @@ func (s *Server) handleFindCoordinator(conn net.Conn, connID uint64, correlation
 				Key:    key,
 				NodeID: 1,
 				Host:   host,
-				Port:   int32(port),
+				Port:   port,
 			})
 		}
 	}
