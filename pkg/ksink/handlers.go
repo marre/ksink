@@ -67,7 +67,7 @@ func (s *Server) handleMetadata(conn net.Conn, connID uint64, correlationID int3
 	if err != nil {
 		return fmt.Errorf("failed to parse address %s: %w", addr, err)
 	}
-	port, err := strconv.Atoi(portStr)
+	port64, err := strconv.ParseUint(portStr, 10, 16)
 	if err != nil {
 		return fmt.Errorf("failed to parse port %s: %w", portStr, err)
 	}
@@ -78,7 +78,7 @@ func (s *Server) handleMetadata(conn net.Conn, connID uint64, correlationID int3
 			{
 				NodeID: 1,
 				Host:   host,
-				Port:   int32(port),
+				Port:   int32(port64),
 			},
 		},
 		ControllerID: 1,
