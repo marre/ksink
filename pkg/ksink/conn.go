@@ -128,7 +128,7 @@ func (s *Server) handleConnection(ctx context.Context, conn net.Conn, connID uin
 
 		kreq := kmsg.RequestForKey(apiKey)
 		if kreq == nil {
-			s.logger.Warnf("[conn:%d] Unsupported API key: %d", connID, apiKey)
+			s.logger.Warnf("[conn:%d] Unsupported API key received", connID)
 			return
 		}
 		kreq.SetVersion(apiVersion)
