@@ -1,6 +1,6 @@
 module github.com/marre/ksink
 
-go 1.24.13
+go 1.25.12
 
 require (
 	github.com/ory/dockertest/v3 v3.12.0
