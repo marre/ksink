@@ -82,7 +82,7 @@ func (s *Server) handleMetadata(conn net.Conn, connID uint64, correlationID int3
 			},
 		},
 		ControllerID: 1,
-		ClusterID:    kmsg.StringPtr("ksink-cluster"),
+		ClusterID:    new("ksink-cluster"),
 	}
 
 	// Build topic list for response using parsed request topics
@@ -111,7 +111,7 @@ func (s *Server) handleMetadata(conn net.Conn, connID uint64, correlationID int3
 
 func (s *Server) buildTopicMetadata(topic string, apiVersion int16) kmsg.MetadataResponseTopic {
 	t := kmsg.MetadataResponseTopic{
-		Topic: kmsg.StringPtr(topic),
+		Topic: new(topic),
 		Partitions: []kmsg.MetadataResponseTopicPartition{
 			{
 				Partition:   0,
@@ -130,7 +130,7 @@ func (s *Server) buildTopicMetadata(topic string, apiVersion int16) kmsg.Metadat
 
 func (s *Server) buildTopicErrorMetadata(topic string, apiVersion int16, errCode *kerr.Error) kmsg.MetadataResponseTopic {
 	t := kmsg.MetadataResponseTopic{
-		Topic:     kmsg.StringPtr(topic),
+		Topic:     new(topic),
 		ErrorCode: errCode.Code,
 	}
 	if apiVersion >= 10 {

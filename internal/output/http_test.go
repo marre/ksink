@@ -373,7 +373,7 @@ func TestHTTPWriteSequential(t *testing.T) {
 	require.NoError(t, err)
 
 	for i := range 5 {
-		require.NoError(t, w.Write([]byte(fmt.Sprintf("msg-%d", i)), nil))
+		require.NoError(t, w.Write(fmt.Appendf(nil, "msg-%d", i), nil))
 	}
 	require.NoError(t, w.Close())
 

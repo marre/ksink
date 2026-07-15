@@ -2,6 +2,7 @@ package ksink
 
 import (
 	"context"
+	"maps"
 	"net"
 	"sync"
 	"testing"
@@ -89,9 +90,7 @@ func startReadLoop(t *testing.T, srv *Server) *messageCapture {
 					if msg.Key != nil {
 						rm.Key = string(msg.Key)
 					}
-					for k, v := range msg.Headers {
-						rm.Headers[k] = v
-					}
+					maps.Copy(rm.Headers, msg.Headers)
 					capture.add(rm)
 				}
 			}

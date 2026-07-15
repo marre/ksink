@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"maps"
 	"net"
 	"runtime"
 	"strconv"
@@ -126,9 +127,7 @@ func integrationStartReadLoop(t *testing.T, srv *ksink.Server) *integrationMessa
 					if msg.Key != nil {
 						rm.Key = string(msg.Key)
 					}
-					for k, v := range msg.Headers {
-						rm.Headers[k] = v
-					}
+					maps.Copy(rm.Headers, msg.Headers)
 					capture.add(rm)
 				}
 			}

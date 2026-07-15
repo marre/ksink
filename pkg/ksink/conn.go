@@ -15,10 +15,10 @@ import (
 
 // connState tracks per-connection state for SASL and producer ID tracking.
 type connState struct {
-	authenticated    bool
-	saslMechanism    string
-	scramConv        *scram.ServerConversation
-	awaitingRawSASL  bool // true after a v0 SASLHandshake to expect raw SASL bytes
+	authenticated   bool
+	saslMechanism   string
+	scramConv       *scram.ServerConversation
+	awaitingRawSASL bool // true after a v0 SASLHandshake to expect raw SASL bytes
 }
 
 func (s *Server) acceptLoop(ctx context.Context) {
@@ -39,11 +39,9 @@ func (s *Server) acceptLoop(ctx context.Context) {
 		connID := s.connCount.Add(1)
 		s.logger.Debugf("[conn:%d] New connection from %s", connID, conn.RemoteAddr())
 
-		s.connWG.Add(1)
-		go func() {
-			defer s.connWG.Done()
+		s.connWG.Go(func() {
 			s.handleConnection(ctx, conn, connID)
-		}()
+		})
 	}
 }
 

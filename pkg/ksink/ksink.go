@@ -390,11 +390,9 @@ func (s *Server) Start(ctx context.Context) error {
 
 	s.logger.Infof("Kafka server listening on %s", s.listener.Addr().String())
 
-	s.acceptWG.Add(1)
-	go func() {
-		defer s.acceptWG.Done()
+	s.acceptWG.Go(func() {
 		s.acceptLoop(ctx)
-	}()
+	})
 
 	return nil
 }
@@ -482,5 +480,3 @@ func (s *Server) Close(ctx context.Context) error {
 
 	return nil
 }
-
-
