@@ -238,8 +238,8 @@ func TestServerAdvertisedAddress(t *testing.T) {
 
 	header2 := make([]byte, 0)
 	header2 = kbin.AppendInt16(header2, int16(kmsg.Metadata))
-	header2 = kbin.AppendInt16(header2, 1) // version 1
-	header2 = kbin.AppendInt32(header2, 2) // correlationID
+	header2 = kbin.AppendInt16(header2, 1)  // version 1
+	header2 = kbin.AppendInt32(header2, 2)  // correlationID
 	header2 = kbin.AppendInt16(header2, -1) // no clientID
 	fullReq2 := append(header2, metadataReqBuf...)
 	sizeBuf2 := kbin.AppendInt32(nil, int32(len(fullReq2)))
@@ -563,7 +563,7 @@ func TestTxnStatesMaxSize(t *testing.T) {
 
 	// Pre-fill txnStates to the max.
 	srv.txnMu.Lock()
-	for i := 0; i < maxTxnStates; i++ {
+	for i := range maxTxnStates {
 		srv.txnStates[fmt.Sprintf("fill-%d", i)] = &txnState{}
 	}
 	srv.txnMu.Unlock()
@@ -582,4 +582,3 @@ func TestTxnStatesMaxSize(t *testing.T) {
 	resp := sendInitProducerID(t, conn, 1, &txnID, 30000)
 	assert.NotEqual(t, int16(0), resp.ErrorCode, "should reject when txnStates is full")
 }
-

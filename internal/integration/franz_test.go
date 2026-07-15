@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
+	"maps"
 	"math/big"
 	"net"
 	"os"
@@ -101,10 +102,10 @@ func TestFranzMultipleMessages(t *testing.T) {
 	require.NoError(t, err)
 	defer client.Close()
 
-	for i := 0; i < 5; i++ {
+	for i := range 5 {
 		record := &kgo.Record{
 			Topic: "test-topic",
-			Value: []byte(fmt.Sprintf("message-%d", i)),
+			Value: fmt.Appendf(nil, "message-%d", i),
 		}
 		results := client.ProduceSync(ctx, record)
 		require.NoError(t, results[0].Err)
@@ -1039,8 +1040,7 @@ func TestFranzTLS(t *testing.T) {
 	defer srv.Close(context.Background()) //nolint:errcheck
 
 	// Start read loop
-	readCtx, readCancel := context.WithCancel(context.Background())
-	defer readCancel()
+	readCtx := t.Context()
 	go func() {
 		for {
 			event, ack, err := srv.Read(readCtx)
@@ -1057,9 +1057,7 @@ func TestFranzTLS(t *testing.T) {
 					if msg.Key != nil {
 						rm.Key = string(msg.Key)
 					}
-					for k, v := range msg.Headers {
-						rm.Headers[k] = v
-					}
+					maps.Copy(rm.Headers, msg.Headers)
 					capture.add(rm)
 				}
 			}
@@ -1196,8 +1194,7 @@ func TestFranzMTLS(t *testing.T) {
 	defer srv.Close(context.Background()) //nolint:errcheck
 
 	// Start read loop
-	readCtx, readCancel := context.WithCancel(context.Background())
-	defer readCancel()
+	readCtx := t.Context()
 	go func() {
 		for {
 			event, ack, err := srv.Read(readCtx)
@@ -1214,9 +1211,7 @@ func TestFranzMTLS(t *testing.T) {
 					if msg.Key != nil {
 						rm.Key = string(msg.Key)
 					}
-					for k, v := range msg.Headers {
-						rm.Headers[k] = v
-					}
+					maps.Copy(rm.Headers, msg.Headers)
 					capture.add(rm)
 				}
 			}

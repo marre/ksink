@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"maps"
 	"net"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -125,9 +127,7 @@ func integrationStartReadLoop(t *testing.T, srv *ksink.Server) *integrationMessa
 					if msg.Key != nil {
 						rm.Key = string(msg.Key)
 					}
-					for k, v := range msg.Headers {
-						rm.Headers[k] = v
-					}
+					maps.Copy(rm.Headers, msg.Headers)
 					capture.add(rm)
 				}
 			}
@@ -334,7 +334,7 @@ type kafkaProducer interface {
 
 func testBasicNoAuth(t *testing.T, client kafkaProducer) {
 	port := getIntegrationFreePort(t)
-	hostAddr := fmt.Sprintf("%s:%d", getHostAddress(), port)
+	hostAddr := net.JoinHostPort(getHostAddress(), strconv.Itoa(port))
 
 	capture := startIntegrationServer(t, port, ksink.Config{
 		AdvertisedAddress: hostAddr,
@@ -352,7 +352,7 @@ func testBasicNoAuth(t *testing.T, client kafkaProducer) {
 
 func testMultipleMessages(t *testing.T, client kafkaProducer) {
 	port := getIntegrationFreePort(t)
-	hostAddr := fmt.Sprintf("%s:%d", getHostAddress(), port)
+	hostAddr := net.JoinHostPort(getHostAddress(), strconv.Itoa(port))
 
 	capture := startIntegrationServer(t, port, ksink.Config{
 		AdvertisedAddress: hostAddr,
@@ -373,7 +373,7 @@ func testMultipleMessages(t *testing.T, client kafkaProducer) {
 
 func testSASLPlain(t *testing.T, client kafkaProducer) {
 	port := getIntegrationFreePort(t)
-	hostAddr := fmt.Sprintf("%s:%d", getHostAddress(), port)
+	hostAddr := net.JoinHostPort(getHostAddress(), strconv.Itoa(port))
 
 	capture := startIntegrationServer(t, port, ksink.Config{
 		AdvertisedAddress: hostAddr,
@@ -393,7 +393,7 @@ func testSASLPlain(t *testing.T, client kafkaProducer) {
 
 func testSASLPlainWrongPassword(t *testing.T, client kafkaProducer) {
 	port := getIntegrationFreePort(t)
-	hostAddr := fmt.Sprintf("%s:%d", getHostAddress(), port)
+	hostAddr := net.JoinHostPort(getHostAddress(), strconv.Itoa(port))
 
 	capture := startIntegrationServer(t, port, ksink.Config{
 		AdvertisedAddress: hostAddr,
@@ -412,7 +412,7 @@ func testSASLPlainWrongPassword(t *testing.T, client kafkaProducer) {
 
 func testMessageWithKey(t *testing.T, client kafkaProducer) {
 	port := getIntegrationFreePort(t)
-	hostAddr := fmt.Sprintf("%s:%d", getHostAddress(), port)
+	hostAddr := net.JoinHostPort(getHostAddress(), strconv.Itoa(port))
 
 	capture := startIntegrationServer(t, port, ksink.Config{
 		AdvertisedAddress: hostAddr,
@@ -431,7 +431,7 @@ func testMessageWithKey(t *testing.T, client kafkaProducer) {
 
 func testIdempotentProducer(t *testing.T, client kafkaProducer) {
 	port := getIntegrationFreePort(t)
-	hostAddr := fmt.Sprintf("%s:%d", getHostAddress(), port)
+	hostAddr := net.JoinHostPort(getHostAddress(), strconv.Itoa(port))
 
 	capture := startIntegrationServer(t, port, ksink.Config{
 		AdvertisedAddress: hostAddr,

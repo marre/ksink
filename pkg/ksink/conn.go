@@ -2,6 +2,7 @@ package ksink
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -14,10 +15,10 @@ import (
 
 // connState tracks per-connection state for SASL and producer ID tracking.
 type connState struct {
-	authenticated    bool
-	saslMechanism    string
-	scramConv        *scram.ServerConversation
-	awaitingRawSASL  bool // true after a v0 SASLHandshake to expect raw SASL bytes
+	authenticated   bool
+	saslMechanism   string
+	scramConv       *scram.ServerConversation
+	awaitingRawSASL bool // true after a v0 SASLHandshake to expect raw SASL bytes
 }
 
 func (s *Server) acceptLoop(ctx context.Context) {
@@ -38,11 +39,9 @@ func (s *Server) acceptLoop(ctx context.Context) {
 		connID := s.connCount.Add(1)
 		s.logger.Debugf("[conn:%d] New connection from %s", connID, conn.RemoteAddr())
 
-		s.connWG.Add(1)
-		go func() {
-			defer s.connWG.Done()
+		s.connWG.Go(func() {
 			s.handleConnection(ctx, conn, connID)
-		}()
+		})
 	}
 }
 
@@ -73,7 +72,8 @@ func (s *Server) handleConnection(ctx context.Context, conn net.Conn, connID uin
 		// Read the request size (4 bytes, big-endian)
 		sizeBuf := make([]byte, 4)
 		if _, err := io.ReadFull(conn, sizeBuf); err != nil {
-			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+			var netErr net.Error
+			if errors.As(err, &netErr) && netErr.Timeout() {
 				s.logger.Debugf("[conn:%d] Connection idle timeout", connID)
 			} else if err != io.EOF {
 				s.logger.Debugf("[conn:%d] Error reading request size: %v", connID, err)

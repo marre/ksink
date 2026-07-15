@@ -57,7 +57,7 @@ func (s *Server) handleSaslAuthenticate(conn net.Conn, connID uint64, correlatio
 		authenticated := s.validateSASLPlain(authBytes, state)
 		if !authenticated {
 			resp.ErrorCode = kerr.SaslAuthenticationFailed.Code
-			resp.ErrorMessage = kmsg.StringPtr("Authentication failed")
+			resp.ErrorMessage = new("Authentication failed")
 			s.logger.Warnf("[conn:%d] SASL PLAIN authentication failed", connID)
 			if err := s.sendResponse(conn, connID, correlationID, resp); err != nil {
 				return err
@@ -70,7 +70,7 @@ func (s *Server) handleSaslAuthenticate(conn net.Conn, connID uint64, correlatio
 		respBytes, err := s.handleSASLScram(connID, authBytes, state)
 		if err != nil {
 			resp.ErrorCode = kerr.SaslAuthenticationFailed.Code
-			resp.ErrorMessage = kmsg.StringPtr(err.Error())
+			resp.ErrorMessage = new(err.Error())
 			s.logger.Warnf("[conn:%d] SASL SCRAM authentication failed: %v", connID, err)
 			if sendErr := s.sendResponse(conn, connID, correlationID, resp); sendErr != nil {
 				return sendErr
@@ -90,7 +90,7 @@ func (s *Server) handleSaslAuthenticate(conn net.Conn, connID uint64, correlatio
 
 	default:
 		resp.ErrorCode = kerr.UnsupportedSaslMechanism.Code
-		resp.ErrorMessage = kmsg.StringPtr("Unsupported SASL mechanism")
+		resp.ErrorMessage = new("Unsupported SASL mechanism")
 		if err := s.sendResponse(conn, connID, correlationID, resp); err != nil {
 			return err
 		}
