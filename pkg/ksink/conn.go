@@ -2,6 +2,7 @@ package ksink
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -73,7 +74,8 @@ func (s *Server) handleConnection(ctx context.Context, conn net.Conn, connID uin
 		// Read the request size (4 bytes, big-endian)
 		sizeBuf := make([]byte, 4)
 		if _, err := io.ReadFull(conn, sizeBuf); err != nil {
-			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+			var netErr net.Error
+			if errors.As(err, &netErr) && netErr.Timeout() {
 				s.logger.Debugf("[conn:%d] Connection idle timeout", connID)
 			} else if err != io.EOF {
 				s.logger.Debugf("[conn:%d] Error reading request size: %v", connID, err)

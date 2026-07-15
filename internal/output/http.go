@@ -49,9 +49,7 @@ type httpWriter struct {
 // given URL. It supports optional TLS configuration, retries, and a
 // dead-letter queue for failed messages.
 func NewHTTPWriter(url string, opts HTTPOpts, tlsCfg *tls.Config) (Writer, error) {
-	if opts.MaxRetries < 0 {
-		opts.MaxRetries = 0
-	}
+	opts.MaxRetries = max(0, opts.MaxRetries)
 	transport := &http.Transport{}
 	if tlsCfg != nil {
 		transport.TLSClientConfig = tlsCfg
