@@ -47,6 +47,7 @@ func main() {
 		transactional bool
 		tOpts         output.TLSOpts
 		httpOpts      output.HTTPOpts
+		s3Opts        output.S3Opts
 	)
 
 	rootCmd := &cobra.Command{
@@ -61,6 +62,7 @@ Output destinations (--output):
   messages.jsonl                    Write to a file
   http://host:port/path             POST messages via HTTP
   https://host:port/path            POST messages via HTTPS
+  s3://bucket/key-pattern           Write messages to S3 objects
 
 Use --output-tls-* flags to configure client certificates (mTLS) and
 CA certificates for server verification on https outputs.
@@ -68,6 +70,10 @@ CA certificates for server verification on https outputs.
 HTTP output sends one message at a time and waits for a 200 OK response
 before proceeding to the next message. Use --output-http-* flags to
 configure retries and a dead-letter queue for failed messages.
+
+S3 output:
+  Use --output-s3-* flags to configure region, endpoint/path-style,
+  retries, and object batching behavior.
 
 Message formats (--output-format):
   binary       Raw message value bytes (default, newline-delimited)
@@ -94,7 +100,23 @@ kcat format specifiers (--output-format-string):
 					return fmt.Errorf("--output-separator, --output-separator-hex, and --no-separator are only supported with --output-format=binary")
 				}
 			}
-			return run(addr, dst, fmtName, fmtStr, jsonB64Key, jsonB64Val, separator, sepHex, noSeparator, transactional, tOpts, httpOpts)
+			if !strings.HasPrefix(dst, "s3://") {
+				for _, name := range []string{
+					"output-s3-region",
+					"output-s3-endpoint",
+					"output-s3-force-path-style",
+					"output-s3-retries",
+					"output-s3-retry-delay",
+					"output-s3-batch-max-bytes",
+					"output-s3-batch-max-messages",
+					"output-s3-multipart-part-size",
+				} {
+					if cmd.Flags().Changed(name) {
+						return fmt.Errorf("--output-s3-* flags require an s3:// output destination")
+					}
+				}
+			}
+			return run(addr, dst, fmtName, fmtStr, jsonB64Key, jsonB64Val, separator, sepHex, noSeparator, transactional, tOpts, httpOpts, s3Opts)
 		},
 	}
 
@@ -102,10 +124,10 @@ kcat format specifiers (--output-format-string):
 	rootCmd.Flags().BoolVar(&transactional, "transactional", false,
 		"Enable transactional produce support (per-transaction files with rename-as-commit/delete-as-abort). Requires {txnID} in --output.")
 	rootCmd.Flags().StringVar(&dst, "output", "-",
-		`Output destination: "-" for stdout (default), file path, or http(s):// URL.
-The path may contain {topic} to route messages to per-topic files
+		`Output destination: "-" for stdout (default), file path, http(s):// URL, or s3://bucket/key-pattern.
+The path may contain {topic} to route messages to per-topic files.
 (e.g. "{topic}.jsonl" produces "orders.jsonl", "events.jsonl", etc.).
-With --transactional, must also contain {txnID}
+With --transactional, it must also contain {txnID}.
 (e.g. "{topic}-{txnID}.jsonl" produces "orders-my-txn.jsonl").
 Topic names are sanitised to prevent path traversal.`)
 	rootCmd.Flags().StringVar(&fmtName, "output-format", "binary",
@@ -138,6 +160,22 @@ Topic names are sanitised to prevent path traversal.`)
 		"File path for dead-letter queue; failed HTTP messages are appended here instead of stopping the process")
 	rootCmd.Flags().DurationVar(&httpOpts.Timeout, "output-http-timeout", 30*time.Second,
 		"HTTP request timeout per message")
+	rootCmd.Flags().StringVar(&s3Opts.Region, "output-s3-region", "",
+		"AWS region for S3 output (if empty, uses AWS SDK default chain)")
+	rootCmd.Flags().StringVar(&s3Opts.Endpoint, "output-s3-endpoint", "",
+		"Custom S3 endpoint URL (e.g. http://127.0.0.1:9000 for MinIO)")
+	rootCmd.Flags().BoolVar(&s3Opts.ForcePathStyle, "output-s3-force-path-style", false,
+		"Use path-style S3 addressing (required by some S3-compatible endpoints)")
+	rootCmd.Flags().IntVar(&s3Opts.RetryMaxAttempts, "output-s3-retries", 3,
+		"Maximum S3 write attempts for each operation")
+	rootCmd.Flags().DurationVar(&s3Opts.RetryDelay, "output-s3-retry-delay", 250*time.Millisecond,
+		"Delay between S3 retry attempts")
+	rootCmd.Flags().IntVar(&s3Opts.BatchMaxBytes, "output-s3-batch-max-bytes", 5*1024*1024,
+		"Maximum buffered bytes per S3 object before flush")
+	rootCmd.Flags().IntVar(&s3Opts.BatchMaxMessages, "output-s3-batch-max-messages", 1000,
+		"Maximum buffered messages per S3 object before flush")
+	rootCmd.Flags().Int64Var(&s3Opts.MultipartPartSize, "output-s3-multipart-part-size", 5*1024*1024,
+		"Multipart upload part size in bytes (minimum 5 MiB for non-final parts)")
 
 	rootCmd.AddCommand(&cobra.Command{
 		Use:   "json-schema",
@@ -153,7 +191,7 @@ Topic names are sanitised to prevent path traversal.`)
 	}
 }
 
-func run(addr, dst, fmtName, fmtStr string, jsonB64Key, jsonB64Val bool, separator, sepHex string, noSeparator, transactional bool, tOpts output.TLSOpts, httpOpts output.HTTPOpts) error {
+func run(addr, dst, fmtName, fmtStr string, jsonB64Key, jsonB64Val bool, separator, sepHex string, noSeparator, transactional bool, tOpts output.TLSOpts, httpOpts output.HTTPOpts, s3Opts output.S3Opts) error {
 	var sep []byte
 	if fmtName == "binary" {
 		var err error
@@ -193,11 +231,18 @@ func run(addr, dst, fmtName, fmtStr string, jsonB64Key, jsonB64Val bool, separat
 
 	var w output.Writer
 	isHTTP := strings.HasPrefix(dst, "http://") || strings.HasPrefix(dst, "https://")
+	isS3 := strings.HasPrefix(dst, "s3://")
 	if isHTTP {
 		if transactional {
 			return fmt.Errorf("--transactional is not supported with HTTP output")
 		}
 		w, err = output.NewHTTPWriter(dst, httpOpts, tlsCfg)
+	} else if isS3 {
+		if transactional {
+			w, err = output.NewTxnS3Writer(dst, s3Opts)
+		} else {
+			w, err = output.NewS3Writer(dst, s3Opts)
+		}
 	} else if transactional && dst != "-" {
 		w, err = output.NewTxnFileWriter(dst)
 	} else {
@@ -256,6 +301,13 @@ func run(addr, dst, fmtName, fmtStr string, jsonB64Key, jsonB64Val bool, separat
 					if err := w.Write(data, msg); err != nil {
 						writeErr = fmt.Errorf("failed to write message: %w", err)
 						break
+					}
+				}
+				if writeErr == nil {
+					if flusher, ok := w.(output.Flusher); ok {
+						if err := flusher.Flush(); err != nil {
+							writeErr = fmt.Errorf("failed to flush output: %w", err)
+						}
 					}
 				}
 			case *ksink.TxnCommitEvent:
