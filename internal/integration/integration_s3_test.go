@@ -95,7 +95,7 @@ func startMinIOForTest(t *testing.T) (*awss3.Client, string, string) {
 	pool := newDockerPool(t)
 	resource, err := pool.RunWithOptions(&dockertest.RunOptions{
 		Repository:   "minio/minio",
-		Tag:          "latest",
+		Tag:          "RELEASE.2025-09-07T16-13-09Z",
 		Cmd:          []string{"server", "/data", "--address", ":9000"},
 		ExposedPorts: []string{"9000/tcp"},
 		Env: []string{

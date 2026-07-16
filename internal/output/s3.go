@@ -188,6 +188,7 @@ func (w *s3Writer) flushKeyLocked(key string, buf *s3Buffer) error {
 	}
 	buf.count = 0
 	buf.data.Reset()
+	delete(w.buffers, key)
 	return nil
 }
 
@@ -225,7 +226,6 @@ func (w *txnS3Writer) CommitTxn(txnID string) error {
 		w.mu.Unlock()
 		return nil
 	}
-	delete(w.txnData, txnID)
 	w.mu.Unlock()
 
 	for key, data := range byKey {
@@ -240,6 +240,10 @@ func (w *txnS3Writer) CommitTxn(txnID string) error {
 			return err
 		}
 	}
+
+	w.mu.Lock()
+	delete(w.txnData, txnID)
+	w.mu.Unlock()
 
 	return nil
 }
@@ -270,15 +274,21 @@ func (w *txnS3Writer) putObject(key string, payload []byte) error {
 }
 
 func (w *txnS3Writer) multipartPutObject(key string, payload []byte) error {
-	createOut, err := w.client.CreateMultipartUpload(context.Background(), &s3.CreateMultipartUploadInput{
-		Bucket: aws.String(w.bucket),
-		Key:    aws.String(key),
-	})
-	if err != nil {
+	var uploadID *string
+	if err := withS3Retry(w.opts, func() error {
+		createOut, err := w.client.CreateMultipartUpload(context.Background(), &s3.CreateMultipartUploadInput{
+			Bucket: aws.String(w.bucket),
+			Key:    aws.String(key),
+		})
+		if err != nil {
+			return err
+		}
+		uploadID = createOut.UploadId
+		return nil
+	}); err != nil {
 		return fmt.Errorf("failed to start multipart upload for s3://%s/%s: %w", w.bucket, key, err)
 	}
 
-	uploadID := createOut.UploadId
 	parts := make([]types.CompletedPart, 0, (len(payload)+int(w.opts.MultipartPartSize)-1)/int(w.opts.MultipartPartSize))
 
 	for partNum, start := int32(1), 0; start < len(payload); partNum, start = partNum+1, start+int(w.opts.MultipartPartSize) {
@@ -287,36 +297,46 @@ func (w *txnS3Writer) multipartPutObject(key string, payload []byte) error {
 			end = len(payload)
 		}
 		chunk := payload[start:end]
-		upOut, uploadErr := w.client.UploadPart(context.Background(), &s3.UploadPartInput{
-			Bucket:     aws.String(w.bucket),
-			Key:        aws.String(key),
-			UploadId:   uploadID,
-			PartNumber: aws.Int32(partNum),
-			Body:       bytes.NewReader(chunk),
-		})
-		if uploadErr != nil {
+		pn := partNum
+		var completedPart types.CompletedPart
+		if err := withS3Retry(w.opts, func() error {
+			upOut, err := w.client.UploadPart(context.Background(), &s3.UploadPartInput{
+				Bucket:     aws.String(w.bucket),
+				Key:        aws.String(key),
+				UploadId:   uploadID,
+				PartNumber: aws.Int32(pn),
+				Body:       bytes.NewReader(chunk),
+			})
+			if err != nil {
+				return err
+			}
+			completedPart = types.CompletedPart{
+				ETag:       upOut.ETag,
+				PartNumber: aws.Int32(pn),
+			}
+			return nil
+		}); err != nil {
 			_, _ = w.client.AbortMultipartUpload(context.Background(), &s3.AbortMultipartUploadInput{
 				Bucket:   aws.String(w.bucket),
 				Key:      aws.String(key),
 				UploadId: uploadID,
 			})
-			return fmt.Errorf("failed to upload multipart part %d for s3://%s/%s: %w", partNum, w.bucket, key, uploadErr)
+			return fmt.Errorf("failed to upload multipart part %d for s3://%s/%s: %w", pn, w.bucket, key, err)
 		}
-		parts = append(parts, types.CompletedPart{
-			ETag:       upOut.ETag,
-			PartNumber: aws.Int32(partNum),
-		})
+		parts = append(parts, completedPart)
 	}
 
-	_, err = w.client.CompleteMultipartUpload(context.Background(), &s3.CompleteMultipartUploadInput{
-		Bucket:   aws.String(w.bucket),
-		Key:      aws.String(key),
-		UploadId: uploadID,
-		MultipartUpload: &types.CompletedMultipartUpload{
-			Parts: parts,
-		},
-	})
-	if err != nil {
+	if err := withS3Retry(w.opts, func() error {
+		_, err := w.client.CompleteMultipartUpload(context.Background(), &s3.CompleteMultipartUploadInput{
+			Bucket:   aws.String(w.bucket),
+			Key:      aws.String(key),
+			UploadId: uploadID,
+			MultipartUpload: &types.CompletedMultipartUpload{
+				Parts: parts,
+			},
+		})
+		return err
+	}); err != nil {
 		_, _ = w.client.AbortMultipartUpload(context.Background(), &s3.AbortMultipartUploadInput{
 			Bucket:   aws.String(w.bucket),
 			Key:      aws.String(key),
