@@ -221,12 +221,12 @@ func (w *txnS3Writer) Write(data []byte, msg *ksink.Message) error {
 
 func (w *txnS3Writer) CommitTxn(txnID string) error {
 	w.mu.Lock()
+	defer w.mu.Unlock()
+
 	byKey, ok := w.txnData[txnID]
 	if !ok {
-		w.mu.Unlock()
 		return nil
 	}
-	w.mu.Unlock()
 
 	for key, data := range byKey {
 		payload := append([]byte(nil), data.data.Bytes()...)
@@ -241,10 +241,7 @@ func (w *txnS3Writer) CommitTxn(txnID string) error {
 		}
 	}
 
-	w.mu.Lock()
 	delete(w.txnData, txnID)
-	w.mu.Unlock()
-
 	return nil
 }
 
@@ -263,14 +260,17 @@ func (w *txnS3Writer) Close() error {
 }
 
 func (w *txnS3Writer) putObject(key string, payload []byte) error {
-	return withS3Retry(w.opts, func() error {
+	if err := withS3Retry(w.opts, func() error {
 		_, err := w.client.PutObject(context.Background(), &s3.PutObjectInput{
 			Bucket: aws.String(w.bucket),
 			Key:    aws.String(key),
 			Body:   bytes.NewReader(payload),
 		})
 		return err
-	})
+	}); err != nil {
+		return fmt.Errorf("failed to put S3 object s3://%s/%s: %w", w.bucket, key, err)
+	}
+	return nil
 }
 
 func (w *txnS3Writer) multipartPutObject(key string, payload []byte) error {
@@ -393,6 +393,15 @@ func parseS3Destination(dst string) (bucket, key string, err error) {
 	}
 	if u.Scheme != "s3" {
 		return "", "", fmt.Errorf("invalid S3 destination scheme %q", u.Scheme)
+	}
+	if u.User != nil {
+		return "", "", fmt.Errorf("invalid S3 destination %q: userinfo is not supported", dst)
+	}
+	if u.RawQuery != "" {
+		return "", "", fmt.Errorf("invalid S3 destination %q: query parameters are not supported", dst)
+	}
+	if u.Fragment != "" {
+		return "", "", fmt.Errorf("invalid S3 destination %q: fragments are not supported", dst)
 	}
 	if u.Host == "" {
 		return "", "", fmt.Errorf("missing S3 bucket in %q", dst)

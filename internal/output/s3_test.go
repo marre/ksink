@@ -82,6 +82,24 @@ func TestParseS3Destination(t *testing.T) {
 	assert.Equal(t, "path/to/{topic}.jsonl", key)
 }
 
+func TestParseS3DestinationRejectsUserinfo(t *testing.T) {
+	_, _, err := parseS3Destination("s3://user@my-bucket/key.jsonl")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "userinfo is not supported")
+}
+
+func TestParseS3DestinationRejectsQueryParams(t *testing.T) {
+	_, _, err := parseS3Destination("s3://my-bucket/key.jsonl?x=y")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "query parameters are not supported")
+}
+
+func TestParseS3DestinationRejectsFragment(t *testing.T) {
+	_, _, err := parseS3Destination("s3://my-bucket/key.jsonl#section")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "fragments are not supported")
+}
+
 func TestNewS3WriterRejectsTxnPlaceholder(t *testing.T) {
 	_, err := NewS3Writer("s3://b/out-{txnID}.jsonl", S3Opts{})
 	require.Error(t, err)
@@ -164,6 +182,22 @@ func TestTxnS3WriterCommitMultipart(t *testing.T) {
 	require.Len(t, client.mpCreates, 1)
 	require.Len(t, client.mpUploads, 2)
 	require.Len(t, client.mpDone, 1)
+}
+
+func TestTxnS3WriterCommitPutObjectErrorIncludesBucketKey(t *testing.T) {
+	client := &mockS3Client{failPutAfter: 1}
+	w := &txnS3Writer{
+		client: client,
+		opts:   normalizeS3Opts(S3Opts{RetryMaxAttempts: 1}),
+		bucket: "my-bucket",
+		keyTpl: "events/{topic}-{txnID}.jsonl",
+		txnData: map[string]map[string]*txnS3Buffer{},
+	}
+
+	require.NoError(t, w.Write([]byte("data"), &ksink.Message{TransactionalID: "txn1", Topic: "orders"}))
+	err := w.CommitTxn("txn1")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "s3://my-bucket/")
 }
 
 func TestTxnS3WriterAbortTxn(t *testing.T) {
