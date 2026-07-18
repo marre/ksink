@@ -2,8 +2,13 @@ package output
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -232,6 +237,41 @@ func TestWithS3Retry(t *testing.T) {
 		attempts++
 		if attempts < 3 {
 			return fmt.Errorf("transient")
+		}
+
+		func TestDurableS3BufferRecoveryTruncatesToJournalOffset(t *testing.T) {
+			root := t.TempDir()
+			key := "events/orders.jsonl"
+			sum := sha256.Sum256([]byte(key))
+			name := hex.EncodeToString(sum[:]) + ".data"
+			active := filepath.Join(root, "active")
+			require.NoError(t, os.MkdirAll(active, 0700))
+			require.NoError(t, os.WriteFile(filepath.Join(active, name), []byte("complete-partial"), 0600))
+			meta := durableMeta{
+				Bucket: "bucket", Key: key, ObjectKey: "events/orders-1.jsonl",
+				Offset: 8, Count: 1,
+			}
+			metaBytes, err := json.Marshal(meta)
+			require.NoError(t, err)
+			require.NoError(t, os.WriteFile(filepath.Join(active, name+".meta"), metaBytes, 0600))
+
+			client := &mockS3Client{}
+			b, err := newDurableS3Buffer(root, "bucket", "events/{topic}.jsonl", client,
+				normalizeS3Opts(S3Opts{RetryMaxAttempts: 1}))
+			require.NoError(t, err)
+			require.NoError(t, b.close())
+			require.Len(t, client.putObjects, 1)
+			assert.Equal(t, "complete", client.putObjects[0].body)
+		}
+
+		func TestDurableS3BufferStartupFailsWithoutJournal(t *testing.T) {
+			root := t.TempDir()
+			require.NoError(t, os.MkdirAll(filepath.Join(root, "active"), 0700))
+			require.NoError(t, os.WriteFile(filepath.Join(root, "active", "orphan.data"), []byte("data"), 0600))
+			_, err := newDurableS3Buffer(root, "bucket", "events/{topic}.jsonl", &mockS3Client{},
+				normalizeS3Opts(S3Opts{RetryMaxAttempts: 1}))
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "journal")
 		}
 		return nil
 	})

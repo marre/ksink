@@ -110,6 +110,8 @@ kcat format specifiers (--output-format-string):
 					"output-s3-batch-max-bytes",
 					"output-s3-batch-max-messages",
 					"output-s3-multipart-part-size",
+					"output-s3-buffer-dir",
+					"output-s3-batch-max-age",
 				} {
 					if cmd.Flags().Changed(name) {
 						return fmt.Errorf("--output-s3-* flags require an s3:// output destination")
@@ -176,6 +178,10 @@ Topic names are sanitised to prevent path traversal.`)
 		"Maximum buffered messages per S3 object before flush")
 	rootCmd.Flags().Int64Var(&s3Opts.MultipartPartSize, "output-s3-multipart-part-size", 5*1024*1024,
 		"Multipart upload part size in bytes (minimum 5 MiB for non-final parts)")
+	rootCmd.Flags().StringVar(&s3Opts.BufferDir, "output-s3-buffer-dir", "",
+		"Directory for durable local S3 buffering and startup recovery (empty = memory only)")
+	rootCmd.Flags().DurationVar(&s3Opts.BatchMaxAge, "output-s3-batch-max-age", 0,
+		"Maximum age of a durable local S3 buffer before it is uploaded (0 = disabled)")
 
 	rootCmd.AddCommand(&cobra.Command{
 		Use:   "json-schema",

@@ -1,6 +1,7 @@
 package output
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -43,11 +44,11 @@ type durableEntry struct {
 }
 
 type durableMeta struct {
-	Bucket    string `json:"bucket"`
-	Key       string `json:"key"`
-	ObjectKey string `json:"object_key"`
-	Count     int    `json:"count"`
-	Offset    int64  `json:"offset"`
+	Bucket    string    `json:"bucket"`
+	Key       string    `json:"key"`
+	ObjectKey string    `json:"object_key"`
+	Count     int       `json:"count"`
+	Offset    int64     `json:"offset"`
 	Created   time.Time `json:"created"`
 }
 
