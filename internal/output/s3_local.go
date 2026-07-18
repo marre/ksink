@@ -32,8 +32,11 @@ type durableS3Buffer struct {
 	closeOne sync.Once
 }
 
-// durableAgeCheckDivisor determines the ticker frequency relative to BatchMaxAge.
+// durableAgeCheckDivisor checks twice per age window, limiting rotation delay
+// without creating a high-frequency background loop.
 const durableAgeCheckDivisor = 2
+
+const durableMinBatchAge = 100 * time.Millisecond
 
 type durableEntry struct {
 	key       string
@@ -49,6 +52,7 @@ type durableEntry struct {
 type durableMeta struct {
 	Bucket    string    `json:"bucket"`
 	Key       string    `json:"key"`
+	KeyTpl    string    `json:"key_template"`
 	ObjectKey string    `json:"object_key"`
 	Count     int       `json:"count"`
 	Offset    int64     `json:"offset"`
@@ -151,6 +155,8 @@ func (b *durableS3Buffer) ageLoop() {
 }
 
 func (b *durableS3Buffer) openEntry(key string) (*durableEntry, error) {
+	// Hashing keeps arbitrary S3 keys out of local path names and provides a
+	// stable collision-resistant filename for recovery.
 	keyHash := sha256.Sum256([]byte(key))
 	hashedFileName := hex.EncodeToString(keyHash[:])
 	dir := filepath.Join(b.root, "active")
@@ -172,7 +178,7 @@ func (b *durableS3Buffer) openEntry(key string) (*durableEntry, error) {
 }
 
 func (b *durableS3Buffer) writeMeta(e *durableEntry) error {
-	meta := durableMeta{Bucket: b.bucket, Key: e.key, ObjectKey: e.objectKey, Count: e.count, Offset: e.offset, Created: e.created}
+	meta := durableMeta{Bucket: b.bucket, Key: e.key, KeyTpl: b.keyTpl, ObjectKey: e.objectKey, Count: e.count, Offset: e.offset, Created: e.created}
 	data, err := json.Marshal(meta)
 	if err != nil {
 		return fmt.Errorf("failed to encode durable S3 journal: %w", err)
@@ -242,6 +248,9 @@ func (b *durableS3Buffer) upload(dataPath string) error {
 	}
 	if meta.Bucket != b.bucket {
 		return fmt.Errorf("bucket mismatch: file %s has bucket %q but expected %q", dataPath, meta.Bucket, b.bucket)
+	}
+	if meta.KeyTpl != "" && meta.KeyTpl != b.keyTpl {
+		return fmt.Errorf("key template mismatch: file %s has %q but expected %q", dataPath, meta.KeyTpl, b.keyTpl)
 	}
 	if err := validateDurableFile(dataPath, meta); err != nil {
 		return err
