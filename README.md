@@ -98,12 +98,51 @@ Supported placeholders in the S3 key pattern:
 - `{txnID}` for transactional output (`--transactional` only)
 
 S3 flags:
-- `--output-s3-region`
-- `--output-s3-endpoint`
-- `--output-s3-force-path-style`
-- `--output-s3-retries`, `--output-s3-retry-delay`
-- `--output-s3-batch-max-bytes`, `--output-s3-batch-max-messages`
-- `--output-s3-multipart-part-size`
+- `--output-s3-region`: AWS region for S3 output (uses AWS SDK default chain if empty).
+- `--output-s3-endpoint`: Custom S3 endpoint URL (e.g. `http://127.0.0.1:9000` for MinIO).
+- `--output-s3-force-path-style`: Use path-style S3 addressing (required by some S3-compatible endpoints like MinIO).
+- `--output-s3-retries`: Maximum S3 write attempts for each operation (default: `3`).
+- `--output-s3-retry-delay`: Delay between S3 retry attempts (default: `250ms`).
+- `--output-s3-batch-max-bytes`: Maximum buffered bytes per S3 object before flush (default: `5242880` / 5 MiB).
+- `--output-s3-batch-max-messages`: Maximum buffered messages per S3 object before flush (default: `1000`).
+- `--output-s3-multipart-part-size`: Multipart upload part size in bytes (minimum `5242880` / 5 MiB).
+- `--output-s3-buffer-dir`: Directory for durable local S3 buffering and startup recovery (memory-only if empty).
+- `--output-s3-batch-max-age`: Maximum age of a durable local S3 buffer before it is uploaded (disabled if `0`).
+
+#### S3 Upload Mechanics
+
+Under the hood, S3 uploads operate in one of two modes depending on whether `--transactional` is enabled:
+
+##### 1. Non-Transactional Uploads
+
+By default, messages are routed to partitions based on the resolved S3 key (derived from the `--output` S3 key pattern and the message's topic).
+
+- **In-Memory Buffering (Default):**
+  - Messages are buffered in memory per resolved S3 key.
+  - When the buffer reaches `--output-s3-batch-max-bytes` or `--output-s3-batch-max-messages`, an upload to S3 is triggered.
+  - Each uploaded batch is saved as a unique object using a suffix based on the current Unix nanoseconds timestamp and a sequence counter to prevent overwriting existing objects (e.g., `key-pattern-<timestamp>-<sequence>`).
+  - Active buffers are also flushed and uploaded when the process shuts down cleanly.
+
+- **Durable Local Buffering:**
+  - If `--output-s3-buffer-dir` is provided, `ksink` utilizes a filesystem write-ahead state machine with `active`, `pending`, and `uploading` subdirectories for durable message persistence.
+  - **Write-Ahead Logging:** In-progress data is written and synchronized (`fsync`'d) to disk under the `active/` directory before any metadata journal updates.
+  - **Hashing Key Names:** The resolved S3 key is hashed using SHA-256 to generate stable, collision-free local filenames, avoiding any path traversal issues.
+  - **Rotation & Upload:** Once local size/count limits are reached or the buffer exceeds `--output-s3-batch-max-age` (checked periodically by a background loop), the files are closed and moved sequentially to `pending/`, then `uploading/` to be uploaded via `PutObject`. Once the S3 upload succeeds, the local temporary files are deleted.
+  - **Startup Recovery:** On initialization, `ksink` checks the buffer directory. It recovers any half-written files from the `active/` directory by validating them against their metadata journals, truncating them to the last synced offset, moving them to `pending/`, and immediately uploading all pending/uploading batches to S3 before starting to accept new incoming writes.
+
+##### 2. Transactional Uploads
+
+To enable transactional S3 uploads, you must provide the `--transactional` flag and include the `{txnID}` placeholder in the output pattern (e.g., `s3://my-bucket/messages/{topic}-{txnID}.jsonl`).
+
+- **In-Memory Partitioned Buffering:**
+  - Messages are buffered in memory, partitioned by both the transaction ID and the resolved S3 key pattern.
+  - Active transactional payloads are held in memory and are **not** persisted to the local filesystem. If the `ksink` process crashes or restarts, any uncommitted transactional data in memory is lost.
+- **Commit Semantics:**
+  - When the producer commits the transaction (`CommitTxn`), `ksink` flushes and uploads the buffered messages to S3.
+  - **PutObject (Small Transactions):** If the buffered payload size is smaller than the multipart threshold specified by `--output-s3-multipart-part-size` (default: 5 MiB), the payload is uploaded as a single object via a standard `PutObject` call.
+  - **Multipart Upload (Large Transactions):** If the payload size exceeds the threshold, `ksink` splits the payload into part-sized chunks (using the `--output-s3-multipart-part-size` configuration) and uploads them using S3 Multipart Upload APIs. On successful completion of all part uploads, the upload is finalized (`CompleteMultipartUpload`). If any part upload fails, the multipart upload is aborted (`AbortMultipartUpload`) to clean up resources in S3.
+- **Abort Semantics:**
+  - When the producer aborts the transaction (`AbortTxn`), `ksink` simply discards the corresponding in-memory buffers without uploading any objects to S3.
 
 Durability semantics:
 - Non-transactional S3 output acknowledges after the current write batch is
