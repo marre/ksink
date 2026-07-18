@@ -32,6 +32,8 @@ type durableS3Buffer struct {
 	closeOne sync.Once
 }
 
+const durableAgeCheckDivisor = 2
+
 type durableEntry struct {
 	key       string
 	objectKey string
@@ -126,7 +128,8 @@ func (b *durableS3Buffer) close() error {
 }
 
 func (b *durableS3Buffer) ageLoop() {
-	t := time.NewTicker(b.opts.BatchMaxAge / 2)
+	// Check twice per configured age so rotation is not delayed by a full age interval.
+	t := time.NewTicker(b.opts.BatchMaxAge / durableAgeCheckDivisor)
 	defer func() { t.Stop(); close(b.done) }()
 	for {
 		select {
@@ -147,10 +150,10 @@ func (b *durableS3Buffer) ageLoop() {
 }
 
 func (b *durableS3Buffer) openEntry(key string) (*durableEntry, error) {
-	idBytes := sha256.Sum256([]byte(key))
-	id := hex.EncodeToString(idBytes[:])
+	keyHash := sha256.Sum256([]byte(key))
+	hashedFileName := hex.EncodeToString(keyHash[:])
 	dir := filepath.Join(b.root, "active")
-	dataPath := filepath.Join(dir, id+".data")
+	dataPath := filepath.Join(dir, hashedFileName+".data")
 	metaPath := dataPath + ".meta"
 	f, err := os.OpenFile(dataPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
 	if err != nil {
@@ -261,7 +264,6 @@ func (b *durableS3Buffer) upload(dataPath string) error {
 	if err != nil {
 		return err
 	}
-	defer f.Close() //nolint:errcheck
 	if err := withS3Retry(b.opts, func() error {
 		_, e := b.client.PutObject(context.Background(), &s3.PutObjectInput{
 			Bucket: aws.String(meta.Bucket), Key: aws.String(meta.ObjectKey), Body: f,
@@ -271,7 +273,11 @@ func (b *durableS3Buffer) upload(dataPath string) error {
 		}
 		return e
 	}); err != nil {
+		_ = f.Close()
 		return fmt.Errorf("failed to sync durable S3 buffer %s: %w", dataPath, err)
+	}
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("failed to close durable S3 buffer %s: %w", dataPath, err)
 	}
 	if err := os.Remove(dataPath); err != nil {
 		return err
