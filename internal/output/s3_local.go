@@ -30,13 +30,12 @@ type durableS3Buffer struct {
 	stop     chan struct{}
 	done     chan struct{}
 	closeOne sync.Once
+	asyncErr error
 }
 
 // durableAgeCheckDivisor checks twice per age window, limiting rotation delay
 // without creating a high-frequency background loop.
 const durableAgeCheckDivisor = 2
-
-const durableMinBatchAge = 100 * time.Millisecond
 
 type durableEntry struct {
 	key       string
@@ -83,6 +82,9 @@ func newDurableS3Buffer(root, bucket, keyTpl string, client s3API, opts S3Opts) 
 func (b *durableS3Buffer) write(data []byte, msg *ksink.Message) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	if b.asyncErr != nil {
+		return b.asyncErr
+	}
 	key := resolveS3Key(b.keyTpl, "", topicFromMsg(msg))
 	e := b.active[key]
 	if e == nil {
@@ -114,6 +116,9 @@ func (b *durableS3Buffer) write(data []byte, msg *ksink.Message) error {
 func (b *durableS3Buffer) flush() error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	if b.asyncErr != nil {
+		return b.asyncErr
+	}
 	for key := range b.active {
 		if err := b.rotateLocked(key); err != nil {
 			return err
@@ -143,10 +148,14 @@ func (b *durableS3Buffer) ageLoop() {
 			now := time.Now()
 			for key, e := range b.active {
 				if now.Sub(e.created) >= b.opts.BatchMaxAge {
-					_ = b.rotateLocked(key)
+					if err := b.rotateLocked(key); err != nil && b.asyncErr == nil {
+						b.asyncErr = err
+					}
 				}
 			}
-			_ = b.syncPendingLocked()
+			if err := b.syncPendingLocked(); err != nil && b.asyncErr == nil {
+				b.asyncErr = err
+			}
 			b.mu.Unlock()
 		case <-b.stop:
 			return
@@ -249,7 +258,7 @@ func (b *durableS3Buffer) upload(dataPath string) error {
 	if meta.Bucket != b.bucket {
 		return fmt.Errorf("bucket mismatch: file %s has bucket %q but expected %q", dataPath, meta.Bucket, b.bucket)
 	}
-	if meta.KeyTpl != "" && meta.KeyTpl != b.keyTpl {
+	if meta.KeyTpl != b.keyTpl {
 		return fmt.Errorf("key template mismatch: file %s has %q but expected %q", dataPath, meta.KeyTpl, b.keyTpl)
 	}
 	if err := validateDurableFile(dataPath, meta); err != nil {

@@ -253,7 +253,7 @@ func TestDurableS3BufferRecoveryTruncatesToJournalOffset(t *testing.T) {
 	require.NoError(t, os.MkdirAll(active, 0700))
 	require.NoError(t, os.WriteFile(filepath.Join(active, name), []byte("complete-partial"), 0600))
 	meta := durableMeta{
-		Bucket: "bucket", Key: key, KeyTpl: "events/{topic}.jsonl", ObjectKey: "events/orders-1.jsonl",
+		Bucket: "bucket", Key: key, KeyTpl: "events/{topic}.jsonl", ObjectKey: "events/orders-123-1.jsonl",
 		Offset: 8, Count: 1,
 	}
 	metaBytes, err := json.Marshal(meta)

@@ -24,6 +24,7 @@ const (
 	defaultS3RetryDelay        = 250 * time.Millisecond
 	defaultS3RetryMaxAttempts  = 3
 	defaultS3MultipartPartSize = 5 * 1024 * 1024
+	minAllowedBatchMaxAge      = 100 * time.Millisecond
 )
 
 // S3Opts holds configuration for S3 output writers.
@@ -390,8 +391,8 @@ func normalizeS3Opts(opts S3Opts) S3Opts {
 	} else if opts.MultipartPartSize < defaultS3MultipartPartSize {
 		opts.MultipartPartSize = defaultS3MultipartPartSize
 	}
-	if opts.BatchMaxAge > 0 && opts.BatchMaxAge < durableMinBatchAge {
-		opts.BatchMaxAge = durableMinBatchAge
+	if opts.BatchMaxAge > 0 && opts.BatchMaxAge < minAllowedBatchMaxAge {
+		opts.BatchMaxAge = minAllowedBatchMaxAge
 	}
 	return opts
 }
