@@ -125,7 +125,7 @@ By default, messages are routed to partitions based on the resolved S3 key (deri
 
 - **Durable Local Buffering:**
   - If `--output-s3-buffer-dir` is provided, `ksink` utilizes a filesystem write-ahead state machine with `active`, `pending`, and `uploading` subdirectories for durable message persistence.
-  - **Write-Ahead Logging:** In-progress data is written and synchronized (`fsync`'d) to disk under the `active/` directory before any metadata journal updates.
+  - **Write-Ahead Logging:** In-progress data is written and synchronized (`fsynced`) to disk under the `active/` directory before any metadata journal updates.
   - **Hashing Key Names:** The resolved S3 key is hashed using SHA-256 to generate stable, collision-free local filenames, avoiding any path traversal issues.
   - **Rotation & Upload:** Once local size/count limits are reached or the buffer exceeds `--output-s3-batch-max-age` (checked periodically by a background loop), the files are closed and moved sequentially to `pending/`, then `uploading/` to be uploaded via `PutObject`. Once the S3 upload succeeds, the local temporary files are deleted.
   - **Startup Recovery:** On initialization, `ksink` checks the buffer directory. It recovers any half-written files from the `active/` directory by validating them against their metadata journals, truncating them to the last synced offset, moving them to `pending/`, and immediately uploading all pending/uploading batches to S3 before starting to accept new incoming writes.
