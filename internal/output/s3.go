@@ -390,6 +390,9 @@ func normalizeS3Opts(opts S3Opts) S3Opts {
 	} else if opts.MultipartPartSize < defaultS3MultipartPartSize {
 		opts.MultipartPartSize = defaultS3MultipartPartSize
 	}
+	if opts.BatchMaxAge > 0 && opts.BatchMaxAge < durableAgeCheckDivisor*time.Nanosecond {
+		opts.BatchMaxAge = durableAgeCheckDivisor * time.Nanosecond
+	}
 	return opts
 }
 

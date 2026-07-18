@@ -242,12 +242,8 @@ func (b *durableS3Buffer) upload(dataPath string) error {
 	if meta.Bucket != b.bucket {
 		return fmt.Errorf("durable S3 buffer %s belongs to bucket %q, not %q", dataPath, meta.Bucket, b.bucket)
 	}
-	info, err := os.Stat(dataPath)
-	if err != nil {
+	if err := validateDurableFile(dataPath, meta); err != nil {
 		return err
-	}
-	if info.Size() < meta.Offset {
-		return fmt.Errorf("durable S3 buffer %s is shorter than its journal", dataPath)
 	}
 	uploadPath := filepath.Join(b.root, "uploading", filepath.Base(dataPath))
 	uploadMeta := uploadPath + ".meta"
@@ -310,12 +306,8 @@ func (b *durableS3Buffer) recover() error {
 		if err := json.Unmarshal(metaData, &meta); err != nil {
 			return fmt.Errorf("cannot recover %s: %w", dataPath, err)
 		}
-		info, err := os.Stat(dataPath)
-		if err != nil {
-			return err
-		}
-		if info.Size() < meta.Offset {
-			return fmt.Errorf("cannot recover %s: file shorter than journal", dataPath)
+		if err := validateDurableFile(dataPath, meta); err != nil {
+			return fmt.Errorf("cannot recover %s: %w", dataPath, err)
 		}
 		if err := os.Truncate(dataPath, meta.Offset); err != nil {
 			return err
@@ -329,4 +321,15 @@ func (b *durableS3Buffer) recover() error {
 		}
 	}
 	return b.syncPendingLocked()
+}
+
+func validateDurableFile(dataPath string, meta durableMeta) error {
+	info, err := os.Stat(dataPath)
+	if err != nil {
+		return err
+	}
+	if info.Size() < meta.Offset {
+		return fmt.Errorf("file is shorter than its journal")
+	}
+	return nil
 }
