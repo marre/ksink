@@ -32,6 +32,7 @@ type durableS3Buffer struct {
 	closeOne sync.Once
 }
 
+// durableAgeCheckDivisor determines the ticker frequency relative to BatchMaxAge.
 const durableAgeCheckDivisor = 2
 
 type durableEntry struct {
@@ -128,7 +129,7 @@ func (b *durableS3Buffer) close() error {
 }
 
 func (b *durableS3Buffer) ageLoop() {
-	// Check twice per configured age so rotation is not delayed by a full age interval.
+	// Check at intervals of BatchMaxAge/durableAgeCheckDivisor.
 	t := time.NewTicker(b.opts.BatchMaxAge / durableAgeCheckDivisor)
 	defer func() { t.Stop(); close(b.done) }()
 	for {
@@ -240,7 +241,7 @@ func (b *durableS3Buffer) upload(dataPath string) error {
 		return fmt.Errorf("invalid journal for durable S3 buffer %s: %w", dataPath, err)
 	}
 	if meta.Bucket != b.bucket {
-		return fmt.Errorf("durable S3 buffer %s belongs to bucket %q, not %q", dataPath, meta.Bucket, b.bucket)
+		return fmt.Errorf("bucket mismatch: file %s has bucket %q but expected %q", dataPath, meta.Bucket, b.bucket)
 	}
 	if err := validateDurableFile(dataPath, meta); err != nil {
 		return err
@@ -329,7 +330,7 @@ func validateDurableFile(dataPath string, meta durableMeta) error {
 		return err
 	}
 	if info.Size() < meta.Offset {
-		return fmt.Errorf("file is shorter than its journal")
+		return fmt.Errorf("file size (%d bytes) is shorter than journal offset (%d bytes)", info.Size(), meta.Offset)
 	}
 	return nil
 }
