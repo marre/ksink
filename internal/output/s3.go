@@ -39,6 +39,12 @@ type S3Opts struct {
 	BatchMaxMessages int
 
 	MultipartPartSize int64
+
+	// BufferDir enables durable local buffering. Files are recovered and
+	// synchronised before NewS3Writer returns.
+	BufferDir string
+	// BatchMaxAge rotates an active durable buffer after this duration.
+	BatchMaxAge time.Duration
 }
 
 type s3API interface {
@@ -65,6 +71,7 @@ type s3Writer struct {
 	buffers map[string]*s3Buffer // resolved key template -> buffered payload
 
 	nextObjectID uint64
+	local        *durableS3Buffer
 }
 
 type txnS3Buffer struct {
@@ -97,13 +104,21 @@ func NewS3Writer(dst string, opts S3Opts) (Writer, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &s3Writer{
+	w := &s3Writer{
 		client:  client,
 		opts:    opts,
 		bucket:  bucket,
 		keyTpl:  keyTpl,
 		buffers: make(map[string]*s3Buffer),
-	}, nil
+	}
+	if opts.BufferDir != "" {
+		local, err := newDurableS3Buffer(opts.BufferDir, bucket, keyTpl, client, opts)
+		if err != nil {
+			return nil, err
+		}
+		w.local = local
+	}
+	return w, nil
 }
 
 // NewTxnS3Writer creates a transactional S3 writer.
@@ -130,6 +145,9 @@ func NewTxnS3Writer(dst string, opts S3Opts) (TransactionalWriter, error) {
 }
 
 func (w *s3Writer) Write(data []byte, msg *ksink.Message) error {
+	if w.local != nil {
+		return w.local.write(data, msg)
+	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
@@ -151,6 +169,9 @@ func (w *s3Writer) Write(data []byte, msg *ksink.Message) error {
 }
 
 func (w *s3Writer) Flush() error {
+	if w.local != nil {
+		return w.local.flush()
+	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
@@ -166,6 +187,9 @@ func (w *s3Writer) Flush() error {
 }
 
 func (w *s3Writer) Close() error {
+	if w.local != nil {
+		return w.local.close()
+	}
 	return w.Flush()
 }
 
