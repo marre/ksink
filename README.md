@@ -146,7 +146,7 @@ graph TD
 - **Durable Local Buffering:**
   - If `--output-s3-buffer-dir` is provided, `ksink` utilizes a filesystem write-ahead state machine with `active`, `pending`, and `uploading` subdirectories for durable message persistence.
   - **Write-Ahead Logging:** In-progress data is written and synchronized (`fsynced`) to disk under the `active/` directory before any metadata journal updates.
-  - **Hashing Key Names:** The resolved S3 key is hashed using SHA-256 to generate stable, collision-free local filenames, avoiding any path traversal issues.
+  - **Hashing Key Names:** The resolved S3 key is hashed using SHA-256 to generate stable, collision-resistant local filenames, avoiding any path traversal issues.
   - **Rotation & Upload:** Once local size/count limits are reached or the buffer exceeds `--output-s3-batch-max-age` (checked periodically by a background loop), the files are closed and moved sequentially to `pending/`, then `uploading/` to be uploaded via `PutObject`. Once the S3 upload succeeds, the local temporary files are deleted.
   - **Startup Recovery:** On initialization, `ksink` checks the buffer directory. It recovers any half-written files from the `active/` directory by validating them against their metadata journals, truncating them to the last synced offset, moving them to `pending/`, and immediately uploading all pending/uploading batches to S3 before starting to accept new incoming writes.
 
@@ -170,30 +170,37 @@ To enable transactional S3 uploads, you must provide the `--transactional` flag 
 
 ```mermaid
 graph TD
-    A[Kafka Message with TransactionalID] --> B[Buffer in memory partitioned by TxnID and resolved S3 key]
+    A[Kafka Message with TransactionalID] --> B{Durable S3 Buffer Configured?}
     
-    B --> C{Producer event received?}
+    B -->|No| C[Buffer in memory partitioned by TxnID and resolved S3 key]
+    B -->|Yes| C2[Write to txn/txnID/* file on disk]
     
-    C -->|AbortTxn| D[Discard in-memory buffers]
+    C --> D{Producer event received?}
+    C2 --> D
     
-    C -->|CommitTxn| E{Buffered payload size < MultipartPartSize?}
-    E -->|Yes| F[Upload as single object via PutObject]
-    E -->|No| G[Initiate Multipart Upload]
-    G --> H[Upload part-sized chunks in parallel/sequence]
-    H --> I{All parts uploaded successfully?}
-    I -->|Yes| J[Complete Multipart Upload]
-    I -->|No| K[Abort Multipart Upload & cleanup S3 storage]
+    D -->|AbortTxn| E[Discard in-memory buffers / Delete local files]
+    
+    D -->|CommitTxn| F{Payload/File size < MultipartPartSize?}
+    F -->|Yes| G[Upload as single object via PutObject]
+    F -->|No| H[Initiate Multipart Upload]
+    H --> I[Stream parts from memory/disk in sequence]
+    I --> J{All parts uploaded successfully?}
+    J -->|Yes| K[Complete Multipart Upload]
+    J -->|No| L[Abort Multipart Upload & cleanup S3 storage]
+    
+    G --> M[Delete local temp files if disk-buffered]
+    K --> M
 ```
 
-- **In-Memory Partitioned Buffering:**
-  - Messages are buffered in memory, partitioned by both the transaction ID and the resolved S3 key pattern.
-  - Active transactional payloads are held in memory and are **not** persisted to the local filesystem. If the `ksink` process crashes or restarts, any uncommitted transactional data in memory is lost.
+- **Partitioned Buffering (In-Memory or Disk-Backed):**
+  - By default, messages are buffered in memory, partitioned by both the transaction ID and the resolved S3 key pattern. Active transactional payloads are held in memory and are **not** persisted to the local filesystem.
+  - If `--output-s3-buffer-dir` is provided, `ksink` instead streams transactional payloads directly to disk under the local buffer directory (inside a temporary `txn/` subdirectory). This avoids buffering transactional payloads in RAM and allows arbitrarily large transactions to be written safely without high RAM usage.
 - **Commit Semantics:**
   - When the producer commits the transaction (`CommitTxn`), `ksink` flushes and uploads the buffered messages to S3.
-  - **PutObject (Small Transactions):** If the buffered payload size is smaller than the multipart threshold specified by `--output-s3-multipart-part-size` (default: 5 MiB), the payload is uploaded as a single object via a standard `PutObject` call.
-  - **Multipart Upload (Large Transactions):** If the payload size exceeds the threshold, `ksink` splits the payload into part-sized chunks (using the `--output-s3-multipart-part-size` configuration) and uploads them using S3 Multipart Upload APIs. On successful completion of all part uploads, the upload is finalized (`CompleteMultipartUpload`). If any part upload fails, the multipart upload is aborted (`AbortMultipartUpload`) to clean up resources in S3.
+  - **PutObject (Small Transactions):** If the buffered payload/file size is smaller than the multipart threshold specified by `--output-s3-multipart-part-size` (default: 5 MiB), the payload is uploaded as a single object via a standard `PutObject` call.
+  - **Multipart Upload (Large Transactions):** If the payload/file size exceeds the threshold, `ksink` splits the payload into part-sized chunks (using the `--output-s3-multipart-part-size` configuration) and uploads them using S3 Multipart Upload APIs. On successful completion of all part uploads, the upload is finalized (`CompleteMultipartUpload`). If any part upload fails, the multipart upload is aborted (`AbortMultipartUpload`) to clean up resources in S3.
 - **Abort Semantics:**
-  - When the producer aborts the transaction (`AbortTxn`), `ksink` simply discards the corresponding in-memory buffers without uploading any objects to S3.
+  - When the producer aborts the transaction (`AbortTxn`), `ksink` discards the corresponding in-memory buffers or deletes the disk-buffered transaction files.
 
 Durability semantics:
 - Non-transactional S3 output acknowledges after the current write batch is
@@ -204,8 +211,7 @@ Durability semantics:
 - Delivery is **at-least-once**: duplicates are possible after retries/failures.
 
 Crash recovery note:
-- In-progress transactional payloads are held in memory and are not recovered
-  after process crash/restart.
+- In-progress transactional payloads are held in memory (or disk-buffered) and are not recovered after process crash/restart (uncommitted transactional files are cleaned up on startup).
 
 Cost guidance:
 - Prefer larger batches to reduce `PutObject` request count and tiny-object
@@ -228,6 +234,120 @@ go run ./cmd/ksink --output-separator-hex "00" --output messages.bin
 # kcat-compatible output formatting
 go run ./cmd/ksink --output-format kcat \
   --output-format-string 'Topic: %t Partition: %p Offset: %o\nKey: %k\nValue: %s\n---\n'
+```
+
+### Producer Acknowledgment Flow
+
+When `ksink` receives a produce batch or a transaction commit from a client, it blocks the Kafka network connection thread and does not return a response to the producer until the data has been safely persisted to the configured destination (e.g. disk file, S3 bucket). This provides synchronous durability guarantees back to the producer.
+
+Here are three different ways of visualizing the acknowledgment flow and the interaction of different entities (Kafka Producer, S3, files, and ksink internals):
+
+#### 1. Chronological Sequence Flow (Temporal Detail)
+
+This sequence diagram illustrates the temporal, step-by-step synchronization across all system layers and entities during a produce and commit cycle.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Producer as Kafka Producer
+    participant Conn as TCP Socket (Conn)
+    participant Srv as ksink Server Handler
+    participant Loop as Main Read Loop (App)
+    participant Sink as Output Sink (File / S3)
+
+    Note over Producer, Sink: 1. Ingestion Phase
+    Producer->>Conn: Send Produce Request (TCP Packet)
+    Conn->>Srv: Parse Kafka payload & header
+    Srv->>Srv: Validate Topic & Extract Messages
+
+    Note over Srv, Loop: 2. Handoff & Synchronous Blocking
+    Srv->>Loop: Push pendingBatch{Event, ackCh} to s.batchCh
+    activate Srv
+    Note over Srv: Handler blocks waiting for ackCh
+
+    Note over Loop, Sink: 3. Persistence Phase
+    Loop->>Loop: Retrieve Event from srv.Read()
+    Loop->>Sink: write(data) / commit()
+    activate Sink
+    Sink-->>Loop: Success (Persisted to Disk / S3 Object)
+    deactivate Sink
+
+    Note over Loop, Producer: 4. Acknowledgment Signaling
+    Loop->>Srv: Invoke ack(nil) (writes to ackCh)
+    deactivate Srv
+    Srv->>Conn: Send ProduceResponse (ErrorCode: 0)
+    Conn->>Producer: TCP ACK Response Received
+    Note over Producer: Messages are now officially persisted!
+```
+
+#### 2. Entity Component & Control Flow (Architecture Detail)
+
+This architectural block diagram details the structure of `ksink`, demonstrating how data and control signals flow between the concurrent subsystems, channels, and final destinations.
+
+```mermaid
+graph TD
+    classDef external fill:#f9f,stroke:#333,stroke-width:2px;
+    classDef internal fill:#bbf,stroke:#333,stroke-width:1px;
+    
+    Producer[Kafka Producer]:::external -->|TCP Produce / EndTxn| Conn[TCP Connection Socket]:::internal
+    Conn -->|Parse Request| Handler[ksink Server Handler]:::internal
+    
+    subgraph Synchronous Blocking
+        Handler -->|1. Push pendingBatch| batchCh[batchCh Channel]:::internal
+        Handler -.->|2. Block waiting for ackCh| ackCh[ackCh Channel]:::internal
+    end
+    
+    batchCh -->|Read event| App[Main Read Loop / Application]:::internal
+    
+    subgraph Output Sinks
+        App -->|Write / Commit| Sink[Output Writer]:::internal
+        Sink -->|Append| File[Local File / *.tmp]:::external
+        Sink -->|Flush / Upload| S3[S3 Bucket]:::external
+    end
+    
+    File -->|Persistence Confirmed| App
+    S3 -->|Persistence Confirmed| App
+    
+    App -->|3. Invoke ack()| ackCh
+    ackCh -->|Unblock Handler| Handler
+    Handler -->|Send Response TCP Packet| Conn
+    Conn -->|Acknowledge Message| Producer
+```
+
+#### 3. Message & Transaction State Transitions (State Lifecycle Detail)
+
+This state machine visualizes how a message or transactional batch transitions from its initial network representation to its final persisted state, showing the exact point of back-signaling.
+
+```mermaid
+stateDiagram-v2
+    [*] --> TCP_PACKET : Producer sends bytes
+
+    state TCP_PACKET {
+        [*] --> Ingress : Connection receives request
+        Ingress --> Parsed : parseRecords() extracts message
+    }
+
+    state DELIVERED_TO_APP {
+        Parsed --> Buffered : deliverEvent() pushes to s.batchCh
+        Buffered --> Processing : srv.Read() retrieves batch
+    }
+
+    state PERSISTING {
+        Processing --> LocalTemp : Write to local file (*.tmp)
+        Processing --> S3Memory : Buffer S3 txn payload in RAM
+        Processing --> S3Disk : Stream to local file (txn/*)
+        LocalTemp --> PersistedDisk : CommitTxn (Rename .tmp -> final)
+        S3Memory --> PersistedS3 : CommitTxn (PutObject / CompleteMultipart)
+        S3Disk --> PersistedS3 : CommitTxn (Upload from disk)
+    }
+
+    state ACKNOWLEDGED {
+        PersistedDisk --> Unblocked : ack(nil) called
+        PersistedS3 --> Unblocked : ack(nil) called
+        Unblocked --> TCP_Response : sendResponse() writes TCP Packet
+    }
+
+    TCP_Response --> [*] : Producer marks offset/txn as committed
 ```
 
 ## Library

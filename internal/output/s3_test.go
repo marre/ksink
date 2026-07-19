@@ -279,4 +279,94 @@ func TestDurableS3BufferStartupFailsWithoutJournal(t *testing.T) {
 	assert.Contains(t, err.Error(), ".meta")
 }
 
+func TestTxnS3WriterDiskBufferCommitPutObject(t *testing.T) {
+	client := &mockS3Client{}
+	tmpDir := t.TempDir()
+
+	txnDir := filepath.Join(tmpDir, "txn")
+	require.NoError(t, os.MkdirAll(txnDir, 0700))
+
+	w := &txnS3Writer{
+		client: client,
+		opts: normalizeS3Opts(S3Opts{
+			BufferDir: tmpDir,
+			MultipartPartSize: 10,
+		}),
+		bucket:  "bucket",
+		keyTpl:  "events/{topic}-{txnID}.jsonl",
+		txnData: map[string]map[string]*txnS3Buffer{},
+	}
+
+	require.NoError(t, w.Write([]byte("abc"), &ksink.Message{TransactionalID: "txn1", Topic: "orders"}))
+
+	sum := sha256.Sum256([]byte("events/orders-txn1.jsonl"))
+	hashedFileName := hex.EncodeToString(sum[:]) + ".data"
+	filePath := filepath.Join(tmpDir, "txn", "txn1", hashedFileName)
+	assert.FileExists(t, filePath)
+
+	require.NoError(t, w.CommitTxn("txn1"))
+
+	assert.NoFileExists(t, filePath)
+
+	require.Len(t, client.putObjects, 1)
+	assert.Equal(t, "events/orders-txn1.jsonl", client.putObjects[0].key)
+	assert.Equal(t, "abc", client.putObjects[0].body)
+}
+
+func TestTxnS3WriterDiskBufferCommitMultipart(t *testing.T) {
+	client := &mockS3Client{}
+	tmpDir := t.TempDir()
+
+	txnDir := filepath.Join(tmpDir, "txn")
+	require.NoError(t, os.MkdirAll(txnDir, 0700))
+
+	w := &txnS3Writer{
+		client: client,
+		opts: normalizeS3Opts(S3Opts{
+			BufferDir: tmpDir,
+			MultipartPartSize: 5 * 1024 * 1024,
+		}),
+		bucket:  "bucket",
+		keyTpl:  "events/{topic}-{txnID}.bin",
+		txnData: map[string]map[string]*txnS3Buffer{},
+	}
+
+	largePayload := strings.Repeat("a", 5*1024*1024+3)
+	require.NoError(t, w.Write([]byte(largePayload), &ksink.Message{TransactionalID: "txn1", Topic: "orders"}))
+	require.NoError(t, w.CommitTxn("txn1"))
+	require.Len(t, client.mpCreates, 1)
+	require.Len(t, client.mpUploads, 2)
+	require.Len(t, client.mpDone, 1)
+}
+
+func TestTxnS3WriterDiskBufferAbort(t *testing.T) {
+	client := &mockS3Client{}
+	tmpDir := t.TempDir()
+
+	txnDir := filepath.Join(tmpDir, "txn")
+	require.NoError(t, os.MkdirAll(txnDir, 0700))
+
+	w := &txnS3Writer{
+		client: client,
+		opts: normalizeS3Opts(S3Opts{
+			BufferDir: tmpDir,
+			MultipartPartSize: 10,
+		}),
+		bucket:  "bucket",
+		keyTpl:  "events/{topic}-{txnID}.jsonl",
+		txnData: map[string]map[string]*txnS3Buffer{},
+	}
+
+	require.NoError(t, w.Write([]byte("abc"), &ksink.Message{TransactionalID: "txn1", Topic: "orders"}))
+
+	sum := sha256.Sum256([]byte("events/orders-txn1.jsonl"))
+	hashedFileName := hex.EncodeToString(sum[:]) + ".data"
+	filePath := filepath.Join(tmpDir, "txn", "txn1", hashedFileName)
+	assert.FileExists(t, filePath)
+
+	require.NoError(t, w.AbortTxn("txn1"))
+
+	assert.NoFileExists(t, filePath)
+}
+
 var _ s3API = (*mockS3Client)(nil)

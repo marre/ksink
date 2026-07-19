@@ -3,10 +3,14 @@ package output
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"net/url"
+	"os"
 	"path"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -76,7 +80,10 @@ type s3Writer struct {
 }
 
 type txnS3Buffer struct {
-	data bytes.Buffer
+	data bytes.Buffer // used if BufferDir is empty
+	file *os.File     // used if BufferDir is set
+	path string       // used if BufferDir is set
+	size int64        // size of the data written
 }
 
 type txnS3Writer struct {
@@ -135,6 +142,16 @@ func NewTxnS3Writer(dst string, opts S3Opts) (TransactionalWriter, error) {
 	client, err := newS3Client(opts)
 	if err != nil {
 		return nil, err
+	}
+	if opts.BufferDir != "" {
+		txnDir := filepath.Join(opts.BufferDir, "txn")
+		// Clean up any uncommitted transactional files from previous runs on startup.
+		if err := os.RemoveAll(txnDir); err != nil && !os.IsNotExist(err) {
+			return nil, fmt.Errorf("failed to clean up old S3 transaction buffer directory: %w", err)
+		}
+		if err := os.MkdirAll(txnDir, 0700); err != nil {
+			return nil, fmt.Errorf("failed to create S3 transaction buffer directory: %w", err)
+		}
 	}
 	return &txnS3Writer{
 		client:  client,
@@ -235,11 +252,33 @@ func (w *txnS3Writer) Write(data []byte, msg *ksink.Message) error {
 	buf, ok := byKey[key]
 	if !ok {
 		buf = &txnS3Buffer{}
+		if w.opts.BufferDir != "" {
+			txnDir := filepath.Join(w.opts.BufferDir, "txn", SanitizePathSegment(txnID))
+			if err := os.MkdirAll(txnDir, 0700); err != nil {
+				return fmt.Errorf("failed to create txn buffer directory: %w", err)
+			}
+			keyHash := sha256.Sum256([]byte(key))
+			hashedFileName := hex.EncodeToString(keyHash[:]) + ".data"
+			buf.path = filepath.Join(txnDir, hashedFileName)
+			f, err := os.OpenFile(buf.path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
+			if err != nil {
+				return fmt.Errorf("failed to create txn buffer file: %w", err)
+			}
+			buf.file = f
+		}
 		byKey[key] = buf
 	}
 
-	if _, err := buf.data.Write(data); err != nil {
-		return fmt.Errorf("failed to buffer transactional S3 payload: %w", err)
+	if w.opts.BufferDir != "" {
+		n, err := buf.file.Write(data)
+		if err != nil {
+			return fmt.Errorf("failed to write transactional S3 payload to disk: %w", err)
+		}
+		buf.size += int64(n)
+	} else {
+		if _, err := buf.data.Write(data); err != nil {
+			return fmt.Errorf("failed to buffer transactional S3 payload: %w", err)
+		}
 	}
 	return nil
 }
@@ -253,34 +292,205 @@ func (w *txnS3Writer) CommitTxn(txnID string) error {
 		return nil
 	}
 
-	for key, data := range byKey {
-		payload := append([]byte(nil), data.data.Bytes()...)
-		if int64(len(payload)) < w.opts.MultipartPartSize {
-			if err := w.putObject(key, payload); err != nil {
+	for key, buf := range byKey {
+		if w.opts.BufferDir != "" {
+			if buf.file != nil {
+				if err := buf.file.Close(); err != nil {
+					return fmt.Errorf("failed to close txn buffer file before upload: %w", err)
+				}
+				buf.file = nil
+			}
+			if err := w.uploadFile(key, buf.path, buf.size); err != nil {
 				return err
 			}
-			continue
-		}
-		if err := w.multipartPutObject(key, payload); err != nil {
-			return err
+			_ = os.Remove(buf.path)
+		} else {
+			payload := append([]byte(nil), buf.data.Bytes()...)
+			if int64(len(payload)) < w.opts.MultipartPartSize {
+				if err := w.putObject(key, payload); err != nil {
+					return err
+				}
+				continue
+			}
+			if err := w.multipartPutObject(key, payload); err != nil {
+				return err
+			}
 		}
 	}
 
 	delete(w.txnData, txnID)
+	if w.opts.BufferDir != "" {
+		txnDir := filepath.Join(w.opts.BufferDir, "txn", SanitizePathSegment(txnID))
+		_ = os.RemoveAll(txnDir)
+	}
 	return nil
 }
 
 func (w *txnS3Writer) AbortTxn(txnID string) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+
+	byKey, ok := w.txnData[txnID]
+	if !ok {
+		return nil
+	}
 	delete(w.txnData, txnID)
+
+	for _, buf := range byKey {
+		if buf.file != nil {
+			_ = buf.file.Close()
+		}
+		if buf.path != "" {
+			_ = os.Remove(buf.path)
+		}
+	}
+
+	if w.opts.BufferDir != "" {
+		txnDir := filepath.Join(w.opts.BufferDir, "txn", SanitizePathSegment(txnID))
+		_ = os.RemoveAll(txnDir)
+	}
 	return nil
 }
 
 func (w *txnS3Writer) Close() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+
+	if w.txnData == nil {
+		return nil
+	}
+
+	var firstErr error
+	for txnID, byKey := range w.txnData {
+		for _, buf := range byKey {
+			if buf.file != nil {
+				if err := buf.file.Close(); err != nil && firstErr == nil {
+					firstErr = err
+				}
+			}
+			if buf.path != "" {
+				if err := os.Remove(buf.path); err != nil && firstErr == nil {
+					firstErr = err
+				}
+			}
+		}
+		if w.opts.BufferDir != "" {
+			txnDir := filepath.Join(w.opts.BufferDir, "txn", SanitizePathSegment(txnID))
+			_ = os.RemoveAll(txnDir)
+		}
+	}
 	w.txnData = nil
+	return firstErr
+}
+
+func (w *txnS3Writer) uploadFile(key string, filePath string, size int64) error {
+	if size < w.opts.MultipartPartSize {
+		f, err := os.Open(filePath)
+		if err != nil {
+			return fmt.Errorf("failed to open txn buffer file for upload: %w", err)
+		}
+		defer f.Close()
+
+		if err := withS3Retry(w.opts, func() error {
+			_, err := w.client.PutObject(context.Background(), &s3.PutObjectInput{
+				Bucket: aws.String(w.bucket),
+				Key:    aws.String(key),
+				Body:   f,
+			})
+			if err != nil {
+				_, _ = f.Seek(0, io.SeekStart)
+			}
+			return err
+		}); err != nil {
+			return fmt.Errorf("failed to put S3 object s3://%s/%s: %w", w.bucket, key, err)
+		}
+		return nil
+	}
+
+	return w.multipartUploadFile(key, filePath, size)
+}
+
+func (w *txnS3Writer) multipartUploadFile(key string, filePath string, size int64) error {
+	var uploadID *string
+	if err := withS3Retry(w.opts, func() error {
+		createOut, err := w.client.CreateMultipartUpload(context.Background(), &s3.CreateMultipartUploadInput{
+			Bucket: aws.String(w.bucket),
+			Key:    aws.String(key),
+		})
+		if err != nil {
+			return err
+		}
+		uploadID = createOut.UploadId
+		return nil
+	}); err != nil {
+		return fmt.Errorf("failed to start multipart upload for s3://%s/%s: %w", w.bucket, key, err)
+	}
+
+	f, err := os.Open(filePath)
+	if err != nil {
+		return fmt.Errorf("failed to open txn buffer file for multipart upload: %w", err)
+	}
+	defer f.Close()
+
+	parts := make([]types.CompletedPart, 0, (size+w.opts.MultipartPartSize-1)/w.opts.MultipartPartSize)
+
+	for partNum, start := int32(1), int64(0); start < size; partNum, start = partNum+1, start+w.opts.MultipartPartSize {
+		end := start + w.opts.MultipartPartSize
+		if end > size {
+			end = size
+		}
+		chunkSize := end - start
+		pn := partNum
+
+		section := io.NewSectionReader(f, start, chunkSize)
+
+		var completedPart types.CompletedPart
+		if err := withS3Retry(w.opts, func() error {
+			upOut, err := w.client.UploadPart(context.Background(), &s3.UploadPartInput{
+				Bucket:     aws.String(w.bucket),
+				Key:        aws.String(key),
+				UploadId:   uploadID,
+				PartNumber: aws.Int32(pn),
+				Body:       section,
+			})
+			if err != nil {
+				return err
+			}
+			completedPart = types.CompletedPart{
+				ETag:       upOut.ETag,
+				PartNumber: aws.Int32(pn),
+			}
+			return nil
+		}); err != nil {
+			_, _ = w.client.AbortMultipartUpload(context.Background(), &s3.AbortMultipartUploadInput{
+				Bucket:   aws.String(w.bucket),
+				Key:      aws.String(key),
+				UploadId: uploadID,
+			})
+			return fmt.Errorf("failed to upload multipart part %d for s3://%s/%s: %w", pn, w.bucket, key, err)
+		}
+		parts = append(parts, completedPart)
+	}
+
+	if err := withS3Retry(w.opts, func() error {
+		_, err := w.client.CompleteMultipartUpload(context.Background(), &s3.CompleteMultipartUploadInput{
+			Bucket:   aws.String(w.bucket),
+			Key:      aws.String(key),
+			UploadId: uploadID,
+			MultipartUpload: &types.CompletedMultipartUpload{
+				Parts: parts,
+			},
+		})
+		return err
+	}); err != nil {
+		_, _ = w.client.AbortMultipartUpload(context.Background(), &s3.AbortMultipartUploadInput{
+			Bucket:   aws.String(w.bucket),
+			Key:      aws.String(key),
+			UploadId: uploadID,
+		})
+		return fmt.Errorf("failed to complete multipart upload for s3://%s/%s: %w", w.bucket, key, err)
+	}
+
 	return nil
 }
 
