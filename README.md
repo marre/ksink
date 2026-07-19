@@ -127,8 +127,8 @@ graph TD
     E --> F[Clear in-memory buffer]
     D -->|No| C
     
-    B -->|Yes| G[Write to active/*.data & fsync]
-    G --> H[Update active/*.data.meta journal & fsync]
+    B -->|Yes| G["Write to active/*.data &amp; fsync"]
+    G --> H["Update active/*.data.meta journal &amp; fsync"]
     H --> I{Batch limits or max age reached?}
     I -->|Yes| J[Move data/meta to pending/ folder]
     J --> K[Move to uploading/ folder]
@@ -150,19 +150,19 @@ graph TD
   - **Rotation & Upload:** Once local size/count limits are reached or the buffer exceeds `--output-s3-batch-max-age` (checked periodically by a background loop), the files are closed and moved sequentially to `pending/`, then `uploading/` to be uploaded via `PutObject`. Once the S3 upload succeeds, the local temporary files are deleted.
   - **Startup Recovery:** On initialization, `ksink` checks the buffer directory. It recovers any half-written files from the `active/` directory by validating them against their metadata journals, truncating them to the last synced offset, moving them to `pending/`, and immediately uploading all pending/uploading batches to S3 before starting to accept new incoming writes.
 
-    ```mermaid
-    graph TD
-        Start[ksink Startup] --> A{Active files found?}
-        A -->|Yes| B[Validate active files against meta journals]
-        B --> C[Truncate files to last synced offset]
-        C --> D[Move to pending/ directory]
-        A -->|No| E{Pending/uploading files found?}
-        D --> E
-        E -->|Yes| F[Upload files to S3 via PutObject]
-        F --> G[Delete uploaded local files]
-        E -->|No| H[Ready to accept new writes]
-        G --> H
-    ```
+```mermaid
+graph TD
+    Start[ksink Startup] --> A{Active files found?}
+    A -->|Yes| B[Validate active files against meta journals]
+    B --> C[Truncate files to last synced offset]
+    C --> D[Move to pending/ directory]
+    A -->|No| E{Pending/uploading files found?}
+    D --> E
+    E -->|Yes| F[Upload files to S3 via PutObject]
+    F --> G[Delete uploaded local files]
+    E -->|No| H[Ready to accept new writes]
+    G --> H
+```
 
 ##### 2. Transactional Uploads
 
@@ -173,20 +173,20 @@ graph TD
     A[Kafka Message with TransactionalID] --> B{Durable S3 Buffer Configured?}
     
     B -->|No| C[Buffer in memory partitioned by TxnID and resolved S3 key]
-    B -->|Yes| C2[Write to txn/txnID/* file on disk]
+    B -->|Yes| C2["Write to txn/txnID/* file on disk"]
     
     C --> D{Producer event received?}
     C2 --> D
     
-    D -->|AbortTxn| E[Discard in-memory buffers / Delete local files]
+    D -->|AbortTxn| E["Discard in-memory buffers / Delete local files"]
     
-    D -->|CommitTxn| F{Payload/File size < MultipartPartSize?}
+    D -->|CommitTxn| F{"Payload/File size < MultipartPartSize?"}
     F -->|Yes| G[Upload as single object via PutObject]
     F -->|No| H[Initiate Multipart Upload]
-    H --> I[Stream parts from memory/disk in sequence]
+    H --> I["Stream parts from memory/disk in sequence"]
     I --> J{All parts uploaded successfully?}
     J -->|Yes| K[Complete Multipart Upload]
-    J -->|No| L[Abort Multipart Upload & cleanup S3 storage]
+    J -->|No| L["Abort Multipart Upload &amp; cleanup S3 storage"]
     
     G --> M[Delete local temp files if disk-buffered]
     K --> M
@@ -257,10 +257,10 @@ sequenceDiagram
 
     Note over Producer, Sink: 1. Ingestion Phase
     Producer->>Conn: Send Produce Request (TCP Packet)
-    Conn->>Srv: Parse Kafka payload & header
-    Srv->>Srv: Validate Topic & Extract Messages
+    Conn->>Srv: Parse Kafka payload and header
+    Srv->>Srv: Validate Topic and Extract Messages
 
-    Note over Srv, Loop: 2. Handoff & Synchronous Blocking
+    Note over Srv, Loop: 2. Handoff and Synchronous Blocking
     Srv->>Loop: Push pendingBatch{Event, ackCh} to s.batchCh
     activate Srv
     Note over Srv: Handler blocks waiting for ackCh
@@ -289,29 +289,29 @@ graph TD
     classDef external fill:#f9f,stroke:#333,stroke-width:2px;
     classDef internal fill:#bbf,stroke:#333,stroke-width:1px;
     
-    Producer[Kafka Producer]:::external -->|TCP Produce / EndTxn| Conn[TCP Connection Socket]:::internal
-    Conn -->|Parse Request| Handler[ksink Server Handler]:::internal
+    Producer[Kafka Producer]:::external -->|"TCP Produce / EndTxn"| Conn[TCP Connection Socket]:::internal
+    Conn -->|"Parse Request"| Handler[ksink Server Handler]:::internal
     
     subgraph Synchronous Blocking
-        Handler -->|1. Push pendingBatch| batchCh[batchCh Channel]:::internal
-        Handler -.->|2. Block waiting for ackCh| ackCh[ackCh Channel]:::internal
+        Handler -->|"1. Push pendingBatch"| batchCh[batchCh Channel]:::internal
+        Handler -.->|"2. Block waiting for ackCh"| ackCh[ackCh Channel]:::internal
     end
     
-    batchCh -->|Read event| App[Main Read Loop / Application]:::internal
+    batchCh -->|"Read event"| App["Main Read Loop / Application"]:::internal
     
     subgraph Output Sinks
-        App -->|Write / Commit| Sink[Output Writer]:::internal
-        Sink -->|Append| File[Local File / *.tmp]:::external
-        Sink -->|Flush / Upload| S3[S3 Bucket]:::external
+        App -->|"Write / Commit"| Sink[Output Writer]:::internal
+        Sink -->|"Append"| File["Local File / *.tmp"]:::external
+        Sink -->|"Flush / Upload"| S3[S3 Bucket]:::external
     end
     
-    File -->|Persistence Confirmed| App
-    S3 -->|Persistence Confirmed| App
+    File -->|"Persistence Confirmed"| App
+    S3 -->|"Persistence Confirmed"| App
     
-    App -->|3. Invoke ack()| ackCh
-    ackCh -->|Unblock Handler| Handler
-    Handler -->|Send Response TCP Packet| Conn
-    Conn -->|Acknowledge Message| Producer
+    App -->|"3. Invoke ack()"| ackCh
+    ackCh -->|"Unblock Handler"| Handler
+    Handler -->|"Send Response TCP Packet"| Conn
+    Conn -->|"Acknowledge Message"| Producer
 ```
 
 #### 3. Message & Transaction State Transitions (State Lifecycle Detail)
@@ -324,27 +324,27 @@ stateDiagram-v2
 
     state TCP_PACKET {
         [*] --> Ingress : Connection receives request
-        Ingress --> Parsed : parseRecords() extracts message
+        Ingress --> Parsed : parseRecords extracts message
     }
 
     state DELIVERED_TO_APP {
-        Parsed --> Buffered : deliverEvent() pushes to s.batchCh
-        Buffered --> Processing : srv.Read() retrieves batch
+        Parsed --> Buffered : deliverEvent pushes to s.batchCh
+        Buffered --> Processing : srv.Read retrieves batch
     }
 
     state PERSISTING {
-        Processing --> LocalTemp : Write to local file (*.tmp)
+        Processing --> LocalTemp : Write to local file .tmp
         Processing --> S3Memory : Buffer S3 txn payload in RAM
-        Processing --> S3Disk : Stream to local file (txn/*)
-        LocalTemp --> PersistedDisk : CommitTxn (Rename .tmp -> final)
-        S3Memory --> PersistedS3 : CommitTxn (PutObject / CompleteMultipart)
-        S3Disk --> PersistedS3 : CommitTxn (Upload from disk)
+        Processing --> S3Disk : Stream to local file txn
+        LocalTemp --> PersistedDisk : CommitTxn - Rename .tmp to final
+        S3Memory --> PersistedS3 : CommitTxn - PutObject or CompleteMultipart
+        S3Disk --> PersistedS3 : CommitTxn - Upload from disk
     }
 
     state ACKNOWLEDGED {
-        PersistedDisk --> Unblocked : ack(nil) called
-        PersistedS3 --> Unblocked : ack(nil) called
-        Unblocked --> TCP_Response : sendResponse() writes TCP Packet
+        PersistedDisk --> Unblocked : ack with nil called
+        PersistedS3 --> Unblocked : ack with nil called
+        Unblocked --> TCP_Response : sendResponse writes TCP Packet
     }
 
     TCP_Response --> [*] : Producer marks offset/txn as committed
