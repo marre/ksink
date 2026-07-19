@@ -98,7 +98,7 @@ Supported placeholders in the S3 key pattern:
 - `{txnID}` for transactional output (`--transactional` only)
 
 S3 flags:
-- `--output-s3-region`: AWS region for S3 output (uses AWS SDK default chain if empty).
+- `--output-s3-region`: AWS region for S3 output (uses AWS SDK default credential and region resolution chain if empty).
 - `--output-s3-endpoint`: Custom S3 endpoint URL (e.g. `http://127.0.0.1:9000` for MinIO).
 - `--output-s3-force-path-style`: Use path-style S3 addressing (required by some S3-compatible endpoints like MinIO).
 - `--output-s3-retries`: Maximum S3 write attempts for each operation (default: `3`).
@@ -117,6 +117,26 @@ Under the hood, S3 uploads operate in one of two modes depending on whether `--t
 
 By default, messages are routed to partitions based on the resolved S3 key (derived from the `--output` S3 key pattern and the message's topic).
 
+```mermaid
+graph TD
+    A[Kafka Message] --> B{Durable Buffer Configured?}
+    
+    B -->|No| C[Buffer in memory per S3 key]
+    C --> D{Batch size, count, or age reached?}
+    D -->|Yes| E[Upload batch to S3 via PutObject]
+    E --> F[Clear in-memory buffer]
+    D -->|No| C
+    
+    B -->|Yes| G[Write to active/*.data & fsync]
+    G --> H[Update active/*.data.meta journal & fsync]
+    H --> I{Batch limits or max age reached?}
+    I -->|Yes| J[Move data/meta to pending/ folder]
+    J --> K[Move to uploading/ folder]
+    K --> L[Upload to S3 via PutObject]
+    L --> M[Delete local files]
+    I -->|No| G
+```
+
 - **In-Memory Buffering (Default):**
   - Messages are buffered in memory per resolved S3 key.
   - When the buffer reaches `--output-s3-batch-max-bytes` or `--output-s3-batch-max-messages`, an upload to S3 is triggered.
@@ -130,9 +150,40 @@ By default, messages are routed to partitions based on the resolved S3 key (deri
   - **Rotation & Upload:** Once local size/count limits are reached or the buffer exceeds `--output-s3-batch-max-age` (checked periodically by a background loop), the files are closed and moved sequentially to `pending/`, then `uploading/` to be uploaded via `PutObject`. Once the S3 upload succeeds, the local temporary files are deleted.
   - **Startup Recovery:** On initialization, `ksink` checks the buffer directory. It recovers any half-written files from the `active/` directory by validating them against their metadata journals, truncating them to the last synced offset, moving them to `pending/`, and immediately uploading all pending/uploading batches to S3 before starting to accept new incoming writes.
 
+    ```mermaid
+    graph TD
+        Start[ksink Startup] --> A{Active files found?}
+        A -->|Yes| B[Validate active files against meta journals]
+        B --> C[Truncate files to last synced offset]
+        C --> D[Move to pending/ directory]
+        A -->|No| E{Pending/uploading files found?}
+        D --> E
+        E -->|Yes| F[Upload files to S3 via PutObject]
+        F --> G[Delete uploaded local files]
+        E -->|No| H[Ready to accept new writes]
+        G --> H
+    ```
+
 ##### 2. Transactional Uploads
 
 To enable transactional S3 uploads, you must provide the `--transactional` flag and include the `{txnID}` placeholder in the output pattern (e.g., `s3://my-bucket/messages/{topic}-{txnID}.jsonl`).
+
+```mermaid
+graph TD
+    A[Kafka Message with TransactionalID] --> B[Buffer in memory partitioned by TxnID and resolved S3 key]
+    
+    B --> C{Producer event received?}
+    
+    C -->|AbortTxn| D[Discard in-memory buffers]
+    
+    C -->|CommitTxn| E{Buffered payload size < MultipartPartSize?}
+    E -->|Yes| F[Upload as single object via PutObject]
+    E -->|No| G[Initiate Multipart Upload]
+    G --> H[Upload part-sized chunks in parallel/sequence]
+    H --> I{All parts uploaded successfully?}
+    I -->|Yes| J[Complete Multipart Upload]
+    I -->|No| K[Abort Multipart Upload & cleanup S3 storage]
+```
 
 - **In-Memory Partitioned Buffering:**
   - Messages are buffered in memory, partitioned by both the transaction ID and the resolved S3 key pattern.
