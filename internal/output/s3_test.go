@@ -21,8 +21,7 @@ type mockS3Client struct {
 	mpDone     []string
 	mpAborts   []string
 
-	failPutAfter int
-	putCalls     int
+	failPuts int
 }
 
 type mockPutObject struct {
@@ -37,8 +36,8 @@ type mockUploadPart struct {
 }
 
 func (m *mockS3Client) PutObject(_ context.Context, params *s3.PutObjectInput, _ ...func(*s3.Options)) (*s3.PutObjectOutput, error) {
-	m.putCalls++
-	if m.failPutAfter > 0 && m.putCalls >= m.failPutAfter {
+	if m.failPuts > 0 {
+		m.failPuts--
 		return nil, fmt.Errorf("put failed")
 	}
 	b, _ := io.ReadAll(params.Body)
@@ -185,7 +184,7 @@ func TestTxnS3WriterCommitMultipart(t *testing.T) {
 }
 
 func TestTxnS3WriterCommitPutObjectErrorIncludesBucketKey(t *testing.T) {
-	client := &mockS3Client{failPutAfter: 1}
+	client := &mockS3Client{failPuts: 1}
 	w := &txnS3Writer{
 		client: client,
 		opts:   normalizeS3Opts(S3Opts{RetryMaxAttempts: 1}),
@@ -198,6 +197,27 @@ func TestTxnS3WriterCommitPutObjectErrorIncludesBucketKey(t *testing.T) {
 	err := w.CommitTxn("txn1")
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "s3://my-bucket/")
+}
+
+func TestTxnS3WriterCommitCanBeRetriedAfterPutObjectFailure(t *testing.T) {
+	client := &mockS3Client{failPuts: 1}
+	w := &txnS3Writer{
+		client: client,
+		opts:   normalizeS3Opts(S3Opts{RetryMaxAttempts: 1}),
+		bucket: "bucket",
+		keyTpl: "events/{topic}-{txnID}.jsonl",
+		txnData: map[string]map[string]*txnS3Buffer{},
+	}
+
+	require.NoError(t, w.Write([]byte("data"), &ksink.Message{TransactionalID: "txn1", Topic: "orders"}))
+	require.Error(t, w.CommitTxn("txn1"))
+	require.Contains(t, w.txnData, "txn1")
+
+	require.NoError(t, w.CommitTxn("txn1"))
+	require.NotContains(t, w.txnData, "txn1")
+	require.Len(t, client.putObjects, 1)
+	assert.Equal(t, "events/orders-txn1.jsonl", client.putObjects[0].key)
+	assert.Equal(t, "data", client.putObjects[0].body)
 }
 
 func TestTxnS3WriterAbortTxn(t *testing.T) {
