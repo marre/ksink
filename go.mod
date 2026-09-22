@@ -7,7 +7,7 @@ require (
 	github.com/spf13/cobra v1.10.2
 	github.com/stretchr/testify v1.12.1
 	github.com/twmb/franz-go v1.21.6
-	github.com/twmb/franz-go/pkg/kmsg v1.13.1
+	github.com/twmb/franz-go/pkg/kmsg v1.14.0
 	github.com/xdg-go/scram v1.2.0
 	github.com/xeipuuv/gojsonschema v1.2.0
 )
