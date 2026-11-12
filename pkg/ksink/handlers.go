@@ -681,6 +681,10 @@ func (s *Server) handleEndTxn(ctx context.Context, conn net.Conn, connID uint64,
 		s.txnMu.Unlock()
 		resp.ErrorCode = kerr.ConcurrentTransactions.Code
 		return s.sendResponse(conn, connID, correlationID, resp)
+	case s.txnStoreErr != nil:
+		s.txnMu.Unlock()
+		resp.ErrorCode = kerr.UnknownServerError.Code
+		return s.sendResponse(conn, connID, correlationID, resp)
 	case !st.active:
 		// A lost EndTxn response can be retried without duplicating commits.
 		repeated := st.hasOutcome && st.lastCommit == req.Commit
@@ -690,7 +694,20 @@ func (s *Server) handleEndTxn(ctx context.Context, conn net.Conn, connID uint64,
 		}
 		return s.sendResponse(conn, connID, correlationID, resp)
 	}
+	if st.pendingAction != "" && st.pendingAction != action {
+		s.txnMu.Unlock()
+		resp.ErrorCode = kerr.InvalidTxnState.Code
+		return s.sendResponse(conn, connID, correlationID, resp)
+	}
 	st.ending = true
+	st.pendingAction = action
+	if err := s.persistTxnStateLocked(); err != nil {
+		st.ending = false
+		s.txnMu.Unlock()
+		s.logger.Errorf("[conn:%d] EndTxn: failed to persist transaction decision: %v", connID, err)
+		resp.ErrorCode = kerr.UnknownServerError.Code
+		return s.sendResponse(conn, connID, correlationID, resp)
+	}
 	s.txnMu.Unlock()
 	st.inFlight.Wait() // do not publish commit ahead of accepted Produce events
 
@@ -711,6 +728,13 @@ func (s *Server) handleEndTxn(ctx context.Context, conn net.Conn, connID uint64,
 		st.needsResolution = false
 		st.hasOutcome = true
 		st.lastCommit = req.Commit
+		st.pendingAction = ""
+	}
+	if persistErr := s.persistTxnStateLocked(); persistErr != nil {
+		if err == nil {
+			err = persistErr // external commit may have succeeded: never fake an ack
+		}
+		st.needsResolution = true
 	}
 	s.txnMu.Unlock()
 	if err != nil {
