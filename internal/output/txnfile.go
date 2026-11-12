@@ -48,6 +48,7 @@ type txnDirectory struct {
 type txnFileWriter struct {
 	pattern  string
 	root     string
+	lock     *os.File // advisory lock, held until Close or process exit
 	mu       sync.Mutex
 	txnFiles map[string]*txnDirectory // Kafka producer transactional.id => instance
 	closed   bool
@@ -83,12 +84,34 @@ func NewTxnFileWriter(pattern string) (TransactionalWriter, error) {
 		return nil, fmt.Errorf("transactional output pattern must contain %s placeholder", TxnIDPlaceholder)
 	}
 	root := transactionOutputRoot(pattern)
+	if err := mkdirTxnDurable(root); err != nil {
+		return nil, fmt.Errorf("prepare transactional file output %s: %w", root, err)
+	}
+	lockPath := filepath.Join(root, ".ksink-lock")
+	lock, err := os.OpenFile(lockPath, os.O_RDWR|os.O_CREATE, 0600)
+	if err != nil {
+		return nil, fmt.Errorf("open transaction recovery lock %s: %w", lockPath, err)
+	}
+	if err := acquireTxnFileLock(lock); err != nil {
+		_ = lock.Close()
+		return nil, fmt.Errorf("acquire exclusive transaction writer lock for %s: %w", root, err)
+	}
+	// Keep the lock held until Close, even after recovery completes, so
+	// a second ksink instance cannot delete this writer's active staging.
+	if err := syncTxnDirectory(root); err != nil {
+		_ = releaseTxnFileLock(lock)
+		_ = lock.Close()
+		return nil, err
+	}
 	if err := recoverTxnDirectories(root); err != nil {
+		_ = releaseTxnFileLock(lock)
+		_ = lock.Close()
 		return nil, fmt.Errorf("recover transactional file output under %s: %w", root, err)
 	}
 	return &txnFileWriter{
 		pattern:  filepath.Clean(pattern),
 		root:     root,
+		lock:     lock,
 		txnFiles: make(map[string]*txnDirectory),
 	}, nil
 }
@@ -315,6 +338,15 @@ func (w *txnFileWriter) Close() error {
 		}
 	}
 	w.txnFiles = nil
+	if w.lock != nil {
+		if err := releaseTxnFileLock(w.lock); err != nil && firstErr == nil {
+			firstErr = fmt.Errorf("release transaction writer lock: %w", err)
+		}
+		if err := w.lock.Close(); err != nil && firstErr == nil {
+			firstErr = fmt.Errorf("close transaction writer lock: %w", err)
+		}
+		w.lock = nil
+	}
 	return firstErr
 }
 
