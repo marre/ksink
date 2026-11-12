@@ -70,7 +70,7 @@ func TestFailedEndTxnRetainsActiveStateUntilRetry(t *testing.T) {
 
 	conn, err := net.Dial("tcp", srv.Addr().String())
 	require.NoError(t, err)
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	apiReq := &kmsg.ApiVersionsRequest{Version: 0}
 	sendRawRequest(t, conn, int16(kmsg.ApiVersions), 0, 1, apiReq.AppendTo(nil))
 	txnID := "retry-state"
@@ -127,7 +127,7 @@ func TestFailedZombieAbortDoesNotFenceOrForgetTransaction(t *testing.T) {
 
 	conn, err := net.Dial("tcp", srv.Addr().String())
 	require.NoError(t, err)
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	apiReq := &kmsg.ApiVersionsRequest{Version: 0}
 	sendRawRequest(t, conn, int16(kmsg.ApiVersions), 0, 1, apiReq.AppendTo(nil))
 	txnID := "zombie-abort"
