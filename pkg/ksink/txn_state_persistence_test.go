@@ -172,6 +172,58 @@ func TestDurableTxnStateLockAndCorruption(t *testing.T) {
 	require.Equal(t, "{broken", string(contents))
 }
 
+func TestDurableTxnSequenceSnapshotSurvivesRestart(t *testing.T) {
+	dir := t.TempDir()
+	cfg := Config{Address: "127.0.0.1:0", TransactionalWrite: true, TransactionStateDir: dir}
+	first, err := New(cfg)
+	require.NoError(t, err)
+	first.txnMu.Lock()
+	first.producerIDCounter.Store(72)
+	first.txnStates["sequence-persist"] = &txnState{
+		producerID: 72, epoch: 5,
+		sequences: map[string]txnPartitionSequence{
+			txnSequenceKey("orders", 1): {
+				Next: 9,
+				Recent: []txnBatchSignature{
+					{Base: 6, Count: 3, Checksum: "abc"},
+				},
+			},
+		},
+	}
+	require.NoError(t, first.persistTxnStateLocked())
+	first.txnMu.Unlock()
+	require.NoError(t, first.Close(context.Background()))
+
+	restarted, err := New(cfg)
+	require.NoError(t, err)
+	defer func() { _ = restarted.Close(context.Background()) }()
+	require.Equal(t, int64(72), restarted.producerIDCounter.Load())
+	restarted.txnMu.Lock()
+	restored := restarted.txnStates["sequence-persist"]
+	require.NotNil(t, restored)
+	require.Equal(t, int16(5), restored.epoch)
+	require.True(t, restored.restartRequired)
+	require.Equal(t, int32(9), restored.sequences[txnSequenceKey("orders", 1)].Next)
+	require.Equal(t, "abc", restored.sequences[txnSequenceKey("orders", 1)].Recent[0].Checksum)
+	restarted.txnMu.Unlock()
+}
+
+func TestDurableTxnSnapshotFailureFencesFurtherOperations(t *testing.T) {
+	dir := t.TempDir()
+	cfg := Config{Address: "127.0.0.1:0", TransactionalWrite: true, TransactionStateDir: dir}
+	srv, err := New(cfg)
+	require.NoError(t, err)
+	defer func() { _ = srv.Close(context.Background()) }()
+	// A directory at the temporary snapshot path prevents creating the
+	// next journal checkpoint. The store must fail closed.
+	require.NoError(t, os.Mkdir(filepath.Join(dir, "state.json.tmp"), 0700))
+	srv.txnMu.Lock()
+	srv.producerIDCounter.Add(1)
+	require.Error(t, srv.persistTxnStateLocked())
+	require.Error(t, srv.persistTxnStateLocked(), "the same instance must never recover silently from an uncertain snapshot")
+	srv.txnMu.Unlock()
+}
+
 func newTxnStateTestConn(t *testing.T, srv *Server) net.Conn {
 	t.Helper()
 	conn, err := net.Dial("tcp", srv.Addr().String())
