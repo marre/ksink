@@ -502,8 +502,24 @@ func (s *Server) handleInitProducerId(ctx context.Context, conn net.Conn, connID
 		})
 	}
 
-	// Non-transactional idempotent producer — just assign an ID.
+	// Non-transactional idempotent producers also draw from the same
+	// monotonically increasing ID space. Persist the counter when durable
+	// transaction state is enabled so IDs cannot be reused after a restart.
+	s.txnMu.Lock()
+	if s.txnStoreErr != nil {
+		s.txnMu.Unlock()
+		return s.sendResponse(conn, connID, correlationID, &kmsg.InitProducerIDResponse{
+			Version: apiVersion, ErrorCode: kerr.UnknownServerError.Code, ProducerID: -1,
+		})
+	}
 	producerID := s.producerIDCounter.Add(1)
+	if err := s.persistTxnStateLocked(); err != nil {
+		s.txnMu.Unlock()
+		return s.sendResponse(conn, connID, correlationID, &kmsg.InitProducerIDResponse{
+			Version: apiVersion, ErrorCode: kerr.UnknownServerError.Code, ProducerID: -1,
+		})
+	}
+	s.txnMu.Unlock()
 
 	resp := &kmsg.InitProducerIDResponse{
 		Version:       apiVersion,
