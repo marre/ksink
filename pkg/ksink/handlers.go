@@ -172,7 +172,9 @@ func (s *Server) handleProduce(ctx context.Context, conn net.Conn, connID uint64
 		switch {
 		case !ok:
 			txnProduceErr = kerr.ProducerFenced.Code
-		case !st.active || st.ending || st.needsResolution:
+		case st.restartRequired:
+			txnProduceErr = kerr.ProducerFenced.Code
+		case !st.active || st.ending || st.needsResolution || s.txnStoreErr != nil:
 			txnProduceErr = kerr.InvalidTxnState.Code
 		default:
 			txnProducerID, txnProducerEpoch = st.producerID, st.epoch
@@ -183,8 +185,16 @@ func (s *Server) handleProduce(ctx context.Context, conn net.Conn, connID uint64
 		}
 		s.txnMu.Unlock()
 	}
+	var proposedSequences map[string]txnPartitionSequence
+	var sequenceChanged bool
 	if txnProduceState != nil {
+		// Transaction batches may arrive over multiple connections. Serialize
+		// the dedup check, sink delivery, and durable sequence checkpoint so
+		// two concurrent retries cannot both deliver the same batch.
+		txnProduceState.produceMu.Lock()
+		defer txnProduceState.produceMu.Unlock()
 		defer txnProduceState.inFlight.Done()
+		proposedSequences = copyTxnSequences(txnProduceState.sequences)
 	}
 
 	// First pass: parse all records and track per-partition status
@@ -210,14 +220,29 @@ func (s *Server) handleProduce(ctx context.Context, conn net.Conn, connID uint64
 				results[key] = partResult{errCode: txnProduceErr}
 				continue
 			}
+			recordBatches := partData.Records
 			if txnID != "" && s.cfg.TransactionalWrite {
-				if code := validateTxnBatchProducer(partData.Records, txnProducerID, txnProducerEpoch); code != 0 {
+				if code := validateTxnBatchProducer(recordBatches, txnProducerID, txnProducerEpoch); code != 0 {
 					results[key] = partResult{errCode: code}
 					continue
 				}
+				var code int16
+				recordBatches, code = acceptTxnBatches(recordBatches,
+					txnSequenceKey(topicData.Topic, partData.Partition), proposedSequences)
+				if code != 0 {
+					results[key] = partResult{errCode: code}
+					continue
+				}
+				if len(recordBatches) == 0 {
+					// Exact retransmission of an acknowledged RecordBatch:
+					// success without sending the messages to the sink again.
+					results[key] = partResult{}
+					continue
+				}
+				sequenceChanged = true
 			}
 
-			batch, err := s.parseRecords(connID, topicData.Topic, partData.Partition, partData.Records, remoteAddr)
+			batch, err := s.parseRecords(connID, topicData.Topic, partData.Partition, recordBatches, remoteAddr)
 			if err != nil {
 				s.logger.Errorf("[conn:%d] Failed to parse records for %s/%d: %v", connID, topicData.Topic, partData.Partition, err)
 				results[key] = partResult{errCode: kerr.CorruptMessage.Code}
@@ -241,6 +266,27 @@ func (s *Server) handleProduce(ctx context.Context, conn net.Conn, connID uint64
 		if handlerErr != nil {
 			s.logger.Errorf("[conn:%d] Batch processing error: %v", connID, handlerErr)
 		}
+	}
+
+	// Do not acknowledge a successful Produce until the accepted batch
+	// sequences are durably recorded. If the sink already accepted data but
+	// checkpointing fails, mark the transaction unresolved (it cannot commit
+	// or accept more data until an explicit abort / restart).
+	if txnProduceState != nil {
+		s.txnMu.Lock()
+		if handlerErr == nil && sequenceChanged {
+			txnProduceState.sequences = proposedSequences
+		}
+		if handlerErr != nil {
+			txnProduceState.needsResolution = true
+		}
+		if (sequenceChanged && handlerErr == nil) || handlerErr != nil {
+			if err := s.persistTxnStateLocked(); err != nil {
+				handlerErr = err
+				txnProduceState.needsResolution = true
+			}
+		}
+		s.txnMu.Unlock()
 	}
 
 	// Build response
