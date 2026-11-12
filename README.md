@@ -258,10 +258,10 @@ intentionally simplified:
 | Real Kafka behaviour | ksink API behaviour | ksink tool behaviour |
 |---|---|---|
 | Records written inside a transaction are invisible to `read_committed` consumers until commit. | Records are delivered to `Read` as `*MessagesEvent` immediately when produced. The `TransactionalID` field is populated so the consumer can buffer them. When the transaction ends, a `*TxnCommitEvent` or `*TxnAbortEvent` is delivered so the consumer can decide what to do. | Messages are staged in a private transaction directory. On commit the entire directory is renamed into `committed/` in one atomic filesystem operation; abort removes staging. Consumers must read only from `committed/`. |
-| The transaction coordinator tracks transaction state across broker restarts. | No persistent producer ID, epoch, deduplication or transaction state; a Kafka producer must reinitialize after a server restart. | On writer startup, staged transactions **without** a durable commit intent are aborted, and transactions **with** an intent are finished idempotently before accepting new messages. Committed directories survive process restarts. |
+| The transaction coordinator tracks transaction state across broker restarts. | `TransactionStateDir` enables durable producer IDs, epochs, transaction outcomes and bounded per-partition record-batch deduplication across restarts. In-flight transactions are conservatively aborted and old producers must call `InitProducerID` again. | On writer startup, staged transactions **without** a durable commit intent are aborted, and transactions **with** an intent are finished idempotently. Committed directories survive restarts. |
 | `sendOffsetsToTransaction` atomically commits consumer offsets with the transaction. | Not supported. ksink is a sink, not a full broker with consumer groups. | Not supported. |
-| Zombie fencing: restarting a producer with the same `transactional.id` aborts the old instance's pending transaction. | **Supported in-process.** When `InitProducerID` is called with an existing `transactional.id` that has an in-flight transaction, the old transaction is aborted through `Read` before the epoch is bumped. | The old transaction's private staging directory is deleted on abort. |
-| Transactions can span multiple topic-partitions atomically. | All events for the same `transactional.id` share a transaction context while active, but there is no durable coordinator. | All files within one transaction directory are made visible together via one same-filesystem directory rename. The atomicity guarantee applies only to consumers reading complete directories under `committed/`, not to consumers scanning staging or to process crashes. |
+| Zombie fencing: restarting a producer with the same `transactional.id` aborts the old instance's pending transaction. | **Supported.** `InitProducerID` fences an in-flight producer after aborting it; after a process restart, an old epoch cannot start a new transaction without first reinitializing. Durable epoch fencing requires `TransactionStateDir`. | The old transaction's private staging directory is deleted on abort. |
+| Transactions can span multiple topic-partitions atomically. | All events for the same `transactional.id` share a transaction context while active. The durable coordinator records commit/abort decisions and outcomes but does not commit its journal atomically with the filesystem writer. | All files within one transaction directory are made visible together via one same-filesystem directory rename. The atomicity guarantee applies only to readers of `committed/`. |
 | Aborted records are never visible to `read_committed` consumers. | Aborted records were already delivered to `Read`. The `*TxnAbortEvent` signals the consumer to clean up, but application-level processing that happened before the abort is not rolled back. | The private staging directory is deleted on abort, so it never appears under `committed/`. |
 | `isolation.level` consumer configuration. | Not applicable — ksink does not implement the consumer protocol. | Not applicable. |
 
@@ -300,20 +300,50 @@ for recovery. One active writer process per output root is enforced by
 the lock file `.ksink-lock`. The marker is metadata, not a message file,
 and readers must ignore it.
 
-This filesystem journal does **not** persist Kafka producer IDs, epochs,
-record sequence/deduplication state or EndTxn outcomes in the broker.
-Thus it cannot resume active producer transactions after a server restart
-and does not provide cross-restart exactly-once Kafka delivery. A crash
-before durable commit intent means an active transaction is aborted even
-if some Produce requests were acknowledged. A crash after intent means the
-entire transaction is eventually published on next successful startup.
+### Persistent Kafka transaction coordinator
+
+The `ksink --transactional` filesystem tool now automatically stores
+Kafka coordinator state in `.ksink-kafka-state/` under the fixed output
+root. Override this with `--transaction-state-dir=/persistent/path`.
+When embedding `pkg/ksink`, set `Config.TransactionStateDir` explicitly;
+leaving it blank preserves legacy in-memory state.
+
+The coordinator persists producer IDs, monotonic ID allocation, epochs,
+active transaction status, pending commit/abort decisions, acknowledged
+EndTxn outcomes and a bounded history of Kafka RecordBatch sequences per
+topic/partition. A recently acknowledged, byte-identical Produce retry is
+acknowledged without being delivered to the sink again. Out-of-order or
+conflicting producer sequences are rejected. The sequence history follows
+the producer epoch, not the transaction boundary.
+
+The coordinator synchronizes its snapshot before successful protocol
+responses and holds an exclusive file lock so another ksink server cannot
+use the same state directory concurrently. A failed snapshot write makes
+the running coordinator reject further state changes rather than
+acknowledge an undurable result.
+
+**On restart, incomplete active transactions do not resume.** The file
+writer discards staged output without a durable commit intent, while
+the Kafka coordinator requires a fresh `InitProducerID` before accepting
+new transactions from an old producer. A previously acknowledged EndTxn
+outcome remains recognizable for a response-loss retry.
+
+**Important remaining boundary:** the coordinator journal and the
+filesystem commit-intent journal are *different durable state stores*.
+If a crash happens after the sink has committed but before the Kafka
+coordinator saves the EndTxn outcome, that response remains ambiguous.
+The old epoch is fenced when the producer reinitializes; automatic
+cross-store resolution and strict exactly-once delivery require a
+shared transaction-instance identity and reconciliation protocol.
+Do not interpret this implementation as full Kafka EOS.
+
 Consumers must inspect only `committed/`. Durable behavior requires a
 filesystem honoring file/parent-directory fsync and same-filesystem
 atomic directory rename; unsupported filesystems fail instead of silently
-claiming durability. Filesystem failure or lost power during unacknowledged
-commit may leave an ambiguous outcome until startup recovery runs.
+claiming durability. Non-transactional idempotent Producer requests do
+not yet use the transactional sequence-deduplication path.
 
-**Performance note:** each transactional write performs a file fsync and
-synchronizes its directory path. This favors correctness and crash safety
-over maximum ingest throughput; batching/durability policy controls can
-be considered separately.
+**Performance note:** each transactional write synchronizes its payload
+and directory path, and each acknowledged new record batch checkpoints the
+coordinator snapshot. This favors correctness over maximum throughput;
+batching and configurable durability policies can be considered later.
