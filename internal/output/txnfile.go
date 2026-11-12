@@ -71,6 +71,13 @@ func transactionOutputRoot(pattern string) string {
 	return dir
 }
 
+// KafkaTransactionStateDir is the default durable coordinator-state directory
+// for transactional filesystem output. Using the fixed pattern root keeps the
+// coordinator and staged files in the same deployment volume.
+func KafkaTransactionStateDir(pattern string) string {
+	return filepath.Join(transactionOutputRoot(pattern), ".ksink-kafka-state")
+}
+
 // NewTxnFileWriter creates a filesystem transactional writer. For example,
 // "messages-{txnID}.jsonl" produces:
 //    .ksink-pending/my-txn-<nonce>/messages-my-txn.jsonl (staging)
