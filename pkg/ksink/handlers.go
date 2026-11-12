@@ -221,25 +221,25 @@ func (s *Server) handleProduce(ctx context.Context, conn net.Conn, connID uint64
 				continue
 			}
 			recordBatches := partData.Records
+			var candidate map[string]txnPartitionSequence
 			if txnID != "" && s.cfg.TransactionalWrite {
 				if code := validateTxnBatchProducer(recordBatches, txnProducerID, txnProducerEpoch); code != 0 {
 					results[key] = partResult{errCode: code}
 					continue
 				}
+				// Don't advance any sequence for batches that fail decoding.
+				candidate = copyTxnSequences(proposedSequences)
 				var code int16
 				recordBatches, code = acceptTxnBatches(recordBatches,
-					txnSequenceKey(topicData.Topic, partData.Partition), proposedSequences)
+					txnSequenceKey(topicData.Topic, partData.Partition), candidate)
 				if code != 0 {
 					results[key] = partResult{errCode: code}
 					continue
 				}
 				if len(recordBatches) == 0 {
-					// Exact retransmission of an acknowledged RecordBatch:
-					// success without sending the messages to the sink again.
-					results[key] = partResult{}
+					results[key] = partResult{} // acknowledged exact duplicate
 					continue
 				}
-				sequenceChanged = true
 			}
 
 			batch, err := s.parseRecords(connID, topicData.Topic, partData.Partition, recordBatches, remoteAddr)
@@ -250,6 +250,10 @@ func (s *Server) handleProduce(ctx context.Context, conn net.Conn, connID uint64
 			}
 
 			results[key] = partResult{}
+			if txnProduceState != nil && candidate != nil {
+				proposedSequences = candidate
+				sequenceChanged = true
+			}
 			if txnID != "" {
 				for _, msg := range batch {
 					msg.TransactionalID = txnID
