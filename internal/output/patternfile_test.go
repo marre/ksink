@@ -207,7 +207,7 @@ func TestTxnFileWriterRoutesByPartitionCommitAbortAndClose(t *testing.T) {
  require.NoError(t,w.CommitTxn("commit"))
  require.NoError(t,w.AbortTxn("abort"))
  for path,want:=range map[string]string{"orders-0-commit-*.jsonl":"one\nthree\n","orders-1-commit-*.jsonl":"two\n","events-0-commit-*.jsonl":"event\n"} {
-  b,err:=os.ReadFile(filepath.Join(dir,path))
+  b,err:=os.ReadFile(oneMatch(t,filepath.Join(dir,path)))
   require.NoError(t,err)
   assert.Equal(t,want,string(b))
   noMatches(t,filepath.Join(dir,path+".tmp"))
