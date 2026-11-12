@@ -1,9 +1,12 @@
 package output_test
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/marre/ksink/internal/output"
@@ -20,218 +23,267 @@ func TestTxnFileWriterRequiresPlaceholder(t *testing.T) {
 
 func TestTxnFileWriterCommit(t *testing.T) {
 	dir := t.TempDir()
-	pattern := filepath.Join(dir, "messages-{txnID}.jsonl")
-
-	w, err := output.NewTxnFileWriter(pattern)
+	w, err := output.NewTxnFileWriter(filepath.Join(dir, "messages-{txnID}.jsonl"))
 	require.NoError(t, err)
-	t.Cleanup(func() { w.Close() }) //nolint:errcheck
+	t.Cleanup(func() { _ = w.Close() })
 
-	msg := &ksink.Message{TransactionalID: "txn-1"}
-	require.NoError(t, w.Write([]byte("hello\n"), msg))
-
-	// Temp file should exist, committed file should not.
-	tmpPath := oneMatch(t, filepath.Join(dir, "messages-txn-1-*.jsonl.tmp"))
-	committedPath := strings.TrimSuffix(tmpPath, ".tmp")
-	require.FileExists(t, tmpPath)
-	requireNoFile(t, committedPath)
-
+	require.NoError(t, w.Write([]byte("hello\n"), &ksink.Message{TransactionalID: "txn-1"}))
+	staged := oneMatch(t, filepath.Join(dir, ".ksink-pending", "txn-1-*", "messages-txn-1.jsonl"))
+	noMatches(t, filepath.Join(dir, "committed", "*"))
 	require.NoError(t, w.CommitTxn("txn-1"))
 
-	// After commit: temp removed, committed file exists with content.
-	requireNoFile(t, tmpPath)
-	require.FileExists(t, committedPath)
-	data, err := os.ReadFile(committedPath)
+	noMatches(t, filepath.Join(dir, ".ksink-pending", "txn-1-*"))
+	committed := oneMatch(t, filepath.Join(dir, "committed", "txn-1-*", "messages-txn-1.jsonl"))
+	data, err := os.ReadFile(committed)
 	require.NoError(t, err)
 	assert.Equal(t, "hello\n", string(data))
+	requireNoFile(t, staged)
 }
 
 func TestTxnFileWriterAbort(t *testing.T) {
 	dir := t.TempDir()
-	pattern := filepath.Join(dir, "messages-{txnID}.jsonl")
-
-	w, err := output.NewTxnFileWriter(pattern)
+	w, err := output.NewTxnFileWriter(filepath.Join(dir, "messages-{txnID}.jsonl"))
 	require.NoError(t, err)
-	t.Cleanup(func() { w.Close() }) //nolint:errcheck
+	t.Cleanup(func() { _ = w.Close() })
 
-	msg := &ksink.Message{TransactionalID: "txn-abort"}
-	require.NoError(t, w.Write([]byte("should-be-discarded\n"), msg))
-
-	tmpPath := oneMatch(t, filepath.Join(dir, "messages-txn-abort-*.jsonl.tmp"))
-	require.FileExists(t, tmpPath)
-
+	require.NoError(t, w.Write([]byte("discard\n"), &ksink.Message{TransactionalID: "txn-abort"}))
+	oneMatch(t, filepath.Join(dir, ".ksink-pending", "txn-abort-*", "*.jsonl"))
 	require.NoError(t, w.AbortTxn("txn-abort"))
-
-	// After abort: temp file is deleted.
-	requireNoFile(t, tmpPath)
-	requireNoFile(t, strings.TrimSuffix(tmpPath, ".tmp"))
+	noMatches(t, filepath.Join(dir, ".ksink-pending", "txn-abort-*"))
+	noMatches(t, filepath.Join(dir, "committed", "txn-abort-*"))
 }
 
 func TestTxnFileWriterRejectsNonTransactionalWrite(t *testing.T) {
-	dir := t.TempDir()
-	pattern := filepath.Join(dir, "out-{txnID}.jsonl")
-
-	w, err := output.NewTxnFileWriter(pattern)
+	w, err := output.NewTxnFileWriter(filepath.Join(t.TempDir(), "out-{txnID}.jsonl"))
 	require.NoError(t, err)
-	t.Cleanup(func() { w.Close() }) //nolint:errcheck
-
-	// Write without a TransactionalID should fail.
-	err = w.Write([]byte("plain\n"), &ksink.Message{})
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "TransactionalID")
+	t.Cleanup(func() { _ = w.Close() })
+	require.ErrorContains(t, w.Write([]byte("plain"), &ksink.Message{}), "TransactionalID")
+	require.ErrorContains(t, w.Write([]byte("plain"), nil), "TransactionalID")
 }
 
 func TestTxnFileWriterMultipleTransactions(t *testing.T) {
 	dir := t.TempDir()
-	pattern := filepath.Join(dir, "out-{txnID}.jsonl")
-
-	w, err := output.NewTxnFileWriter(pattern)
+	w, err := output.NewTxnFileWriter(filepath.Join(dir, "out-{txnID}.jsonl"))
 	require.NoError(t, err)
-	t.Cleanup(func() { w.Close() }) //nolint:errcheck
+	t.Cleanup(func() { _ = w.Close() })
 
-	// Two concurrent transactions.
-	msg1 := &ksink.Message{TransactionalID: "t1"}
-	msg2 := &ksink.Message{TransactionalID: "t2"}
-
-	require.NoError(t, w.Write([]byte("a\n"), msg1))
-	require.NoError(t, w.Write([]byte("b\n"), msg2))
-	require.NoError(t, w.Write([]byte("c\n"), msg1))
-
+	require.NoError(t, w.Write([]byte("a\n"), &ksink.Message{TransactionalID: "t1"}))
+	require.NoError(t, w.Write([]byte("b\n"), &ksink.Message{TransactionalID: "t2"}))
+	require.NoError(t, w.Write([]byte("c\n"), &ksink.Message{TransactionalID: "t1"}))
 	require.NoError(t, w.CommitTxn("t1"))
 	require.NoError(t, w.AbortTxn("t2"))
 
-	// t1 committed with both writes; extension stays at the end.
-	data, err := os.ReadFile(oneMatch(t, filepath.Join(dir, "out-t1-*.jsonl")))
+	got, err := os.ReadFile(oneMatch(t, filepath.Join(dir, "committed", "t1-*", "out-t1.jsonl")))
 	require.NoError(t, err)
-	assert.Equal(t, "a\nc\n", string(data))
-
-	// t2 aborted.
-	noMatches(t, filepath.Join(dir, "out-t2-*.jsonl.tmp"))
-	noMatches(t, filepath.Join(dir, "out-t2-*.jsonl"))
+	require.Equal(t, "a\nc\n", string(got))
+	noMatches(t, filepath.Join(dir, "committed", "t2-*"))
+	noMatches(t, filepath.Join(dir, ".ksink-pending", "t2-*"))
 }
 
 func TestTxnFileWriterCloseRemovesUncommitted(t *testing.T) {
 	dir := t.TempDir()
-	pattern := filepath.Join(dir, "out-{txnID}.bin")
-
-	w, err := output.NewTxnFileWriter(pattern)
+	w, err := output.NewTxnFileWriter(filepath.Join(dir, "out-{txnID}.bin"))
 	require.NoError(t, err)
-
-	msg := &ksink.Message{TransactionalID: "open-txn"}
-	require.NoError(t, w.Write([]byte("data\n"), msg))
-	tmpPath := oneMatch(t, filepath.Join(dir, "out-open-txn-*.bin.tmp"))
-
+	require.NoError(t, w.Write([]byte("saved\n"), &ksink.Message{TransactionalID: "saved"}))
+	require.NoError(t, w.CommitTxn("saved"))
+	require.NoError(t, w.Write([]byte("pending\n"), &ksink.Message{TransactionalID: "open-txn"}))
+	oneMatch(t, filepath.Join(dir, ".ksink-pending", "open-txn-*"))
+	require.NoError(t, w.Close())
 	require.NoError(t, w.Close())
 
-	// Uncommitted temp file removed on close.
-	requireNoFile(t, tmpPath)
+	noMatches(t, filepath.Join(dir, ".ksink-pending", "open-txn-*"))
+	oneMatch(t, filepath.Join(dir, "committed", "saved-*", "out-saved.bin"))
+	require.ErrorContains(t, w.Write([]byte("late"), &ksink.Message{TransactionalID: "late"}), "closed")
 }
 
 func TestTxnFileWriterCommitNoData(t *testing.T) {
-	dir := t.TempDir()
-	pattern := filepath.Join(dir, "out-{txnID}.jsonl")
-
-	w, err := output.NewTxnFileWriter(pattern)
+	w, err := output.NewTxnFileWriter(filepath.Join(t.TempDir(), "out-{txnID}.jsonl"))
 	require.NoError(t, err)
-	t.Cleanup(func() { w.Close() }) //nolint:errcheck
-
-	// Commit/abort with no data written should be a no-op.
+	t.Cleanup(func() { _ = w.Close() })
 	require.NoError(t, w.CommitTxn("nonexistent"))
 	require.NoError(t, w.AbortTxn("nonexistent"))
 }
 
 func TestTxnFileWriterSanitizesTxnID(t *testing.T) {
 	dir := t.TempDir()
-	pattern := filepath.Join(dir, "out-{txnID}.jsonl")
-
-	w, err := output.NewTxnFileWriter(pattern)
+	w, err := output.NewTxnFileWriter(filepath.Join(dir, "out-{txnID}.jsonl"))
 	require.NoError(t, err)
-	t.Cleanup(func() { w.Close() }) //nolint:errcheck
-
-	// A txnID with path separators should be sanitised so the file stays
-	// inside the intended directory.
-	msg := &ksink.Message{TransactionalID: "../../etc/evil"}
-	require.NoError(t, w.Write([]byte("data\n"), msg))
+	t.Cleanup(func() { _ = w.Close() })
+	require.NoError(t, w.Write([]byte("data\n"), &ksink.Message{TransactionalID: "../../etc/evil"}))
 	require.NoError(t, w.CommitTxn("../../etc/evil"))
-
-	// The committed file must be inside the temp dir, not escaped.
-	expected := oneMatch(t, filepath.Join(dir, "out-evil-*.jsonl"))
-	require.FileExists(t, expected)
-
-	// Original traversal path must not exist.
-	requireNoFile(t, filepath.Join(dir, "..", "..", "etc", "evil"))
+	oneMatch(t, filepath.Join(dir, "committed", "evil-*", "out-evil.jsonl"))
+	noMatches(t, filepath.Join(dir, "..", "..", "etc", "evil"))
 }
 
 func TestTxnFileWriterNeverReplacesExistingFile(t *testing.T) {
 	dir := t.TempDir()
-	pattern := filepath.Join(dir, "out-{txnID}.jsonl")
-	w, err := output.NewTxnFileWriter(pattern)
+	w, err := output.NewTxnFileWriter(filepath.Join(dir, "out-{txnID}.jsonl"))
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = w.Close() })
 
 	original := filepath.Join(dir, "out-reuse.jsonl")
 	require.NoError(t, os.WriteFile(original, []byte("old\n"), 0600))
-
 	msg := &ksink.Message{TransactionalID: "reuse"}
 	require.NoError(t, w.Write([]byte("first\n"), msg))
 	require.NoError(t, w.CommitTxn("reuse"))
 	require.NoError(t, w.Write([]byte("second\n"), msg))
 	require.NoError(t, w.CommitTxn("reuse"))
 
-	// The original file and both independent successful commits survive.
 	data, err := os.ReadFile(original)
 	require.NoError(t, err)
 	require.Equal(t, "old\n", string(data))
-	paths, err := filepath.Glob(filepath.Join(dir, "out-reuse-*.jsonl"))
+	paths, err := filepath.Glob(filepath.Join(dir, "committed", "reuse-*", "out-reuse.jsonl"))
 	require.NoError(t, err)
 	require.Len(t, paths, 2)
-	first, err := os.ReadFile(paths[0])
-	require.NoError(t, err)
-	second, err := os.ReadFile(paths[1])
-	require.NoError(t, err)
-	require.ElementsMatch(t, []string{"first\n", "second\n"}, []string{string(first), string(second)})
+	contents := make([]string, 0, len(paths))
+	for _, path := range paths {
+		b, err := os.ReadFile(path)
+		require.NoError(t, err)
+		contents = append(contents, string(b))
+	}
+	require.ElementsMatch(t, []string{"first\n", "second\n"}, contents)
 }
 
-func TestTxnFileWriterCommitCanRetryAfterPublishFailure(t *testing.T) {
-	dir := t.TempDir()
-	w, err := output.NewTxnFileWriter(filepath.Join(dir, "{txnID}.jsonl"))
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = w.Close() })
-	msg := &ksink.Message{TransactionalID: "retry"}
-	require.NoError(t, w.Write([]byte("payload\n"), msg))
-	tmp := oneMatch(t, filepath.Join(dir, "retry-*.jsonl.tmp"))
-	final := strings.TrimSuffix(tmp, ".tmp")
-	// A directory at the final path makes os.Link fail without losing staging.
-	require.NoError(t, os.Mkdir(final, 0700))
-	require.Error(t, w.CommitTxn("retry"))
-	require.FileExists(t, tmp)
-	require.Error(t, w.Write([]byte("must not append\n"), msg))
-	require.NoError(t, os.Remove(final))
-	require.NoError(t, w.CommitTxn("retry"))
-	requireNoFile(t, tmp)
-	b, err := os.ReadFile(final)
-	require.NoError(t, err)
-	require.Equal(t, "payload\n", string(b))
-}
-
-func TestTxnFileWriterAbortAfterPartialMultiKeyCommit(t *testing.T) {
+func TestTxnFileWriterCommitCanRetryAfterDirectoryPublishFailure(t *testing.T) {
 	dir := t.TempDir()
 	w, err := output.NewTxnFileWriter(filepath.Join(dir, "{topic}-{txnID}.jsonl"))
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = w.Close() })
-	require.NoError(t, w.Write([]byte("a\n"), &ksink.Message{Topic: "orders", TransactionalID: "multi"}))
-	require.NoError(t, w.Write([]byte("b\n"), &ksink.Message{Topic: "payments", TransactionalID: "multi"}))
-	paths, err := filepath.Glob(filepath.Join(dir, "*-multi-*.jsonl.tmp"))
+	txnID := "retry"
+	for _, topic := range []string{"orders", "payments"} {
+		require.NoError(t, w.Write([]byte(topic+"\n"), &ksink.Message{TransactionalID: txnID, Topic: topic}))
+	}
+
+	// Replace the committed root with a file to force the single rename to
+	// fail. No subset of the transaction may become visible.
+	committedRoot := filepath.Join(dir, "committed")
+	require.NoError(t, os.Remove(committedRoot))
+	require.NoError(t, os.WriteFile(committedRoot, []byte("blocker"), 0600))
+	require.Error(t, w.CommitTxn(txnID))
+	require.ErrorContains(t, w.Write([]byte("blocked"), &ksink.Message{TransactionalID: txnID}), "pending commit")
+	oneMatch(t, filepath.Join(dir, ".ksink-pending", "retry-*", "orders-retry.jsonl"))
+	oneMatch(t, filepath.Join(dir, ".ksink-pending", "retry-*", "payments-retry.jsonl"))
+	noMatches(t, filepath.Join(dir, "committed", "retry-*"))
+
+	require.NoError(t, os.Remove(committedRoot))
+	require.NoError(t, os.Mkdir(committedRoot, 0700))
+	require.NoError(t, w.CommitTxn(txnID))
+	dirPath := oneMatch(t, filepath.Join(dir, "committed", "retry-*"))
+	for _, topic := range []string{"orders", "payments"} {
+		b, err := os.ReadFile(filepath.Join(dirPath, topic+"-retry.jsonl"))
+		require.NoError(t, err)
+		require.Equal(t, topic+"\n", string(b))
+	}
+	noMatches(t, filepath.Join(dir, ".ksink-pending", "retry-*"))
+}
+
+func TestTxnFileWriterAbortAfterFailedMultiFileCommit(t *testing.T) {
+	dir := t.TempDir()
+	w, err := output.NewTxnFileWriter(filepath.Join(dir, "{topic}-{txnID}.jsonl"))
 	require.NoError(t, err)
-	require.Len(t, paths, 2)
-	// A single publish fails; whichever was already linked must be removed on abort.
-	failingFinal := strings.TrimSuffix(paths[0], ".tmp")
-	require.NoError(t, os.Mkdir(failingFinal, 0700))
+	t.Cleanup(func() { _ = w.Close() })
+	for _, topic := range []string{"orders", "payments"} {
+		require.NoError(t, w.Write([]byte(topic), &ksink.Message{TransactionalID: "multi", Topic: topic}))
+	}
+	committedRoot := filepath.Join(dir, "committed")
+	require.NoError(t, os.Remove(committedRoot))
+	require.NoError(t, os.WriteFile(committedRoot, []byte("blocker"), 0600))
 	require.Error(t, w.CommitTxn("multi"))
-	require.Error(t, w.Write([]byte("blocked"), &ksink.Message{Topic: "orders", TransactionalID: "multi"}))
 	require.NoError(t, w.AbortTxn("multi"))
-	require.NoError(t, os.Remove(failingFinal))
-	noMatches(t, filepath.Join(dir, "*-multi-*.jsonl.tmp"))
-	noMatches(t, filepath.Join(dir, "*-multi-*.jsonl"))
+	noMatches(t, filepath.Join(dir, ".ksink-pending", "multi-*"))
+	require.NoError(t, os.Remove(committedRoot))
+	require.NoError(t, os.Mkdir(committedRoot, 0700))
+	noMatches(t, filepath.Join(dir, "committed", "multi-*"))
+}
+
+func TestTxnFileWriterAllTopicsVisibleAtOnce(t *testing.T) {
+	dir := t.TempDir()
+	w, err := output.NewTxnFileWriter(filepath.Join(dir, "{topic}", "{partition}-{txnID}.jsonl"))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = w.Close() })
+	const count = 50
+	for i := 0; i < count; i++ {
+		msg := &ksink.Message{TransactionalID: "atomic", Topic: fmt.Sprintf("topic-%d", i), Partition: int32(i)}
+		require.NoError(t, w.Write([]byte(fmt.Sprintf("%d\n", i)), msg))
+	}
+
+	// A concurrent observer sees zero transaction directories, or a complete
+	// directory with every file. There is never a partially published set.
+	var mu sync.Mutex
+	var failures []string
+	done := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-done:
+				return
+			default:
+			}
+			dirs, err := filepath.Glob(filepath.Join(dir, "committed", "atomic-*"))
+			if err != nil {
+				mu.Lock()
+				failures = append(failures, err.Error())
+				mu.Unlock()
+				return
+			}
+			for _, transactionDir := range dirs {
+				for i := 0; i < count; i++ {
+					path := filepath.Join(transactionDir, fmt.Sprintf("topic-%d", i), fmt.Sprintf("%d-atomic.jsonl", i))
+					if _, err := os.Stat(path); err != nil {
+						mu.Lock()
+						failures = append(failures, path)
+						mu.Unlock()
+						return
+					}
+				}
+			}
+		}
+	}()
+	require.NoError(t, w.CommitTxn("atomic"))
+	committed := oneMatch(t, filepath.Join(dir, "committed", "atomic-*"))
+	for i := 0; i < count; i++ {
+		require.FileExists(t, filepath.Join(committed, fmt.Sprintf("topic-%d", i), fmt.Sprintf("%d-atomic.jsonl", i)))
+	}
+	close(done)
+	wg.Wait()
+	require.Empty(t, failures, "reader observed a partially published transaction")
+}
+
+func TestTxnFileWriterPreservesSubdirectoryLayout(t *testing.T) {
+	dir := t.TempDir()
+	w, err := output.NewTxnFileWriter(filepath.Join(dir, "static", "{topic}", "part-{partition}-{txnID}.bin"))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = w.Close() })
+	require.NoError(t, w.Write([]byte("foo"), &ksink.Message{TransactionalID: "nested", Topic: "orders", Partition: 2}))
+	require.NoError(t, w.CommitTxn("nested"))
+	require.FileExists(t, oneMatch(t, filepath.Join(dir, "static", "committed", "nested-*", "orders", "part-2-nested.bin")))
+	noMatches(t, filepath.Join(dir, "committed", "*")) // fixed prefix determines root
+}
+
+func TestTxnFileWriterWriteAfterCommitIsNewTransaction(t *testing.T) {
+	dir := t.TempDir()
+	w, err := output.NewTxnFileWriter(filepath.Join(dir, "out-{txnID}.bin"))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = w.Close() })
+	msg := &ksink.Message{TransactionalID: "repeat"}
+	for i := range 3 {
+		require.NoError(t, w.Write([]byte(fmt.Sprint(i)), msg))
+		require.NoError(t, w.CommitTxn("repeat"))
+	}
+	dirs, err := filepath.Glob(filepath.Join(dir, "committed", "repeat-*"))
+	require.NoError(t, err)
+	require.Len(t, dirs, 3)
+	contents := make([]string, 0, len(dirs))
+	for _, d := range dirs {
+		b, err := os.ReadFile(filepath.Join(d, "out-repeat.bin"))
+		require.NoError(t, err)
+		contents = append(contents, string(b))
+	}
+	sort.Strings(contents)
+	require.Equal(t, []string{"0", "1", "2"}, contents)
 }
 
 func oneMatch(t *testing.T, pattern string) string {
@@ -246,7 +298,7 @@ func noMatches(t *testing.T, pattern string) {
 	t.Helper()
 	paths, err := filepath.Glob(pattern)
 	require.NoError(t, err)
-	require.Empty(t, paths)
+	require.Empty(t, paths, "unexpected matches for %q", pattern)
 }
 
 func requireNoFile(t *testing.T, path string) {
