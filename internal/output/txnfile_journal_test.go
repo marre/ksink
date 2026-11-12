@@ -26,6 +26,11 @@ func crashFileWriter(t *testing.T, writer TransactionalWriter) {
 	}
 	w.closed = true
 	w.txnFiles = nil
+	// The operating system automatically releases advisory locks on process
+	// exit. Do that explicitly when simulating a crash within the same test.
+	require.NoError(t, releaseTxnFileLock(w.lock))
+	require.NoError(t, w.lock.Close())
+	w.lock = nil
 }
 
 func requireOneTxnDir(t *testing.T, pattern string) string {
@@ -187,4 +192,23 @@ func TestTxnFileStartupAfterRenameDoesNotDuplicateCommit(t *testing.T) {
 	paths, err := filepath.Glob(filepath.Join(dir, "committed", "moved-*"))
 	require.NoError(t, err)
 	require.Len(t, paths, 1)
+}
+
+func TestTxnFileRecoveryLockRejectsConcurrentWriter(t *testing.T) {
+	dir := t.TempDir()
+	pattern := filepath.Join(dir, "out-{txnID}.jsonl")
+	owner, err := NewTxnFileWriter(pattern)
+	require.NoError(t, err)
+	_, err = NewTxnFileWriter(pattern)
+	require.ErrorContains(t, err, "exclusive transaction writer lock")
+	require.NoError(t, owner.Write([]byte("still active"), &ksink.Message{TransactionalID: "owner"}))
+	one := requireOneTxnDir(t, filepath.Join(dir, ".ksink-pending", "owner-*"))
+	require.FileExists(t, filepath.Join(one, "out-owner.jsonl"))
+	require.NoError(t, owner.Close())
+	reopened, err := NewTxnFileWriter(pattern)
+	require.NoError(t, err)
+	defer func() { _ = reopened.Close() }()
+	// Owner closed without committing, so uncommitted data is gone.
+	_, err = os.Stat(one)
+	require.ErrorIs(t, err, os.ErrNotExist)
 }
