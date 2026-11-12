@@ -218,6 +218,7 @@ type txnState struct {
 	needsResolution bool // a commit/abort failed; only EndTxn retry/abort is allowed
 	hasOutcome      bool // remember successful EndTxn for response-loss retries
 	lastCommit      bool
+	inFlight        sync.WaitGroup // accepted Produce requests; EndTxn/fencing waits for these
 }
 
 // Server is a Kafka-protocol-compatible server that accepts produce requests.
