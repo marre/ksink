@@ -3,7 +3,6 @@ package output_test
 import (
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 
 	"github.com/marre/ksink/internal/output"
@@ -104,55 +103,39 @@ func TestPatternFileWriterEmptyTopic(t *testing.T) {
 
 func TestTxnFileWriterWithTopicPlaceholder(t *testing.T) {
 	dir := t.TempDir()
-	pattern := filepath.Join(dir, "{topic}-{txnID}.jsonl")
-
-	w, err := output.NewTxnFileWriter(pattern)
+	w, err := output.NewTxnFileWriter(filepath.Join(dir, "{topic}-{txnID}.jsonl"))
 	require.NoError(t, err)
-	t.Cleanup(func() { w.Close() }) //nolint:errcheck
+	t.Cleanup(func() { _ = w.Close() })
 
-	// Write to two topics in the same transaction.
 	msg1 := &ksink.Message{TransactionalID: "txn-1", Topic: "orders"}
 	msg2 := &ksink.Message{TransactionalID: "txn-1", Topic: "events"}
-
 	require.NoError(t, w.Write([]byte("order\n"), msg1))
 	require.NoError(t, w.Write([]byte("event\n"), msg2))
-
-	// Both temp files should exist before commit.
-	ordersTmp := oneMatch(t, filepath.Join(dir, "orders-txn-1-*.jsonl.tmp"))
-	eventsTmp := oneMatch(t, filepath.Join(dir, "events-txn-1-*.jsonl.tmp"))
+	stageDir := oneMatch(t, filepath.Join(dir, ".ksink-pending", "txn-1-*"))
+	require.FileExists(t, filepath.Join(stageDir, "orders-txn-1.jsonl"))
+	require.FileExists(t, filepath.Join(stageDir, "events-txn-1.jsonl"))
+	noMatches(t, filepath.Join(dir, "committed", "*"))
 
 	require.NoError(t, w.CommitTxn("txn-1"))
-
-	// After commit: both committed files should exist.
-	data1, err := os.ReadFile(strings.TrimSuffix(ordersTmp, ".tmp"))
-	require.NoError(t, err)
-	assert.Equal(t, "order\n", string(data1))
-
-	data2, err := os.ReadFile(strings.TrimSuffix(eventsTmp, ".tmp"))
-	require.NoError(t, err)
-	assert.Equal(t, "event\n", string(data2))
-
-	// Temp files should be gone.
-	requireNoFile(t, ordersTmp)
-	requireNoFile(t, eventsTmp)
+	committed := oneMatch(t, filepath.Join(dir, "committed", "txn-1-*"))
+	for file, want := range map[string]string{"orders-txn-1.jsonl": "order\n", "events-txn-1.jsonl": "event\n"} {
+		data, err := os.ReadFile(filepath.Join(committed, file))
+		require.NoError(t, err)
+		assert.Equal(t, want, string(data))
+	}
+	noMatches(t, filepath.Join(dir, ".ksink-pending", "txn-1-*"))
 }
 
 func TestTxnFileWriterWithTopicAbort(t *testing.T) {
 	dir := t.TempDir()
-	pattern := filepath.Join(dir, "{topic}-{txnID}.jsonl")
-
-	w, err := output.NewTxnFileWriter(pattern)
+	w, err := output.NewTxnFileWriter(filepath.Join(dir, "{topic}-{txnID}.jsonl"))
 	require.NoError(t, err)
-	t.Cleanup(func() { w.Close() }) //nolint:errcheck
+	t.Cleanup(func() { _ = w.Close() })
 
-	msg := &ksink.Message{TransactionalID: "txn-abort", Topic: "orders"}
-	require.NoError(t, w.Write([]byte("data\n"), msg))
-
+	require.NoError(t, w.Write([]byte("data\n"), &ksink.Message{TransactionalID: "txn-abort", Topic: "orders"}))
 	require.NoError(t, w.AbortTxn("txn-abort"))
-
-	// After abort: temp and committed files should not exist.
-	noMatches(t, filepath.Join(dir, "orders-txn-abort-*.jsonl.tmp"))
-	noMatches(t, filepath.Join(dir, "orders-txn-abort-*.jsonl"))
+	noMatches(t, filepath.Join(dir, ".ksink-pending", "txn-abort-*"))
+	noMatches(t, filepath.Join(dir, "committed", "txn-abort-*"))
 }
 
 // Partition routing is opt-in: omitting {partition} preserves per-topic routing.
@@ -189,44 +172,50 @@ func TestPatternFileWriterPartitionOnly(t *testing.T) {
 }
 
 func TestTxnFileWriterRoutesByPartitionCommitAbortAndClose(t *testing.T) {
- dir := t.TempDir()
- w, err := output.NewTxnFileWriter(filepath.Join(dir, "{topic}-{partition}-{txnID}.jsonl"))
- require.NoError(t, err)
- for _,tc:=range []struct{txn,topic,data string;partition int32}{
-  {"commit","orders","one\n",0},
-  {"commit","orders","two\n",1},
-  {"commit","orders","three\n",0},
-  {"commit","events","event\n",0},
-  {"abort","orders","discard\n",3},
-  {"pending","orders","pending\n",4},
- } {
-  require.NoError(t,w.Write([]byte(tc.data), &ksink.Message{TransactionalID:tc.txn,Topic:tc.topic,Partition:tc.partition}))
- }
- require.FileExists(t,oneMatch(t,filepath.Join(dir,"orders-0-commit-*.jsonl.tmp")))
- require.FileExists(t,oneMatch(t,filepath.Join(dir,"orders-1-commit-*.jsonl.tmp")))
- require.NoError(t,w.CommitTxn("commit"))
- require.NoError(t,w.AbortTxn("abort"))
- for path,want:=range map[string]string{"orders-0-commit-*.jsonl":"one\nthree\n","orders-1-commit-*.jsonl":"two\n","events-0-commit-*.jsonl":"event\n"} {
-  b,err:=os.ReadFile(oneMatch(t,filepath.Join(dir,path)))
-  require.NoError(t,err)
-  assert.Equal(t,want,string(b))
-  noMatches(t,filepath.Join(dir,path+".tmp"))
- }
- noMatches(t,filepath.Join(dir,"orders-3-abort-*.jsonl.tmp"))
- noMatches(t,filepath.Join(dir,"orders-3-abort-*.jsonl"))
- require.NoError(t,w.Close())
- noMatches(t,filepath.Join(dir,"orders-4-pending-*.jsonl.tmp"))
+	dir := t.TempDir()
+	w, err := output.NewTxnFileWriter(filepath.Join(dir, "{topic}-{partition}-{txnID}.jsonl"))
+	require.NoError(t, err)
+	for _, tc := range []struct{ txn, topic, data string; partition int32 }{
+		{"commit", "orders", "one\n", 0},
+		{"commit", "orders", "two\n", 1},
+		{"commit", "orders", "three\n", 0},
+		{"commit", "events", "event\n", 0},
+		{"abort", "orders", "discard\n", 3},
+		{"pending", "orders", "pending\n", 4},
+	} {
+		require.NoError(t, w.Write([]byte(tc.data), &ksink.Message{TransactionalID: tc.txn, Topic: tc.topic, Partition: tc.partition}))
+	}
+	stageDir := oneMatch(t, filepath.Join(dir, ".ksink-pending", "commit-*"))
+	require.FileExists(t, filepath.Join(stageDir, "orders-0-commit.jsonl"))
+	require.FileExists(t, filepath.Join(stageDir, "orders-1-commit.jsonl"))
+	require.NoError(t, w.CommitTxn("commit"))
+	require.NoError(t, w.AbortTxn("abort"))
+	committed := oneMatch(t, filepath.Join(dir, "committed", "commit-*"))
+	for file, want := range map[string]string{
+		"orders-0-commit.jsonl": "one\nthree\n",
+		"orders-1-commit.jsonl": "two\n",
+		"events-0-commit.jsonl": "event\n",
+	} {
+		data, err := os.ReadFile(filepath.Join(committed, file))
+		require.NoError(t, err)
+		assert.Equal(t, want, string(data))
+	}
+	noMatches(t, filepath.Join(dir, "committed", "abort-*"))
+	noMatches(t, filepath.Join(dir, ".ksink-pending", "abort-*"))
+	require.NoError(t, w.Close())
+	noMatches(t, filepath.Join(dir, ".ksink-pending", "pending-*"))
 }
 
 func TestTxnFileWriterPartitionOnly(t *testing.T) {
- dir:=t.TempDir()
- w,err:=output.NewTxnFileWriter(filepath.Join(dir,"part-{partition}-{txnID}.bin"))
- require.NoError(t,err)
- require.NoError(t,w.Write([]byte("one"),&ksink.Message{TransactionalID:"x",Topic:"a",Partition:5}))
- require.NoError(t,w.Write([]byte("two"),&ksink.Message{TransactionalID:"x",Topic:"b",Partition:5}))
- require.NoError(t,w.CommitTxn("x"))
- b,err:=os.ReadFile(oneMatch(t,filepath.Join(dir,"part-5-x-*.bin")))
- require.NoError(t,err)
- assert.Equal(t,"onetwo",string(b))
- require.NoError(t,w.Close())
+	dir := t.TempDir()
+	w, err := output.NewTxnFileWriter(filepath.Join(dir, "part-{partition}-{txnID}.bin"))
+	require.NoError(t, err)
+	require.NoError(t, w.Write([]byte("one"), &ksink.Message{TransactionalID: "x", Topic: "a", Partition: 5}))
+	require.NoError(t, w.Write([]byte("two"), &ksink.Message{TransactionalID: "x", Topic: "b", Partition: 5}))
+	require.NoError(t, w.CommitTxn("x"))
+	committed := oneMatch(t, filepath.Join(dir, "committed", "x-*"))
+	data, err := os.ReadFile(filepath.Join(committed, "part-5-x.bin"))
+	require.NoError(t, err)
+	assert.Equal(t, "onetwo", string(data))
+	require.NoError(t, w.Close())
 }
