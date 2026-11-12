@@ -6,7 +6,6 @@ import (
 	"errors"
 	"net"
 	"testing"
-	"time"
 
 	"github.com/stretchr/testify/require"
 	"github.com/twmb/franz-go/pkg/kerr"
