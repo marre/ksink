@@ -165,6 +165,7 @@ func (s *Server) handleProduce(ctx context.Context, conn net.Conn, connID uint64
 	var txnProduceErr int16
 	var txnProducerID int64
 	var txnProducerEpoch int16
+	var txnProduceState *txnState
 	if txnID != "" && s.cfg.TransactionalWrite {
 		s.txnMu.Lock()
 		st, ok := s.txnStates[txnID]
@@ -175,8 +176,15 @@ func (s *Server) handleProduce(ctx context.Context, conn net.Conn, connID uint64
 			txnProduceErr = kerr.InvalidTxnState.Code
 		default:
 			txnProducerID, txnProducerEpoch = st.producerID, st.epoch
+			// Adding while holding txnMu is paired with EndTxn marking the
+			// state as ending under the same mutex before waiting.
+			st.inFlight.Add(1)
+			txnProduceState = st
 		}
 		s.txnMu.Unlock()
+	}
+	if txnProduceState != nil {
+		defer txnProduceState.inFlight.Done()
 	}
 
 	// First pass: parse all records and track per-partition status
@@ -353,6 +361,7 @@ func (s *Server) handleInitProducerId(ctx context.Context, conn net.Conn, connID
 			if existing.active {
 				existing.ending = true
 				s.txnMu.Unlock()
+				existing.inFlight.Wait() // drain accepted Produce requests before abort
 				err := s.deliverEvent(ctx, &TxnAbortEvent{TransactionalID: txnID})
 				s.txnMu.Lock()
 				existing.ending = false
@@ -605,6 +614,7 @@ func (s *Server) handleEndTxn(ctx context.Context, conn net.Conn, connID uint64,
 	}
 	st.ending = true
 	s.txnMu.Unlock()
+	st.inFlight.Wait() // do not publish commit ahead of accepted Produce events
 
 	var evt Event
 	if req.Commit {
