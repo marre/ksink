@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -32,11 +33,13 @@ func (w *patternFileWriter) Write(data []byte, msg *ksink.Message) error {
 	defer w.mu.Unlock()
 
 	topic := ""
+	var partition int32
 	if msg != nil {
 		topic = msg.Topic
+		partition = msg.Partition
 	}
 
-	path := w.resolvePath(topic)
+	path := w.resolvePath(topic, partition)
 
 	f, ok := w.files[path]
 	if !ok {
@@ -66,6 +69,8 @@ func (w *patternFileWriter) Close() error {
 	return firstErr
 }
 
-func (w *patternFileWriter) resolvePath(topic string) string {
-	return filepath.Clean(strings.ReplaceAll(w.pattern, TopicPlaceholder, SanitizePathSegment(topic)))
+func (w *patternFileWriter) resolvePath(topic string, partition int32) string {
+	path := strings.ReplaceAll(w.pattern, TopicPlaceholder, SanitizePathSegment(topic))
+	path = strings.ReplaceAll(path, PartitionPlaceholder, strconv.FormatInt(int64(partition), 10))
+	return filepath.Clean(path)
 }
