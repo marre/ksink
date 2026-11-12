@@ -639,12 +639,14 @@ func TestFranzTransactionalFileCommit(t *testing.T) {
 	require.NoError(t, client.EndTransaction(ctx, kgo.TryCommit))
 
 	// Wait for an immutable committed output, which has a unique instance suffix.
-	committedPath, data := waitForCommittedTxnFile(t, dir, "out-commit-txn-*.jsonl")
+	committedPath, data := waitForCommittedTxnFile(t, dir, "commit-txn-*", "out-commit-txn.jsonl")
 	assert.Equal(t, "msg-1\nmsg-2\n", string(data))
 
-	// Temp file should be gone.
-	_, err = os.Stat(committedPath + ".tmp")
-	assert.True(t, os.IsNotExist(err), "temp file should be removed after commit")
+	// Only the committed directory is visible after successful EndTxn.
+	require.FileExists(t, committedPath)
+	staged, globErr := filepath.Glob(filepath.Join(dir, ".ksink-pending", "commit-txn-*"))
+	require.NoError(t, globErr)
+	assert.Empty(t, staged)
 }
 
 // TestFranzTransactionalFileAbort verifies that messages produced inside an
@@ -697,9 +699,12 @@ func TestFranzTransactionalFileAbort(t *testing.T) {
 	time.Sleep(500 * time.Millisecond)
 
 	// No committed or temporary file for the aborted transaction may remain.
-	abortedPaths, globErr := filepath.Glob(filepath.Join(dir, "out-abort-txn-*.jsonl*"))
+	abortedPaths, globErr := filepath.Glob(filepath.Join(dir, "committed", "abort-txn-*"))
 	require.NoError(t, globErr)
 	assert.Empty(t, abortedPaths)
+	stagedPaths, globErr := filepath.Glob(filepath.Join(dir, ".ksink-pending", "abort-txn-*"))
+	require.NoError(t, globErr)
+	assert.Empty(t, stagedPaths)
 }
 
 // TestFranzTransactionalFileCommitAndAbort verifies a scenario with two
@@ -764,16 +769,19 @@ func TestFranzTransactionalFileCommitAndAbort(t *testing.T) {
 	require.NoError(t, client2.EndTransaction(ctx, kgo.TryAbort))
 
 	// The committed transaction has a unique, immutable filename.
-	_, data := waitForCommittedTxnFile(t, dir, "out-txn-keep-*.jsonl")
+	_, data := waitForCommittedTxnFile(t, dir, "txn-keep-*", "out-txn-keep.jsonl")
 	assert.Equal(t, "committed-msg\n", string(data))
 
 	// Give abort time to process.
 	time.Sleep(500 * time.Millisecond)
 
 	// The aborted transaction should leave no committed or staging file.
-	abortedPaths, globErr := filepath.Glob(filepath.Join(dir, "out-txn-discard-*.jsonl*"))
+	abortedPaths, globErr := filepath.Glob(filepath.Join(dir, "committed", "txn-discard-*"))
 	require.NoError(t, globErr)
 	assert.Empty(t, abortedPaths)
+	stagedPaths, globErr := filepath.Glob(filepath.Join(dir, ".ksink-pending", "txn-discard-*"))
+	require.NoError(t, globErr)
+	assert.Empty(t, stagedPaths)
 }
 
 // TestFranzZombieFencing verifies that when a new producer is created with the
@@ -1452,11 +1460,11 @@ func startFailReadLoop(t *testing.T, srv *Server, ackErr error) {
 	}()
 }
 
-func waitForCommittedTxnFile(t *testing.T, dir, pattern string) (string, []byte) {
+func waitForCommittedTxnFile(t *testing.T, dir, txnDirPattern, filename string) (string, []byte) {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
-		paths, err := filepath.Glob(filepath.Join(dir, pattern))
+		paths, err := filepath.Glob(filepath.Join(dir, "committed", txnDirPattern, filename))
 		require.NoError(t, err)
 		if len(paths) == 1 {
 			data, err := os.ReadFile(paths[0])
@@ -1466,6 +1474,6 @@ func waitForCommittedTxnFile(t *testing.T, dir, pattern string) (string, []byte)
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
-	t.Fatalf("expected exactly one committed transaction file matching %q", pattern)
+	t.Fatalf("expected exactly one committed transaction file for %s/%s", txnDirPattern, filename)
 	return "", nil
 }
