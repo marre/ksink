@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -25,9 +26,9 @@ type txnFileEntry struct {
 // rename-as-commit / delete-as-rollback semantics.
 //
 // The output path must contain a {txnID} placeholder. It may optionally
-// contain a {topic} placeholder that is replaced with the sanitised topic
+// contain {topic} and {partition} placeholders that are replaced with the sanitised topic
 // name from each message. When {topic} is present, a single transaction
-// that produces to multiple topics creates one file per topic; all are
+// that produces to multiple topics or partitions creates one file per resolved path; all are
 // committed or aborted together.
 //
 //	During transaction: pattern with placeholders replaced + ".tmp"
@@ -45,10 +46,11 @@ type txnFileWriter struct {
 //
 // The pattern must contain a {txnID} placeholder which is replaced with the
 // actual transaction ID for each transaction. It may also contain a {topic}
-// placeholder. For example:
+// and {partition} placeholders. For example:
 //
 //	"messages-{txnID}.jsonl"
 //	"{topic}-{txnID}.jsonl"
+//	"{topic}-{partition}-{txnID}.jsonl"
 //
 // produces committed files like "messages-my-txn.jsonl" and temp files like
 // "messages-my-txn.jsonl.tmp".
@@ -80,7 +82,7 @@ func (w *txnFileWriter) Write(data []byte, msg *ksink.Message) error {
 		topic = msg.Topic
 	}
 
-	committed := w.resolvePath(txnID, topic)
+	committed := w.resolvePath(txnID, topic, msg.Partition)
 	entries, ok := w.txnFiles[txnID]
 	if !ok {
 		entries = make(map[string]*txnFileEntry)
@@ -180,8 +182,9 @@ func (w *txnFileWriter) Close() error {
 	return firstErr
 }
 
-func (w *txnFileWriter) resolvePath(txnID, topic string) string {
+func (w *txnFileWriter) resolvePath(txnID, topic string, partition int32) string {
 	path := strings.ReplaceAll(w.pattern, TxnIDPlaceholder, SanitizePathSegment(txnID))
 	path = strings.ReplaceAll(path, TopicPlaceholder, SanitizePathSegment(topic))
+	path = strings.ReplaceAll(path, PartitionPlaceholder, strconv.FormatInt(int64(partition), 10))
 	return filepath.Clean(path)
 }
