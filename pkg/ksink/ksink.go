@@ -145,6 +145,13 @@ type Config struct {
 	// (AddPartitionsToTxn, EndTxn) but does not enforce transactional
 	// semantics. This implies IdempotentWrite.
 	TransactionalWrite bool
+
+	// TransactionStateDir enables durable Kafka producer state and record
+	// sequence deduplication across restarts. The CLI defaults this to a
+	// private sidecar directory under transactional file output. A blank
+	// value retains legacy in-memory behavior for library callers.
+	// Multiple servers MUST NOT share one directory concurrently.
+	TransactionStateDir string
 }
 
 func (c *Config) setDefaults() {
@@ -219,6 +226,10 @@ type txnState struct {
 	hasOutcome      bool // remember successful EndTxn for response-loss retries
 	lastCommit      bool
 	inFlight        sync.WaitGroup // accepted Produce requests; EndTxn/fencing waits for these
+	produceMu       sync.Mutex     // serialize validation, delivery, and sequence journal
+	sequences       map[string]txnPartitionSequence
+	pendingAction   string // persisted EndTxn intent ("commit" or "abort")
+	restartRequired bool   // prevent old producer epochs from resuming after crash
 }
 
 // Server is a Kafka-protocol-compatible server that accepts produce requests.
@@ -248,8 +259,10 @@ type Server struct {
 	producerIDCounter atomic.Int64
 
 	// Transaction state tracking: maps transactional.id -> txnState
-	txnMu     sync.Mutex
-	txnStates map[string]*txnState
+	txnMu       sync.Mutex
+	txnStates   map[string]*txnState
+	txnStore    *durableTxnStore
+	txnStoreErr error
 
 	// Decompressor for parsing record batches
 	decompressor kgo.Decompressor
@@ -267,6 +280,9 @@ type Server struct {
 // New creates a new [Server] with the given configuration and options.
 func New(cfg Config, opts ...Option) (*Server, error) {
 	cfg.setDefaults()
+	if cfg.TransactionStateDir != "" && !cfg.TransactionalWrite {
+		return nil, fmt.Errorf("TransactionStateDir requires TransactionalWrite")
+	}
 
 	s := &Server{
 		cfg:             cfg,
@@ -330,6 +346,9 @@ func New(cfg Config, opts ...Option) (*Server, error) {
 		s.tlsConfig = tlsConfig
 	}
 
+	if err := s.initializeTxnState(); err != nil {
+		return nil, fmt.Errorf("initialize durable Kafka producer state: %w", err)
+	}
 	return s, nil
 }
 
@@ -483,5 +502,15 @@ func (s *Server) Close(ctx context.Context) error {
 		s.logger.Warnf("Timeout waiting for connections to close")
 	}
 
+	// Do not release the coordinator lock while network handlers still run.
+	// If shutdown times out, retaining the lock is safer than allowing two
+	// server instances to mutate the same durable coordinator state.
+	select {
+	case <-done:
+		if s.txnStore != nil {
+			return s.txnStore.close()
+		}
+	default:
+	}
 	return nil
 }
