@@ -1,6 +1,8 @@
 package ksink
 
 import (
+	"crypto/rand"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -113,7 +115,20 @@ func openDurableTxnStore(path string) (*durableTxnStore, txnStateSnapshot, error
 	}
 	data, err := os.ReadFile(filepath.Join(dir, "state.json"))
 	if errors.Is(err, fs.ErrNotExist) {
-		return store, txnStateSnapshot{Version: durableTxnStateVersion, States: make(map[string]storedTxnState)}, nil
+		// Never reuse the low producer IDs assigned by older in-memory
+		// ksink instances when enabling durability for the first time.
+		// A high random starting ID makes an old zombie PID extremely
+		// unlikely to collide with a fresh persistent coordinator.
+		var seed [8]byte
+		if _, err := rand.Read(seed[:]); err != nil {
+			return rollback(fmt.Errorf("seed durable producer ID space: %w", err))
+		}
+		counter := int64(1<<60) | int64(binary.BigEndian.Uint64(seed[:])&((1<<60)-1))
+		return store, txnStateSnapshot{
+			Version: durableTxnStateVersion,
+			Counter: counter,
+			States: make(map[string]storedTxnState),
+		}, nil
 	}
 	if err != nil {
 		return rollback(fmt.Errorf("load coordinator state: %w", err))
