@@ -42,9 +42,16 @@ go run ./cmd/ksink --addr :9092 --transactional --output 'messages-{txnID}.jsonl
 go run ./cmd/ksink --addr :9092 --output '{topic}.jsonl'
 # produces orders.jsonl, events.jsonl, etc. — one file per topic
 
+# Route to separate files per partition (or combine topic and partition)
+go run ./cmd/ksink --addr :9092 --output '{topic}-{partition}.jsonl'
+# produces orders-0.jsonl, orders-1.jsonl, etc.
+
 # Combine {topic} with transactional output
 go run ./cmd/ksink --addr :9092 --transactional --output '{topic}-{txnID}.jsonl'
 # produces orders-my-txn.jsonl, events-my-txn.jsonl, etc.
+
+# Transactional files may also be split by partition:
+# go run ./cmd/ksink --transactional --output '{topic}-{partition}-{txnID}.jsonl'
 
 # Transactional file output — the --output pattern must contain {txnID}.
 # Messages are written to per-transaction temp files; on commit the temp
