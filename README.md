@@ -258,7 +258,7 @@ intentionally simplified:
 | Real Kafka behaviour | ksink API behaviour | ksink tool behaviour |
 |---|---|---|
 | Records written inside a transaction are invisible to `read_committed` consumers until commit. | Records are delivered to `Read` as `*MessagesEvent` immediately when produced. The `TransactionalID` field is populated so the consumer can buffer them. When the transaction ends, a `*TxnCommitEvent` or `*TxnAbortEvent` is delivered so the consumer can decide what to do. | Messages are staged in a private transaction directory. On commit the entire directory is renamed into `committed/` in one atomic filesystem operation; abort removes staging. Consumers must read only from `committed/`. |
-| The transaction coordinator tracks transaction state across broker restarts. | No persistent transaction state. If ksink restarts, in-flight transactions are lost. | On clean shutdown (when `Close()` runs), staged transaction directories are removed. After a crash, orphan directories under `.ksink-pending/` may remain and require manual cleanup. Commit outcomes/producer epochs cannot be recovered reliably. |
+| The transaction coordinator tracks transaction state across broker restarts. | No persistent producer ID, epoch, deduplication or transaction state; a Kafka producer must reinitialize after a server restart. | On writer startup, staged transactions **without** a durable commit intent are aborted, and transactions **with** an intent are finished idempotently before accepting new messages. Committed directories survive process restarts. |
 | `sendOffsetsToTransaction` atomically commits consumer offsets with the transaction. | Not supported. ksink is a sink, not a full broker with consumer groups. | Not supported. |
 | Zombie fencing: restarting a producer with the same `transactional.id` aborts the old instance's pending transaction. | **Supported in-process.** When `InitProducerID` is called with an existing `transactional.id` that has an in-flight transaction, the old transaction is aborted through `Read` before the epoch is bumped. | The old transaction's private staging directory is deleted on abort. |
 | Transactions can span multiple topic-partitions atomically. | All events for the same `transactional.id` share a transaction context while active, but there is no durable coordinator. | All files within one transaction directory are made visible together via one same-filesystem directory rename. The atomicity guarantee applies only to consumers reading complete directories under `committed/`, not to consumers scanning staging or to process crashes. |
@@ -274,9 +274,46 @@ pattern determines the output root. A rename requires staging and committed
 directories on the **same filesystem**, with filesystem semantics supporting
 atomic directory moves (test network-mounted filesystems separately).
 
-**Crash recovery is not implemented.** Although message files are synced before
-publication, ksink does not durably persist producer epochs, transaction
-outcomes or a journal, nor does it sync all affected parent directories. A
-process or machine crash can leave orphaned staging directories and cannot
-be treated as exactly-once or power-loss-safe delivery. Only transaction
-visibility for live readers of `committed/` is atomic.
+### Filesystem recovery and durability
+
+The transactional filesystem writer maintains a **durable commit-intent
+journal** inside each staging directory. It synchronizes each accepted
+message to disk before acknowledging its write. On commit, it closes and
+synchronizes the payloads and subdirectories, writes and synchronizes
+`.ksink-commit-intent`, and publishes the complete directory using one
+same-filesystem rename. It synchronizes the affected parent directories
+before reporting commit success.
+
+On startup, ksink takes an exclusive OS-level lock on the output root and
+reconciles pending directories **before accepting new messages**:
+
+- No commit-intent marker: discard the uncommitted staging directory.
+- Valid commit-intent marker: finish publishing the transaction.
+- Corrupt marker or irreconcilable filesystem error: fail startup rather than
+  silently discard data.
+
+**A commit intent is irreversible.** Once recorded, an aborted/failed
+directory publication must be retried or recovered, not rolled back. A
+successful directory rename is never rolled back. On graceful shutdown,
+uncommitted staging is cleaned; pending committed intents are preserved
+for recovery. One active writer process per output root is enforced by
+the lock file `.ksink-lock`. The marker is metadata, not a message file,
+and readers must ignore it.
+
+This filesystem journal does **not** persist Kafka producer IDs, epochs,
+record sequence/deduplication state or EndTxn outcomes in the broker.
+Thus it cannot resume active producer transactions after a server restart
+and does not provide cross-restart exactly-once Kafka delivery. A crash
+before durable commit intent means an active transaction is aborted even
+if some Produce requests were acknowledged. A crash after intent means the
+entire transaction is eventually published on next successful startup.
+Consumers must inspect only `committed/`. Durable behavior requires a
+filesystem honoring file/parent-directory fsync and same-filesystem
+atomic directory rename; unsupported filesystems fail instead of silently
+claiming durability. Filesystem failure or lost power during unacknowledged
+commit may leave an ambiguous outcome until startup recovery runs.
+
+**Performance note:** each transactional write performs a file fsync and
+synchronizes its directory path. This favors correctness and crash safety
+over maximum ingest throughput; batching/durability policy controls can
+be considered separately.

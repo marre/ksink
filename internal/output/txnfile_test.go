@@ -188,11 +188,17 @@ func TestTxnFileWriterAbortAfterFailedMultiFileCommit(t *testing.T) {
 	require.NoError(t, os.Remove(committedRoot))
 	require.NoError(t, os.WriteFile(committedRoot, []byte("blocker"), 0600))
 	require.Error(t, w.CommitTxn("multi"))
-	require.NoError(t, w.AbortTxn("multi"))
-	noMatches(t, filepath.Join(dir, ".ksink-pending", "multi-*"))
+	// The durable intent decision forbids rolling back: recovery must finish
+	// publishing the entire transaction even if EndTxn returned an error.
+	require.ErrorContains(t, w.AbortTxn("multi"), "commit intent")
+	oneMatch(t, filepath.Join(dir, ".ksink-pending", "multi-*", ".ksink-commit-intent"))
 	require.NoError(t, os.Remove(committedRoot))
 	require.NoError(t, os.Mkdir(committedRoot, 0700))
-	noMatches(t, filepath.Join(dir, "committed", "multi-*"))
+	require.NoError(t, w.CommitTxn("multi"))
+	committed := oneMatch(t, filepath.Join(dir, "committed", "multi-*"))
+	require.FileExists(t, filepath.Join(committed, "orders-multi.jsonl"))
+	require.FileExists(t, filepath.Join(committed, "payments-multi.jsonl"))
+	noMatches(t, filepath.Join(dir, ".ksink-pending", "multi-*"))
 }
 
 func TestTxnFileWriterAllTopicsVisibleAtOnce(t *testing.T) {
