@@ -4,6 +4,7 @@
 //   - -                              Standard output (stdout)
 //   - http://host:port/path         HTTP POST
 //   - https://host:port/path        HTTPS POST
+//   - s3://bucket/key-pattern       S3 object output
 //   - <path>                        File output
 package output
 
@@ -23,6 +24,12 @@ import (
 type Writer interface {
 	io.Closer
 	Write(data []byte, msg *ksink.Message) error
+}
+
+// Flusher is implemented by writers that buffer data and need explicit flushes
+// at acknowledgement boundaries.
+type Flusher interface {
+	Flush() error
 }
 
 // TransactionalWriter extends [Writer] with transaction commit and abort
@@ -109,10 +116,12 @@ func Open(dst string, tlsCfg *tls.Config) (Writer, error) {
 		return newStdoutWriter(), nil
 	case strings.HasPrefix(dst, "https://"), strings.HasPrefix(dst, "http://"):
 		return NewHTTPWriter(dst, HTTPOpts{}, tlsCfg)
+	case strings.HasPrefix(dst, "s3://"):
+		return NewS3Writer(dst, S3Opts{})
 	default:
 		// Reject unknown URL-like schemes explicitly to avoid treating them as file paths.
 		if strings.Contains(dst, "://") {
-			return nil, fmt.Errorf("unsupported output scheme in %q; only -, http(s), or file paths are supported", dst)
+			return nil, fmt.Errorf("unsupported output scheme in %q; only -, http(s), s3, or file paths are supported", dst)
 		}
 		if strings.Contains(dst, TopicPlaceholder) {
 			return newPatternFileWriter(dst), nil

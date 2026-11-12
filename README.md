@@ -32,6 +32,12 @@ go run ./cmd/ksink --addr :9092 --output http://localhost:8080/ingest --output-f
 # Send JSON lines via HTTPS POST to a remote endpoint
 go run ./cmd/ksink --addr :9092 --output https://example.com/ingest --output-format jsonl
 
+# Write JSON lines to S3 (requires AWS credentials via default SDK chain)
+go run ./cmd/ksink --addr :9092 --output 's3://my-bucket/messages/{topic}.jsonl' --output-format jsonl --output-s3-region us-east-1
+
+# Transactional write to S3 using {txnID} in object key
+go run ./cmd/ksink --addr :9092 --transactional --output 's3://my-bucket/messages/{topic}-{txnID}.jsonl' --output-format jsonl --output-s3-region us-east-1
+
 # Print the JSON schema for the jsonl output format
 go run ./cmd/ksink json-schema
 
@@ -80,6 +86,41 @@ When using HTTP output, Kafka message metadata is sent as HTTP headers:
 `X-Kafka-Topic`, `X-Kafka-Partition`, `X-Kafka-Offset`, `X-Kafka-Key`
 (base64-encoded), `X-Kafka-Header-{name}`, `X-Kafka-Timestamp`
 (Unix milliseconds), and `X-Kafka-Client-Addr`.
+
+### S3 Output
+
+Use an `s3://bucket/key-pattern` destination to write messages to Amazon S3 or
+S3-compatible object storage (for example MinIO with `--output-s3-endpoint` and
+`--output-s3-force-path-style`).
+
+Supported placeholders in the S3 key pattern:
+- `{topic}` for per-topic object partitioning
+- `{txnID}` for transactional output (`--transactional` only)
+
+S3 flags:
+- `--output-s3-region`
+- `--output-s3-endpoint`
+- `--output-s3-force-path-style`
+- `--output-s3-retries`, `--output-s3-retry-delay`
+- `--output-s3-batch-max-bytes`, `--output-s3-batch-max-messages`
+- `--output-s3-multipart-part-size`
+
+Durability semantics:
+- Non-transactional S3 output acknowledges after the current write batch is
+  persisted to S3.
+- Transactional S3 output acknowledges commit only after successful S3 commit
+  (`PutObject` for small transactions, multipart upload complete for larger
+  transactions).
+- Delivery is **at-least-once**: duplicates are possible after retries/failures.
+
+Crash recovery note:
+- In-progress transactional payloads are held in memory and are not recovered
+  after process crash/restart.
+
+Cost guidance:
+- Prefer larger batches to reduce `PutObject` request count and tiny-object
+  overhead.
+- Use lifecycle policies to move older data to cheaper storage classes.
 
 ```bash
 # Binary output with no separator to a file
