@@ -390,91 +390,112 @@ func (s *Server) handleInitProducerId(ctx context.Context, conn net.Conn, connID
 		txnID = *req.TransactionalID
 	}
 
-	// For transactional producers, track state and implement zombie fencing.
+	// Persist the producer assignment/epoch before returning it to Kafka.
+	// This prevents a process restart from silently reusing a producer ID.
 	if txnID != "" && s.cfg.TransactionalWrite {
 		s.txnMu.Lock()
+		if s.txnStoreErr != nil {
+			s.txnMu.Unlock()
+			return s.sendResponse(conn, connID, correlationID, &kmsg.InitProducerIDResponse{
+				Version: apiVersion, ErrorCode: kerr.UnknownServerError.Code, ProducerID: -1,
+			})
+		}
 		existing, ok := s.txnStates[txnID]
 		if ok {
 			if existing.ending {
 				s.txnMu.Unlock()
-				resp := &kmsg.InitProducerIDResponse{
+				return s.sendResponse(conn, connID, correlationID, &kmsg.InitProducerIDResponse{
 					Version: apiVersion, ErrorCode: kerr.ConcurrentTransactions.Code, ProducerID: -1,
-				}
-				return s.sendResponse(conn, connID, correlationID, resp)
+				})
 			}
-			// Before fencing the old epoch, ensure that its staged data is
-			// successfully aborted. Do not silently ignore an abort error.
 			if existing.active {
+				if existing.pendingAction == "commit" {
+					s.txnMu.Unlock()
+					return s.sendResponse(conn, connID, correlationID, &kmsg.InitProducerIDResponse{
+						Version: apiVersion, ErrorCode: kerr.ConcurrentTransactions.Code, ProducerID: -1,
+					})
+				}
 				existing.ending = true
+				existing.pendingAction = "abort"
+				if err := s.persistTxnStateLocked(); err != nil {
+					existing.ending = false
+					s.txnMu.Unlock()
+					s.logger.Errorf("[conn:%d] InitProducerId: durable abort decision failed: %v", connID, err)
+					return s.sendResponse(conn, connID, correlationID, &kmsg.InitProducerIDResponse{
+						Version: apiVersion, ErrorCode: kerr.UnknownServerError.Code, ProducerID: -1,
+					})
+				}
 				s.txnMu.Unlock()
-				existing.inFlight.Wait() // drain accepted Produce requests before abort
+				existing.inFlight.Wait()
 				err := s.deliverEvent(ctx, &TxnAbortEvent{TransactionalID: txnID})
 				s.txnMu.Lock()
 				existing.ending = false
 				if err != nil {
 					existing.needsResolution = true
+					_ = s.persistTxnStateLocked()
 					s.txnMu.Unlock()
-					s.logger.Errorf("[conn:%d] InitProducerId: failed to abort old transaction %s: %v", connID, txnID, err)
-					resp := &kmsg.InitProducerIDResponse{
+					s.logger.Errorf("[conn:%d] InitProducerId: unable to abort old producer %s: %v", connID, txnID, err)
+					return s.sendResponse(conn, connID, correlationID, &kmsg.InitProducerIDResponse{
 						Version: apiVersion, ErrorCode: kerr.UnknownServerError.Code, ProducerID: -1,
-					}
-					return s.sendResponse(conn, connID, correlationID, resp)
+					})
 				}
 				existing.active = false
 				existing.needsResolution = false
 				existing.hasOutcome = false
 			}
+			if existing.pendingAction != "" && existing.restartRequired {
+				s.logger.Warnf("[conn:%d] InitProducerId: prior EndTxn outcome for %s is unknown after restart; fencing old epoch", connID, txnID)
+			}
 			if existing.epoch == math.MaxInt16 {
-				newPID := s.producerIDCounter.Add(1)
-				existing.producerID = newPID
+				existing.producerID = s.producerIDCounter.Add(1)
 				existing.epoch = 0
-				s.logger.Warnf("[conn:%d] InitProducerId: epoch overflow for txnID=%s, rotated to producerID=%d",
-					connID, txnID, newPID)
 			} else {
 				existing.epoch++
 			}
+			existing.active = false
+			existing.needsResolution = false
+			existing.pendingAction = ""
 			existing.hasOutcome = false
+			existing.restartRequired = false
+			existing.sequences = make(map[string]txnPartitionSequence)
+			if err := s.persistTxnStateLocked(); err != nil {
+				s.txnMu.Unlock()
+				s.logger.Errorf("[conn:%d] InitProducerId: persist epoch change: %v", connID, err)
+				return s.sendResponse(conn, connID, correlationID, &kmsg.InitProducerIDResponse{
+					Version: apiVersion, ErrorCode: kerr.UnknownServerError.Code, ProducerID: -1,
+				})
+			}
 			producerID, epoch := existing.producerID, existing.epoch
 			s.txnMu.Unlock()
-
-			resp := &kmsg.InitProducerIDResponse{
-				Version: apiVersion, ProducerID: producerID, ProducerEpoch: epoch,
-			}
 			s.logger.Debugf("[conn:%d] InitProducerId: txnID=%s, producerID=%d, epoch=%d (existing)",
 				connID, txnID, producerID, epoch)
-			return s.sendResponse(conn, connID, correlationID, resp)
+			return s.sendResponse(conn, connID, correlationID, &kmsg.InitProducerIDResponse{
+				Version: apiVersion, ProducerID: producerID, ProducerEpoch: epoch,
+			})
 		}
-
-		// Cap the number of tracked transactional IDs to prevent unbounded
-		// memory growth from misbehaving or malicious clients.
 		if len(s.txnStates) >= maxTxnStates {
 			s.txnMu.Unlock()
 			s.logger.Warnf("[conn:%d] Rejecting InitProducerId: too many transactional IDs tracked (%d)", connID, maxTxnStates)
-			resp := &kmsg.InitProducerIDResponse{
-				Version:    apiVersion,
-				ErrorCode:  kerr.UnknownServerError.Code,
-				ProducerID: -1,
-			}
-			return s.sendResponse(conn, connID, correlationID, resp)
+			return s.sendResponse(conn, connID, correlationID, &kmsg.InitProducerIDResponse{
+				Version: apiVersion, ErrorCode: kerr.UnknownServerError.Code, ProducerID: -1,
+			})
 		}
-
-		// New transactional ID — assign a fresh producer ID.
 		producerID := s.producerIDCounter.Add(1)
 		s.txnStates[txnID] = &txnState{
-			producerID: producerID,
-			epoch:      0,
-			active:     false,
+			producerID: producerID, epoch: 0,
+			sequences: make(map[string]txnPartitionSequence),
+		}
+		if err := s.persistTxnStateLocked(); err != nil {
+			s.txnMu.Unlock()
+			s.logger.Errorf("[conn:%d] InitProducerId: persist new producer %s: %v", connID, txnID, err)
+			return s.sendResponse(conn, connID, correlationID, &kmsg.InitProducerIDResponse{
+				Version: apiVersion, ErrorCode: kerr.UnknownServerError.Code, ProducerID: -1,
+			})
 		}
 		s.txnMu.Unlock()
-
-		resp := &kmsg.InitProducerIDResponse{
-			Version:       apiVersion,
-			ProducerID:    producerID,
-			ProducerEpoch: 0,
-		}
-		s.logger.Debugf("[conn:%d] InitProducerId: txnID=%s, producerID=%d, epoch=0 (new)",
-			connID, txnID, producerID)
-		return s.sendResponse(conn, connID, correlationID, resp)
+		return s.sendResponse(conn, connID, correlationID, &kmsg.InitProducerIDResponse{
+			Version: apiVersion, ProducerID: producerID, ProducerEpoch: 0,
+		})
 	}
 
 	// Non-transactional idempotent producer — just assign an ID.
