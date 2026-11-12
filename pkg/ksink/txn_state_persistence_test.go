@@ -146,6 +146,22 @@ func TestDurableTxnCompletedEndTxnRetryAcrossRestart(t *testing.T) {
 		t, conn2, 5, txnID, init.ProducerID, init.ProducerEpoch, false).ErrorCode)
 }
 
+func TestNewDurableCoordinatorUsesFreshProducerIDSpace(t *testing.T) {
+	cfg := Config{Address: "127.0.0.1:0", TransactionalWrite: true, TransactionStateDir: t.TempDir()}
+	srv, err := New(cfg)
+	require.NoError(t, err)
+	seed := srv.producerIDCounter.Load()
+	// Starting at 1 (the old in-memory coordinator behavior) risks reusing
+	// an old producer ID/epoch if the user upgrades with active producers.
+	require.Greater(t, seed, int64(1<<60))
+	require.Less(t, seed, int64(1<<61))
+	require.NoError(t, srv.Close(context.Background()))
+	restarted, err := New(cfg)
+	require.NoError(t, err)
+	require.Equal(t, seed, restarted.producerIDCounter.Load())
+	require.NoError(t, restarted.Close(context.Background()))
+}
+
 func TestDurableTxnStateLockAndCorruption(t *testing.T) {
 	dir := t.TempDir()
 	cfg := Config{Address: "127.0.0.1:0", TransactionalWrite: true, TransactionStateDir: dir}
