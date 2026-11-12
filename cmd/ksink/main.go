@@ -45,6 +45,7 @@ func main() {
 		sepHex        string
 		noSeparator   bool
 		transactional bool
+		stateDir      string
 		tOpts         output.TLSOpts
 		httpOpts      output.HTTPOpts
 	)
@@ -94,13 +95,15 @@ kcat format specifiers (--output-format-string):
 					return fmt.Errorf("--output-separator, --output-separator-hex, and --no-separator are only supported with --output-format=binary")
 				}
 			}
-			return run(addr, dst, fmtName, fmtStr, jsonB64Key, jsonB64Val, separator, sepHex, noSeparator, transactional, tOpts, httpOpts)
+			return run(addr, dst, fmtName, fmtStr, jsonB64Key, jsonB64Val, separator, sepHex, noSeparator, transactional, stateDir, tOpts, httpOpts)
 		},
 	}
 
 	rootCmd.Flags().StringVar(&addr, "addr", ":9092", "Address to listen on")
 	rootCmd.Flags().BoolVar(&transactional, "transactional", false,
-		"Enable transactional produce support (per-transaction files with rename-as-commit/delete-as-abort). Requires {txnID} in --output.")
+		"Enable transactional produce with durable Kafka producer state and atomic filesystem commits. Requires {txnID} in --output.")
+	rootCmd.Flags().StringVar(&stateDir, "transaction-state-dir", "",
+		"Durable Kafka transaction state directory (default: .ksink-kafka-state under the transactional output root)")
 	rootCmd.Flags().StringVar(&dst, "output", "-",
 		`Output destination: "-" for stdout (default), file path, or http(s):// URL.
 The path may contain {topic} and/or {partition} to route messages to per-topic and/or per-partition files
@@ -153,7 +156,7 @@ Topic names are sanitised to prevent path traversal.`)
 	}
 }
 
-func run(addr, dst, fmtName, fmtStr string, jsonB64Key, jsonB64Val bool, separator, sepHex string, noSeparator, transactional bool, tOpts output.TLSOpts, httpOpts output.HTTPOpts) error {
+func run(addr, dst, fmtName, fmtStr string, jsonB64Key, jsonB64Val bool, separator, sepHex string, noSeparator, transactional bool, stateDir string, tOpts output.TLSOpts, httpOpts output.HTTPOpts) error {
 	var sep []byte
 	if fmtName == "binary" {
 		var err error
@@ -163,6 +166,9 @@ func run(addr, dst, fmtName, fmtStr string, jsonB64Key, jsonB64Val bool, separat
 		}
 	}
 
+	if !transactional && stateDir != "" {
+		return fmt.Errorf("--transaction-state-dir requires --transactional")
+	}
 	// Validate format-specific flag combinations before constructing anything.
 	if fmtStr != "" && fmtName != "kcat" {
 		return fmt.Errorf("--output-format-string is only supported with --output-format=kcat")
@@ -212,10 +218,13 @@ func run(addr, dst, fmtName, fmtStr string, jsonB64Key, jsonB64Val bool, separat
 	defer w.Close() //nolint:errcheck
 
 	serverOpts := []ksink.Option{ksink.WithLogger(stdLogger{})}
-
+	if transactional && stateDir == "" {
+		stateDir = output.KafkaTransactionStateDir(dst)
+	}
 	srv, err := ksink.New(ksink.Config{
-		Address:            addr,
-		TransactionalWrite: transactional,
+		Address:             addr,
+		TransactionalWrite:  transactional,
+		TransactionStateDir: stateDir,
 	}, serverOpts...)
 	if err != nil {
 		return fmt.Errorf("failed to create server: %w", err)
