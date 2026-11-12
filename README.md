@@ -48,18 +48,19 @@ go run ./cmd/ksink --addr :9092 --output '{topic}-{partition}.jsonl'
 
 # Combine {topic} with transactional output
 go run ./cmd/ksink --addr :9092 --transactional --output '{topic}-{txnID}.jsonl'
-# produces orders-my-txn-<unique-id>.jsonl, events-my-txn-<unique-id>.jsonl, etc.
+# produces committed/my-txn-<unique-id>/orders-my-txn.jsonl
+#          committed/my-txn-<unique-id>/events-my-txn.jsonl
 
 # Transactional files may also be split by partition:
 # go run ./cmd/ksink --transactional --output '{topic}-{partition}-{txnID}.jsonl'
 
 # Transactional file output — the --output pattern must contain {txnID}.
-# Messages are staged in exclusive temporary files. On commit they are
-# published without overwriting older committed transactions; on abort the
-# temporary files are deleted:
-#   During transaction: messages-<txnID>-<unique-id>.jsonl.tmp
-#   After commit:       messages-<txnID>-<unique-id>.jsonl
-#   After abort:        staging file is deleted
+# All files in a transaction live in ONE directory beneath the first static
+# path prefix. A single same-filesystem directory rename publishes the whole
+# transaction. Readers should only scan committed/, never .ksink-pending/.
+#   During transaction: .ksink-pending/<txnID>-<nonce>/messages-<txnID>.jsonl
+#   After commit:       committed/<txnID>-<nonce>/messages-<txnID>.jsonl
+#   After abort:        the private staging directory is deleted
 go run ./cmd/ksink --addr :9092 --transactional --output 'messages-{txnID}.jsonl'
 ```
 
@@ -256,20 +257,26 @@ intentionally simplified:
 
 | Real Kafka behaviour | ksink API behaviour | ksink tool behaviour |
 |---|---|---|
-| Records written inside a transaction are invisible to `read_committed` consumers until commit. | Records are delivered to `Read` as `*MessagesEvent` immediately when produced. The `TransactionalID` field is populated so the consumer can buffer them. When the transaction ends, a `*TxnCommitEvent` or `*TxnAbortEvent` is delivered so the consumer can decide what to do. | Messages are staged as exclusive temp files. On commit the writer hard-links each staging file to a unique immutable final name, then removes staging; abort removes staging and any partially published files. |
-| The transaction coordinator tracks transaction state across broker restarts. | No persistent transaction state. If ksink restarts, in-flight transactions are lost. | On clean shutdown (when `Close()` runs), uncommitted temp files are cleaned up. If the process crashes or is killed, `.tmp` files may remain across restarts. |
+| Records written inside a transaction are invisible to `read_committed` consumers until commit. | Records are delivered to `Read` as `*MessagesEvent` immediately when produced. The `TransactionalID` field is populated so the consumer can buffer them. When the transaction ends, a `*TxnCommitEvent` or `*TxnAbortEvent` is delivered so the consumer can decide what to do. | Messages are staged in a private transaction directory. On commit the entire directory is renamed into `committed/` in one atomic filesystem operation; abort removes staging. Consumers must read only from `committed/`. |
+| The transaction coordinator tracks transaction state across broker restarts. | No persistent transaction state. If ksink restarts, in-flight transactions are lost. | On clean shutdown (when `Close()` runs), staged transaction directories are removed. After a crash, orphan directories under `.ksink-pending/` may remain and require manual cleanup. Commit outcomes/producer epochs cannot be recovered reliably. |
 | `sendOffsetsToTransaction` atomically commits consumer offsets with the transaction. | Not supported. ksink is a sink, not a full broker with consumer groups. | Not supported. |
-| Zombie fencing: restarting a producer with the same `transactional.id` aborts the old instance's pending transaction. | **Supported.** When `InitProducerID` is called with an existing `transactional.id` that has an in-flight transaction, the old transaction is automatically aborted via a `*TxnAbortEvent` delivered through `Read` and the producer epoch is bumped. | The old transaction's temp file is deleted when the abort event is processed. |
-| Transactions can span multiple topic-partitions atomically. | All events for the same `transactional.id` share a transaction context while active, but there is no durable coordinator. | When output contains `{topic}` or `{partition}`, multiple files are published separately. **There is no atomic visibility guarantee across those files**; a failed commit may expose a subset until retry or abort. Use an unsplit single-file pattern if atomic publication matters. |
-| Aborted records are never visible to `read_committed` consumers. | Aborted records were already delivered to `Read`. The `*TxnAbortEvent` signals the consumer to clean up, but application-level processing that happened before the abort is not rolled back. | The temp file is deleted on abort. |
+| Zombie fencing: restarting a producer with the same `transactional.id` aborts the old instance's pending transaction. | **Supported in-process.** When `InitProducerID` is called with an existing `transactional.id` that has an in-flight transaction, the old transaction is aborted through `Read` before the epoch is bumped. | The old transaction's private staging directory is deleted on abort. |
+| Transactions can span multiple topic-partitions atomically. | All events for the same `transactional.id` share a transaction context while active, but there is no durable coordinator. | All files within one transaction directory are made visible together via one same-filesystem directory rename. The atomicity guarantee applies only to consumers reading complete directories under `committed/`, not to consumers scanning staging or to process crashes. |
+| Aborted records are never visible to `read_committed` consumers. | Aborted records were already delivered to `Read`. The `*TxnAbortEvent` signals the consumer to clean up, but application-level processing that happened before the abort is not rolled back. | The private staging directory is deleted on abort, so it never appears under `committed/`. |
 | `isolation.level` consumer configuration. | Not applicable — ksink does not implement the consumer protocol. | Not applicable. |
 
-**In summary:** ksink provides best-effort transactional file output.
-Successful commits are stored under collision-resistant unique names even when
-a producer reuses its `transactional.id`, and a failed commit can be retried
-without truncating or overwriting previously committed data. Each file is
-published atomically, but multiple files in one transaction are **not** atomic
-as a group. The publisher requires filesystem hard-link support (staging and
-destination are in the same directory). Memory and transaction state are
-not durable across crashes. It does **not** provide Kafka's exactly-once
-guarantees; applications must not treat file output as a durable Kafka log.
+**In summary:** ksink atomically publishes every file of a transaction as
+one directory under `committed/<transactional.id>-<nonce>/`. The output
+layout is **breaking** compared with the prior flat-file layout: output
+patterns now name files *inside* transaction directories, and downstream
+readers must scan only `committed/`. The fixed directory prefix of the
+pattern determines the output root. A rename requires staging and committed
+directories on the **same filesystem**, with filesystem semantics supporting
+atomic directory moves (test network-mounted filesystems separately).
+
+**Crash recovery is not implemented.** Although message files are synced before
+publication, ksink does not durably persist producer epochs, transaction
+outcomes or a journal, nor does it sync all affected parent directories. A
+process or machine crash can leave orphaned staging directories and cannot
+be treated as exactly-once or power-loss-safe delivery. Only transaction
+visibility for live readers of `committed/` is atomic.
