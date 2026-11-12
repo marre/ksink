@@ -86,6 +86,9 @@ func (o *TLSOpts) BuildTLSConfig() (*tls.Config, error) {
 // to route messages to per-topic files.
 const TopicPlaceholder = "{topic}"
 
+// PartitionPlaceholder routes messages to one file per Kafka partition.
+const PartitionPlaceholder = "{partition}"
+
 // SanitizePathSegment returns a safe single-component file name from an
 // untrusted string. It uses [filepath.Clean] and [filepath.Base] to strip
 // any directory traversal, then rejects the special names "." and "..".
@@ -101,7 +104,7 @@ func SanitizePathSegment(s string) string {
 // The special value "-" writes to standard output.
 // For http:// and https:// URLs, Open creates an HTTP writer with default
 // options (no retries, no DLQ). Use NewHTTPWriter for full configuration.
-// If the destination contains the {topic} placeholder, a pattern-based writer
+// If the destination contains the {topic} or {partition} placeholder, a pattern-based writer
 // is returned that routes messages to per-topic files.
 func Open(dst string, tlsCfg *tls.Config) (Writer, error) {
 	switch {
@@ -114,7 +117,7 @@ func Open(dst string, tlsCfg *tls.Config) (Writer, error) {
 		if strings.Contains(dst, "://") {
 			return nil, fmt.Errorf("unsupported output scheme in %q; only -, http(s), or file paths are supported", dst)
 		}
-		if strings.Contains(dst, TopicPlaceholder) {
+		if strings.Contains(dst, TopicPlaceholder) || strings.Contains(dst, PartitionPlaceholder) {
 			return newPatternFileWriter(dst), nil
 		}
 		return newFileWriter(dst)
