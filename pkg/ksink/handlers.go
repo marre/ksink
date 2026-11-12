@@ -597,7 +597,7 @@ func (s *Server) handleAddPartitionsToTxn(conn net.Conn, connID uint64, correlat
 	// Validate producerID/epoch against txnState and mark the transaction as active.
 	s.txnMu.Lock()
 	st, stOK := s.txnStates[req.TransactionalID]
-	if !stOK || st.producerID != req.ProducerID || st.epoch != req.ProducerEpoch {
+	if !stOK || st.producerID != req.ProducerID || st.epoch != req.ProducerEpoch || st.restartRequired {
 		s.txnMu.Unlock()
 		// Return ProducerFenced for all partitions.
 		for ti := range resp.Topics {
@@ -609,7 +609,7 @@ func (s *Server) handleAddPartitionsToTxn(conn net.Conn, connID uint64, correlat
 			connID, req.TransactionalID, req.ProducerID, req.ProducerEpoch)
 		return s.sendResponse(conn, connID, correlationID, resp)
 	}
-	if st.ending || st.needsResolution {
+	if st.ending || st.needsResolution || s.txnStoreErr != nil {
 		s.txnMu.Unlock()
 		for ti := range resp.Topics {
 			for pi := range resp.Topics[ti].Partitions {
@@ -621,6 +621,17 @@ func (s *Server) handleAddPartitionsToTxn(conn net.Conn, connID uint64, correlat
 	if !st.active {
 		st.active = true
 		st.hasOutcome = false
+		st.pendingAction = ""
+		if err := s.persistTxnStateLocked(); err != nil {
+			s.txnMu.Unlock()
+			s.logger.Errorf("[conn:%d] AddPartitionsToTxn: persist active state: %v", connID, err)
+			for ti := range resp.Topics {
+				for pi := range resp.Topics[ti].Partitions {
+					resp.Topics[ti].Partitions[pi].ErrorCode = kerr.UnknownServerError.Code
+				}
+			}
+			return s.sendResponse(conn, connID, correlationID, resp)
+		}
 	}
 	s.txnMu.Unlock()
 
