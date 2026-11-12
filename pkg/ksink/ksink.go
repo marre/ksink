@@ -211,9 +211,14 @@ func WithLogger(l Logger) Option {
 // (bumped on each InitProducerID call), and whether a transaction is
 // currently in progress.
 type txnState struct {
-	producerID int64
-	epoch      int16
-	active     bool // true between AddPartitionsToTxn and EndTxn
+	producerID      int64
+	epoch           int16
+	active          bool // true from AddPartitionsToTxn until EndTxn succeeds
+	ending          bool // an EndTxn or zombie-abort event is being processed
+	needsResolution bool // a commit/abort failed; only EndTxn retry/abort is allowed
+	hasOutcome      bool // remember successful EndTxn for response-loss retries
+	lastCommit      bool
+	inFlight        sync.WaitGroup // accepted Produce requests; EndTxn/fencing waits for these
 }
 
 // Server is a Kafka-protocol-compatible server that accepts produce requests.

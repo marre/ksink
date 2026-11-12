@@ -3,6 +3,7 @@ package output_test
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/marre/ksink/internal/output"
@@ -117,23 +118,23 @@ func TestTxnFileWriterWithTopicPlaceholder(t *testing.T) {
 	require.NoError(t, w.Write([]byte("event\n"), msg2))
 
 	// Both temp files should exist before commit.
-	require.FileExists(t, filepath.Join(dir, "orders-txn-1.jsonl.tmp"))
-	require.FileExists(t, filepath.Join(dir, "events-txn-1.jsonl.tmp"))
+	ordersTmp := oneMatch(t, filepath.Join(dir, "orders-txn-1-*.jsonl.tmp"))
+	eventsTmp := oneMatch(t, filepath.Join(dir, "events-txn-1-*.jsonl.tmp"))
 
 	require.NoError(t, w.CommitTxn("txn-1"))
 
 	// After commit: both committed files should exist.
-	data1, err := os.ReadFile(filepath.Join(dir, "orders-txn-1.jsonl"))
+	data1, err := os.ReadFile(strings.TrimSuffix(ordersTmp, ".tmp"))
 	require.NoError(t, err)
 	assert.Equal(t, "order\n", string(data1))
 
-	data2, err := os.ReadFile(filepath.Join(dir, "events-txn-1.jsonl"))
+	data2, err := os.ReadFile(strings.TrimSuffix(eventsTmp, ".tmp"))
 	require.NoError(t, err)
 	assert.Equal(t, "event\n", string(data2))
 
 	// Temp files should be gone.
-	requireNoFile(t, filepath.Join(dir, "orders-txn-1.jsonl.tmp"))
-	requireNoFile(t, filepath.Join(dir, "events-txn-1.jsonl.tmp"))
+	requireNoFile(t, ordersTmp)
+	requireNoFile(t, eventsTmp)
 }
 
 func TestTxnFileWriterWithTopicAbort(t *testing.T) {
@@ -150,8 +151,8 @@ func TestTxnFileWriterWithTopicAbort(t *testing.T) {
 	require.NoError(t, w.AbortTxn("txn-abort"))
 
 	// After abort: temp and committed files should not exist.
-	requireNoFile(t, filepath.Join(dir, "orders-txn-abort.jsonl.tmp"))
-	requireNoFile(t, filepath.Join(dir, "orders-txn-abort.jsonl"))
+	noMatches(t, filepath.Join(dir, "orders-txn-abort-*.jsonl.tmp"))
+	noMatches(t, filepath.Join(dir, "orders-txn-abort-*.jsonl"))
 }
 
 // Partition routing is opt-in: omitting {partition} preserves per-topic routing.
@@ -169,7 +170,7 @@ func TestPatternFileWriterRoutesByPartition(t *testing.T) {
   "orders-1.jsonl":"b\n",
   "events-0.jsonl":"d\n",
  } {
-  b, err := os.ReadFile(filepath.Join(dir,path))
+  b, err := os.ReadFile(oneMatch(t,filepath.Join(dir,path)))
   require.NoError(t,err)
   assert.Equal(t,want,string(b))
  }
@@ -201,20 +202,20 @@ func TestTxnFileWriterRoutesByPartitionCommitAbortAndClose(t *testing.T) {
  } {
   require.NoError(t,w.Write([]byte(tc.data), &ksink.Message{TransactionalID:tc.txn,Topic:tc.topic,Partition:tc.partition}))
  }
- require.FileExists(t,filepath.Join(dir,"orders-0-commit.jsonl.tmp"))
- require.FileExists(t,filepath.Join(dir,"orders-1-commit.jsonl.tmp"))
+ require.FileExists(t,oneMatch(t,filepath.Join(dir,"orders-0-commit-*.jsonl.tmp")))
+ require.FileExists(t,oneMatch(t,filepath.Join(dir,"orders-1-commit-*.jsonl.tmp")))
  require.NoError(t,w.CommitTxn("commit"))
  require.NoError(t,w.AbortTxn("abort"))
- for path,want:=range map[string]string{"orders-0-commit.jsonl":"one\nthree\n","orders-1-commit.jsonl":"two\n","events-0-commit.jsonl":"event\n"} {
-  b,err:=os.ReadFile(filepath.Join(dir,path))
+ for path,want:=range map[string]string{"orders-0-commit-*.jsonl":"one\nthree\n","orders-1-commit-*.jsonl":"two\n","events-0-commit-*.jsonl":"event\n"} {
+  b,err:=os.ReadFile(oneMatch(t,filepath.Join(dir,path)))
   require.NoError(t,err)
   assert.Equal(t,want,string(b))
-  requireNoFile(t,filepath.Join(dir,path+".tmp"))
+  noMatches(t,filepath.Join(dir,path+".tmp"))
  }
- requireNoFile(t,filepath.Join(dir,"orders-3-abort.jsonl.tmp"))
- requireNoFile(t,filepath.Join(dir,"orders-3-abort.jsonl"))
+ noMatches(t,filepath.Join(dir,"orders-3-abort-*.jsonl.tmp"))
+ noMatches(t,filepath.Join(dir,"orders-3-abort-*.jsonl"))
  require.NoError(t,w.Close())
- requireNoFile(t,filepath.Join(dir,"orders-4-pending.jsonl.tmp"))
+ noMatches(t,filepath.Join(dir,"orders-4-pending-*.jsonl.tmp"))
 }
 
 func TestTxnFileWriterPartitionOnly(t *testing.T) {
@@ -224,7 +225,7 @@ func TestTxnFileWriterPartitionOnly(t *testing.T) {
  require.NoError(t,w.Write([]byte("one"),&ksink.Message{TransactionalID:"x",Topic:"a",Partition:5}))
  require.NoError(t,w.Write([]byte("two"),&ksink.Message{TransactionalID:"x",Topic:"b",Partition:5}))
  require.NoError(t,w.CommitTxn("x"))
- b,err:=os.ReadFile(filepath.Join(dir,"part-5-x.bin"))
+ b,err:=os.ReadFile(oneMatch(t,filepath.Join(dir,"part-5-x-*.bin")))
  require.NoError(t,err)
  assert.Equal(t,"onetwo",string(b))
  require.NoError(t,w.Close())

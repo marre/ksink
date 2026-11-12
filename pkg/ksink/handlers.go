@@ -3,6 +3,7 @@ package ksink
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/binary"
 	"fmt"
 	"math"
 	"net"
@@ -159,6 +160,33 @@ func (s *Server) handleProduce(ctx context.Context, conn net.Conn, connID uint64
 		txnID = *req.TransactionID
 	}
 
+	// For transactional produce, verify the active transaction and producer
+	// epoch. The epoch lives in each record-batch header, not in ProduceRequest.
+	var txnProduceErr int16
+	var txnProducerID int64
+	var txnProducerEpoch int16
+	var txnProduceState *txnState
+	if txnID != "" && s.cfg.TransactionalWrite {
+		s.txnMu.Lock()
+		st, ok := s.txnStates[txnID]
+		switch {
+		case !ok:
+			txnProduceErr = kerr.ProducerFenced.Code
+		case !st.active || st.ending || st.needsResolution:
+			txnProduceErr = kerr.InvalidTxnState.Code
+		default:
+			txnProducerID, txnProducerEpoch = st.producerID, st.epoch
+			// Adding while holding txnMu is paired with EndTxn marking the
+			// state as ending under the same mutex before waiting.
+			st.inFlight.Add(1)
+			txnProduceState = st
+		}
+		s.txnMu.Unlock()
+	}
+	if txnProduceState != nil {
+		defer txnProduceState.inFlight.Done()
+	}
+
 	// First pass: parse all records and track per-partition status
 	type partResult struct {
 		errCode int16
@@ -177,6 +205,16 @@ func (s *Server) handleProduce(ctx context.Context, conn net.Conn, connID uint64
 				s.logger.Warnf("[conn:%d] Rejected produce to disallowed topic: %s", connID, topicData.Topic)
 				results[key] = partResult{errCode: kerr.UnknownTopicOrPartition.Code}
 				continue
+			}
+			if txnProduceErr != 0 {
+				results[key] = partResult{errCode: txnProduceErr}
+				continue
+			}
+			if txnID != "" && s.cfg.TransactionalWrite {
+				if code := validateTxnBatchProducer(partData.Records, txnProducerID, txnProducerEpoch); code != 0 {
+					results[key] = partResult{errCode: code}
+					continue
+				}
 			}
 
 			batch, err := s.parseRecords(connID, topicData.Topic, partData.Partition, partData.Records, remoteAddr)
@@ -259,6 +297,27 @@ func (s *Server) deliverEvent(ctx context.Context, evt Event) error {
 	}
 }
 
+// validateTxnBatchProducer checks every v2 record-batch header without
+// decoding its records. A stale producer must not write into the current
+// producer's transaction merely because it knows the same transactional.id.
+func validateTxnBatchProducer(records []byte, producerID int64, epoch int16) int16 {
+	for len(records) > 0 {
+		if len(records) < 61 {
+			return kerr.CorruptMessage.Code
+		}
+		batchLength := int64(int32(binary.BigEndian.Uint32(records[8:12])))
+		if batchLength < 49 || batchLength > int64(len(records)-12) || records[16] != 2 {
+			return kerr.CorruptMessage.Code
+		}
+		if int64(binary.BigEndian.Uint64(records[43:51])) != producerID ||
+			int16(binary.BigEndian.Uint16(records[51:53])) != epoch {
+			return kerr.ProducerFenced.Code
+		}
+		records = records[12+int(batchLength):]
+	}
+	return 0
+}
+
 func (s *Server) handleInitProducerId(ctx context.Context, conn net.Conn, connID uint64, correlationID int32, apiVersion int16, req *kmsg.InitProducerIDRequest, state *connState) error {
 	if s.saslEnabled && !state.authenticated {
 		s.logger.Warnf("[conn:%d] Rejecting InitProducerId: not authenticated", connID)
@@ -290,41 +349,50 @@ func (s *Server) handleInitProducerId(ctx context.Context, conn net.Conn, connID
 		s.txnMu.Lock()
 		existing, ok := s.txnStates[txnID]
 		if ok {
-			// Zombie fencing: abort any in-flight transaction from the
-			// previous producer instance before bumping the epoch.
-			needsAbort := existing.active
-			if needsAbort {
-				s.logger.Infof("[conn:%d] InitProducerId: fencing zombie txnID=%s (aborting in-flight transaction, epoch %d→%d)",
-					connID, txnID, existing.epoch, existing.epoch+1)
+			if existing.ending {
+				s.txnMu.Unlock()
+				resp := &kmsg.InitProducerIDResponse{
+					Version: apiVersion, ErrorCode: kerr.ConcurrentTransactions.Code, ProducerID: -1,
+				}
+				return s.sendResponse(conn, connID, correlationID, resp)
+			}
+			// Before fencing the old epoch, ensure that its staged data is
+			// successfully aborted. Do not silently ignore an abort error.
+			if existing.active {
+				existing.ending = true
+				s.txnMu.Unlock()
+				existing.inFlight.Wait() // drain accepted Produce requests before abort
+				err := s.deliverEvent(ctx, &TxnAbortEvent{TransactionalID: txnID})
+				s.txnMu.Lock()
+				existing.ending = false
+				if err != nil {
+					existing.needsResolution = true
+					s.txnMu.Unlock()
+					s.logger.Errorf("[conn:%d] InitProducerId: failed to abort old transaction %s: %v", connID, txnID, err)
+					resp := &kmsg.InitProducerIDResponse{
+						Version: apiVersion, ErrorCode: kerr.UnknownServerError.Code, ProducerID: -1,
+					}
+					return s.sendResponse(conn, connID, correlationID, resp)
+				}
 				existing.active = false
+				existing.needsResolution = false
+				existing.hasOutcome = false
 			}
 			if existing.epoch == math.MaxInt16 {
-				// int16 would overflow — rotate to a new producer ID
-				// and reset the epoch to avoid confusing clients.
 				newPID := s.producerIDCounter.Add(1)
 				existing.producerID = newPID
 				existing.epoch = 0
-				s.logger.Warnf("[conn:%d] InitProducerId: epoch overflow for txnID=%s, rotated to new producerID=%d",
+				s.logger.Warnf("[conn:%d] InitProducerId: epoch overflow for txnID=%s, rotated to producerID=%d",
 					connID, txnID, newPID)
 			} else {
 				existing.epoch++
 			}
-			// Copy fields before releasing the lock to avoid a data race.
-			producerID := existing.producerID
-			epoch := existing.epoch
+			existing.hasOutcome = false
+			producerID, epoch := existing.producerID, existing.epoch
 			s.txnMu.Unlock()
 
-			// Deliver the abort event outside the lock to avoid deadlocks.
-			if needsAbort {
-				if err := s.deliverEvent(ctx, &TxnAbortEvent{TransactionalID: txnID}); err != nil {
-					s.logger.Errorf("[conn:%d] InitProducerId: failed to deliver zombie abort event: %v", connID, err)
-				}
-			}
-
 			resp := &kmsg.InitProducerIDResponse{
-				Version:       apiVersion,
-				ProducerID:    producerID,
-				ProducerEpoch: epoch,
+				Version: apiVersion, ProducerID: producerID, ProducerEpoch: epoch,
 			}
 			s.logger.Debugf("[conn:%d] InitProducerId: txnID=%s, producerID=%d, epoch=%d (existing)",
 				connID, txnID, producerID, epoch)
@@ -474,7 +542,19 @@ func (s *Server) handleAddPartitionsToTxn(conn net.Conn, connID uint64, correlat
 			connID, req.TransactionalID, req.ProducerID, req.ProducerEpoch)
 		return s.sendResponse(conn, connID, correlationID, resp)
 	}
-	st.active = true
+	if st.ending || st.needsResolution {
+		s.txnMu.Unlock()
+		for ti := range resp.Topics {
+			for pi := range resp.Topics[ti].Partitions {
+				resp.Topics[ti].Partitions[pi].ErrorCode = kerr.InvalidTxnState.Code
+			}
+		}
+		return s.sendResponse(conn, connID, correlationID, resp)
+	}
+	if !st.active {
+		st.active = true
+		st.hasOutcome = false
+	}
 	s.txnMu.Unlock()
 
 	s.logger.Debugf("[conn:%d] AddPartitionsToTxn: txnID=%s, topics=%d", connID, req.TransactionalID, len(req.Topics))
@@ -509,36 +589,53 @@ func (s *Server) handleEndTxn(ctx context.Context, conn net.Conn, connID uint64,
 		Version: apiVersion,
 	}
 
-	// Validate producerID/epoch against txnState before allowing the commit/abort.
-	fenced := false
+	// Never transition to inactive before the output writer has succeeded.
+	// A failed EndTxn leaves the transaction unresolved: a retry or abort is
+	// allowed, but new Produce/AddPartitions requests are blocked.
 	s.txnMu.Lock()
-	if st, ok := s.txnStates[req.TransactionalID]; ok {
-		if st.producerID != req.ProducerID || st.epoch != req.ProducerEpoch {
-			fenced = true
-		} else {
-			st.active = false
-		}
-	} else {
-		fenced = true
-	}
-	s.txnMu.Unlock()
-
-	if fenced {
+	st, ok := s.txnStates[req.TransactionalID]
+	switch {
+	case !ok || st.producerID != req.ProducerID || st.epoch != req.ProducerEpoch:
+		s.txnMu.Unlock()
 		resp.ErrorCode = kerr.ProducerFenced.Code
-		s.logger.Warnf("[conn:%d] EndTxn fenced: txnID=%s, producerID=%d, epoch=%d",
-			connID, req.TransactionalID, req.ProducerID, req.ProducerEpoch)
+		return s.sendResponse(conn, connID, correlationID, resp)
+	case st.ending:
+		s.txnMu.Unlock()
+		resp.ErrorCode = kerr.ConcurrentTransactions.Code
+		return s.sendResponse(conn, connID, correlationID, resp)
+	case !st.active:
+		// A lost EndTxn response can be retried without duplicating commits.
+		repeated := st.hasOutcome && st.lastCommit == req.Commit
+		s.txnMu.Unlock()
+		if !repeated {
+			resp.ErrorCode = kerr.InvalidTxnState.Code
+		}
 		return s.sendResponse(conn, connID, correlationID, resp)
 	}
+	st.ending = true
+	s.txnMu.Unlock()
+	st.inFlight.Wait() // do not publish commit ahead of accepted Produce events
 
-	// Deliver a transaction-end event through Read so the consumer
-	// can handle commit/abort as part of the pull-based flow.
 	var evt Event
 	if req.Commit {
 		evt = &TxnCommitEvent{TransactionalID: req.TransactionalID}
 	} else {
 		evt = &TxnAbortEvent{TransactionalID: req.TransactionalID}
 	}
-	if err := s.deliverEvent(ctx, evt); err != nil {
+	err := s.deliverEvent(ctx, evt)
+
+	s.txnMu.Lock()
+	st.ending = false
+	if err != nil {
+		st.needsResolution = true
+	} else {
+		st.active = false
+		st.needsResolution = false
+		st.hasOutcome = true
+		st.lastCommit = req.Commit
+	}
+	s.txnMu.Unlock()
+	if err != nil {
 		s.logger.Errorf("[conn:%d] EndTxn: failed to deliver txn event: %v", connID, err)
 		resp.ErrorCode = kerr.UnknownServerError.Code
 		return s.sendResponse(conn, connID, correlationID, resp)

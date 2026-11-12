@@ -48,17 +48,18 @@ go run ./cmd/ksink --addr :9092 --output '{topic}-{partition}.jsonl'
 
 # Combine {topic} with transactional output
 go run ./cmd/ksink --addr :9092 --transactional --output '{topic}-{txnID}.jsonl'
-# produces orders-my-txn.jsonl, events-my-txn.jsonl, etc.
+# produces orders-my-txn-<unique-id>.jsonl, events-my-txn-<unique-id>.jsonl, etc.
 
 # Transactional files may also be split by partition:
 # go run ./cmd/ksink --transactional --output '{topic}-{partition}-{txnID}.jsonl'
 
 # Transactional file output — the --output pattern must contain {txnID}.
-# Messages are written to per-transaction temp files; on commit the temp
-# file is renamed; on abort the temp file is deleted:
-#   During transaction: messages-<txnID>.jsonl.tmp
-#   After commit:       messages-<txnID>.jsonl
-#   After abort:        temp file is deleted
+# Messages are staged in exclusive temporary files. On commit they are
+# published without overwriting older committed transactions; on abort the
+# temporary files are deleted:
+#   During transaction: messages-<txnID>-<unique-id>.jsonl.tmp
+#   After commit:       messages-<txnID>-<unique-id>.jsonl
+#   After abort:        staging file is deleted
 go run ./cmd/ksink --addr :9092 --transactional --output 'messages-{txnID}.jsonl'
 ```
 
@@ -255,17 +256,20 @@ intentionally simplified:
 
 | Real Kafka behaviour | ksink API behaviour | ksink tool behaviour |
 |---|---|---|
-| Records written inside a transaction are invisible to `read_committed` consumers until commit. | Records are delivered to `Read` as `*MessagesEvent` immediately when produced. The `TransactionalID` field is populated so the consumer can buffer them. When the transaction ends, a `*TxnCommitEvent` or `*TxnAbortEvent` is delivered so the consumer can decide what to do. | Messages are written to a temp file (`.tmp` suffix) during the transaction. On commit the temp file is renamed to the final path; on abort it is deleted. |
+| Records written inside a transaction are invisible to `read_committed` consumers until commit. | Records are delivered to `Read` as `*MessagesEvent` immediately when produced. The `TransactionalID` field is populated so the consumer can buffer them. When the transaction ends, a `*TxnCommitEvent` or `*TxnAbortEvent` is delivered so the consumer can decide what to do. | Messages are staged as exclusive temp files. On commit the writer hard-links each staging file to a unique immutable final name, then removes staging; abort removes staging and any partially published files. |
 | The transaction coordinator tracks transaction state across broker restarts. | No persistent transaction state. If ksink restarts, in-flight transactions are lost. | On clean shutdown (when `Close()` runs), uncommitted temp files are cleaned up. If the process crashes or is killed, `.tmp` files may remain across restarts. |
 | `sendOffsetsToTransaction` atomically commits consumer offsets with the transaction. | Not supported. ksink is a sink, not a full broker with consumer groups. | Not supported. |
 | Zombie fencing: restarting a producer with the same `transactional.id` aborts the old instance's pending transaction. | **Supported.** When `InitProducerID` is called with an existing `transactional.id` that has an in-flight transaction, the old transaction is automatically aborted via a `*TxnAbortEvent` delivered through `Read` and the producer epoch is bumped. | The old transaction's temp file is deleted when the abort event is processed. |
-| Transactions can span multiple topic-partitions atomically. | Supported — all events for the same `transactional.id` share the same transaction context regardless of topic/partition. | All messages with the same `transactional.id` go to the same temp file. When the `{topic}` placeholder is used, each topic within a transaction gets its own file; all are committed or aborted together. |
+| Transactions can span multiple topic-partitions atomically. | All events for the same `transactional.id` share a transaction context while active, but there is no durable coordinator. | When output contains `{topic}` or `{partition}`, multiple files are published separately. **There is no atomic visibility guarantee across those files**; a failed commit may expose a subset until retry or abort. Use an unsplit single-file pattern if atomic publication matters. |
 | Aborted records are never visible to `read_committed` consumers. | Aborted records were already delivered to `Read`. The `*TxnAbortEvent` signals the consumer to clean up, but application-level processing that happened before the abort is not rolled back. | The temp file is deleted on abort. |
 | `isolation.level` consumer configuration. | Not applicable — ksink does not implement the consumer protocol. | Not applicable. |
 
-**In summary:** ksink provides a best-effort transactional file output where
-committed transactions produce a final file and aborted transactions clean
-up their temp file. It does **not** provide the exactly-once guarantees of a
-real Kafka cluster. It is designed for testing and lightweight sink
-scenarios where the rename-as-commit / delete-as-abort file semantics are
-sufficient.
+**In summary:** ksink provides best-effort transactional file output.
+Successful commits are stored under collision-resistant unique names even when
+a producer reuses its `transactional.id`, and a failed commit can be retried
+without truncating or overwriting previously committed data. Each file is
+published atomically, but multiple files in one transaction are **not** atomic
+as a group. The publisher requires filesystem hard-link support (staging and
+destination are in the same directory). Memory and transaction state are
+not durable across crashes. It does **not** provide Kafka's exactly-once
+guarantees; applications must not treat file output as a durable Kafka log.
