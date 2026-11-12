@@ -153,3 +153,79 @@ func TestTxnFileWriterWithTopicAbort(t *testing.T) {
 	requireNoFile(t, filepath.Join(dir, "orders-txn-abort.jsonl.tmp"))
 	requireNoFile(t, filepath.Join(dir, "orders-txn-abort.jsonl"))
 }
+
+// Partition routing is opt-in: omitting {partition} preserves per-topic routing.
+func TestPatternFileWriterRoutesByPartition(t *testing.T) {
+ dir := t.TempDir()
+ w, err := output.Open(filepath.Join(dir, "{topic}-{partition}.jsonl"), nil)
+ require.NoError(t, err)
+ require.NoError(t, w.Write([]byte("a\n"), &ksink.Message{Topic:"orders", Partition:0}))
+ require.NoError(t, w.Write([]byte("b\n"), &ksink.Message{Topic:"orders", Partition:1}))
+ require.NoError(t, w.Write([]byte("c\n"), &ksink.Message{Topic:"orders", Partition:0}))
+ require.NoError(t, w.Write([]byte("d\n"), &ksink.Message{Topic:"events", Partition:0}))
+ require.NoError(t, w.Close())
+ for path, want := range map[string]string{
+  "orders-0.jsonl":"a\nc\n",
+  "orders-1.jsonl":"b\n",
+  "events-0.jsonl":"d\n",
+ } {
+  b, err := os.ReadFile(filepath.Join(dir,path))
+  require.NoError(t,err)
+  assert.Equal(t,want,string(b))
+ }
+}
+
+func TestPatternFileWriterPartitionOnly(t *testing.T) {
+ dir := t.TempDir()
+ w, err := output.Open(filepath.Join(dir, "part-{partition}.bin"), nil)
+ require.NoError(t, err)
+ require.NoError(t,w.Write([]byte("first\n"), &ksink.Message{Topic:"a",Partition:2}))
+ require.NoError(t,w.Write([]byte("second\n"), &ksink.Message{Topic:"b",Partition:2}))
+ require.NoError(t,w.Close())
+ b,err:=os.ReadFile(filepath.Join(dir,"part-2.bin"))
+ require.NoError(t,err)
+ assert.Equal(t,"first\nsecond\n",string(b))
+}
+
+func TestTxnFileWriterRoutesByPartitionCommitAbortAndClose(t *testing.T) {
+ dir := t.TempDir()
+ w, err := output.NewTxnFileWriter(filepath.Join(dir, "{topic}-{partition}-{txnID}.jsonl"))
+ require.NoError(t, err)
+ for _,tc:=range []struct{txn,topic,data string;partition int32}{
+  {"commit","orders","one\n",0},
+  {"commit","orders","two\n",1},
+  {"commit","orders","three\n",0},
+  {"commit","events","event\n",0},
+  {"abort","orders","discard\n",3},
+  {"pending","orders","pending\n",4},
+ } {
+  require.NoError(t,w.Write([]byte(tc.data), &ksink.Message{TransactionalID:tc.txn,Topic:tc.topic,Partition:tc.partition}))
+ }
+ require.FileExists(t,filepath.Join(dir,"orders-0-commit.jsonl.tmp"))
+ require.FileExists(t,filepath.Join(dir,"orders-1-commit.jsonl.tmp"))
+ require.NoError(t,w.CommitTxn("commit"))
+ require.NoError(t,w.AbortTxn("abort"))
+ for path,want:=range map[string]string{"orders-0-commit.jsonl":"one\nthree\n","orders-1-commit.jsonl":"two\n","events-0-commit.jsonl":"event\n"} {
+  b,err:=os.ReadFile(filepath.Join(dir,path))
+  require.NoError(t,err)
+  assert.Equal(t,want,string(b))
+  requireNoFile(t,filepath.Join(dir,path+".tmp"))
+ }
+ requireNoFile(t,filepath.Join(dir,"orders-3-abort.jsonl.tmp"))
+ requireNoFile(t,filepath.Join(dir,"orders-3-abort.jsonl"))
+ require.NoError(t,w.Close())
+ requireNoFile(t,filepath.Join(dir,"orders-4-pending.jsonl.tmp"))
+}
+
+func TestTxnFileWriterPartitionOnly(t *testing.T) {
+ dir:=t.TempDir()
+ w,err:=output.NewTxnFileWriter(filepath.Join(dir,"part-{partition}-{txnID}.bin"))
+ require.NoError(t,err)
+ require.NoError(t,w.Write([]byte("one"),&ksink.Message{TransactionalID:"x",Topic:"a",Partition:5}))
+ require.NoError(t,w.Write([]byte("two"),&ksink.Message{TransactionalID:"x",Topic:"b",Partition:5}))
+ require.NoError(t,w.CommitTxn("x"))
+ b,err:=os.ReadFile(filepath.Join(dir,"part-5-x.bin"))
+ require.NoError(t,err)
+ assert.Equal(t,"onetwo",string(b))
+ require.NoError(t,w.Close())
+}
