@@ -26,8 +26,8 @@ type Writer interface {
 }
 
 // TransactionalWriter extends [Writer] with transaction commit and abort
-// operations. File-based backends can implement this to write into temporary
-// files during a transaction and then rename on commit or delete on abort.
+// operations. Filesystem backends stage a transaction under a private
+// directory and can publish its complete contents with a single rename.
 type TransactionalWriter interface {
 	Writer
 	CommitTxn(txnID string) error
