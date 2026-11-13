@@ -1,9 +1,6 @@
 package ksink
 
 import (
-	"crypto/rand"
-	"encoding/binary"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -13,52 +10,47 @@ import (
 
 const durableTxnStateVersion = 1
 
-// txnBatchSignature is a bounded idempotency record for a previously
-// acknowledged Kafka RecordBatch. Sequences are scoped to the producer epoch,
-// topic and partition, and do not reset when one transaction ends.
+// The coordinator snapshots are logical records INSIDE the shared WAL. There
+// is no independent state.json or second durable transaction authority.
 type txnBatchSignature struct {
-	Base     int32  `json:"base"`
-	Count    int32  `json:"count"`
-	Checksum string `json:"checksum"`
+	Base     int32
+	Count    int32
+	Checksum string
 }
 
 type txnPartitionSequence struct {
-	Next    int32               `json:"next"`
-	Recent  []txnBatchSignature `json:"recent"`
+	Next   int32
+	Recent []txnBatchSignature
 }
 
 type storedTxnState struct {
-	ProducerID   int64                            `json:"producer_id"`
-	Epoch        int16                            `json:"epoch"`
-	Active       bool                             `json:"active"`
-	HasOutcome   bool                             `json:"has_outcome"`
-	LastCommit   bool                             `json:"last_commit"`
-	Pending      string                           `json:"pending,omitempty"`
-	Sequences    map[string]txnPartitionSequence  `json:"sequences,omitempty"`
+	ProducerID int64
+	Epoch      int16
+	Active     bool
+	HasOutcome bool
+	LastCommit bool
+	Pending    string
+	Instance   string
+	Sequences  map[string]txnPartitionSequence
 }
 
 type txnStateSnapshot struct {
-	Version   int                       `json:"version"`
-	Counter   int64                     `json:"counter"`
-	States    map[string]storedTxnState `json:"states"`
-}
-
-type durableTxnStore struct {
-	dir  string
-	lock *os.File
+	Version int
+	Counter int64
+	States  map[string]storedTxnState
 }
 
 func txnSyncDirectory(dir string) error {
 	f, err := os.Open(dir)
 	if err != nil {
-		return fmt.Errorf("open coordinator state directory %s: %w", dir, err)
+		return fmt.Errorf("open transaction state directory %s: %w", dir, err)
 	}
 	err = f.Sync()
 	if closeErr := f.Close(); err == nil {
 		err = closeErr
 	}
 	if err != nil {
-		return fmt.Errorf("sync coordinator state directory %s: %w", dir, err)
+		return fmt.Errorf("sync transaction state directory %s: %w", dir, err)
 	}
 	return nil
 }
@@ -67,7 +59,7 @@ func createTxnStateDir(dir string) error {
 	info, err := os.Stat(dir)
 	if err == nil {
 		if !info.IsDir() {
-			return fmt.Errorf("coordinator state path %s is not a directory", dir)
+			return fmt.Errorf("transaction state path %s is not a directory", dir)
 		}
 		return nil
 	}
@@ -76,129 +68,27 @@ func createTxnStateDir(dir string) error {
 	}
 	parent := filepath.Dir(dir)
 	if parent == dir {
-		return fmt.Errorf("invalid transaction state directory %s", dir)
+		return fmt.Errorf("cannot create transaction state root %s", dir)
 	}
 	if err := createTxnStateDir(parent); err != nil {
 		return err
 	}
-	if err := os.Mkdir(dir, 0700); err != nil && !errors.Is(err, fs.ErrExist) {
-		return fmt.Errorf("create coordinator state directory %s: %w", dir, err)
+	if err := os.Mkdir(dir, 0700); err != nil {
+		if !errors.Is(err, fs.ErrExist) {
+			return err
+		}
+		if info, statErr := os.Stat(dir); statErr != nil || !info.IsDir() {
+			return fmt.Errorf("transaction state directory %s is not a directory", dir)
+		}
 	}
 	return txnSyncDirectory(parent)
 }
 
-func openDurableTxnStore(path string) (*durableTxnStore, txnStateSnapshot, error) {
-	var snapshot txnStateSnapshot
-	dir, err := filepath.Abs(path)
-	if err != nil {
-		return nil, snapshot, fmt.Errorf("resolve transaction state directory: %w", err)
-	}
-	if err := createTxnStateDir(dir); err != nil {
-		return nil, snapshot, err
-	}
-	lockPath := filepath.Join(dir, ".ksink-coordinator.lock")
-	lock, err := os.OpenFile(lockPath, os.O_RDWR|os.O_CREATE, 0600)
-	if err != nil {
-		return nil, snapshot, fmt.Errorf("open coordinator lock: %w", err)
-	}
-	if err := lockTxnStateFile(lock); err != nil {
-		_ = lock.Close()
-		return nil, snapshot, fmt.Errorf("acquire exclusive coordinator lock %s: %w", lockPath, err)
-	}
-	store := &durableTxnStore{dir: dir, lock: lock}
-	rollback := func(err error) (*durableTxnStore, txnStateSnapshot, error) {
-		_ = store.close()
-		return nil, txnStateSnapshot{}, err
-	}
-	if err := txnSyncDirectory(dir); err != nil {
-		return rollback(err)
-	}
-	data, err := os.ReadFile(filepath.Join(dir, "state.json"))
-	if errors.Is(err, fs.ErrNotExist) {
-		// Never reuse the low producer IDs assigned by older in-memory
-		// ksink instances when enabling durability for the first time.
-		// A high random starting ID makes an old zombie PID extremely
-		// unlikely to collide with a fresh persistent coordinator.
-		var seed [8]byte
-		if _, err := rand.Read(seed[:]); err != nil {
-			return rollback(fmt.Errorf("seed durable producer ID space: %w", err))
-		}
-		counter := int64(1<<60) | int64(binary.BigEndian.Uint64(seed[:])&((1<<60)-1))
-		return store, txnStateSnapshot{
-			Version: durableTxnStateVersion,
-			Counter: counter,
-			States: make(map[string]storedTxnState),
-		}, nil
-	}
-	if err != nil {
-		return rollback(fmt.Errorf("load coordinator state: %w", err))
-	}
-	if err := json.Unmarshal(data, &snapshot); err != nil {
-		return rollback(fmt.Errorf("decode coordinator state: %w", err))
-	}
-	if snapshot.Version != durableTxnStateVersion || snapshot.Counter < 0 ||
-		len(snapshot.States) > maxTxnStates {
-		return rollback(fmt.Errorf("invalid coordinator state version, counter or size"))
-	}
-	for id, st := range snapshot.States {
-		if id == "" || st.ProducerID <= 0 || st.ProducerID > snapshot.Counter ||
-			st.Epoch < 0 || (st.Pending != "" && st.Pending != "commit" && st.Pending != "abort") {
-			return rollback(fmt.Errorf("invalid durable transaction record for %q", id))
-		}
-	}
-	if snapshot.States == nil {
-		snapshot.States = make(map[string]storedTxnState)
-	}
-	return store, snapshot, nil
-}
-
-func (store *durableTxnStore) save(snapshot txnStateSnapshot) error {
-	if store == nil {
-		return nil
-	}
-	data, err := json.Marshal(snapshot)
-	if err != nil {
-		return fmt.Errorf("marshal coordinator snapshot: %w", err)
-	}
-	tmp := filepath.Join(store.dir, "state.json.tmp")
-	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0600)
-	if err != nil {
-		return fmt.Errorf("create coordinator temporary state: %w", err)
-	}
-	if n, writeErr := f.Write(data); writeErr != nil || n != len(data) {
-		_ = f.Close()
-		return fmt.Errorf("write coordinator state: %v, %d/%d bytes", writeErr, n, len(data))
-	}
-	if err := f.Sync(); err != nil {
-		_ = f.Close()
-		return fmt.Errorf("sync coordinator state: %w", err)
-	}
-	if err := f.Close(); err != nil {
-		return fmt.Errorf("close coordinator state: %w", err)
-	}
-	if err := os.Rename(tmp, filepath.Join(store.dir, "state.json")); err != nil {
-		return fmt.Errorf("publish coordinator state: %w", err)
-	}
-	return txnSyncDirectory(store.dir)
-}
-
-func (store *durableTxnStore) close() error {
-	if store == nil || store.lock == nil {
-		return nil
-	}
-	err := unlockTxnStateFile(store.lock)
-	if closeErr := store.lock.Close(); err == nil {
-		err = closeErr
-	}
-	store.lock = nil
-	return err
-}
-
-// persistTxnStateLocked must be called while holding s.txnMu. If persistence
-// fails, the coordinator is immediately fenced from accepting further
-// mutations. Recovery on restart chooses the last durable snapshot.
+// persistTxnStateLocked serializes the coordinator state into the same WAL
+// used by the output writer. The caller holds s.txnMu. A write error poisons
+// this server: it must not acknowledge any further state mutation.
 func (s *Server) persistTxnStateLocked() error {
-	if s.txnStore == nil {
+	if s.txnLog == nil {
 		return nil
 	}
 	if s.txnStoreErr != nil {
@@ -211,58 +101,83 @@ func (s *Server) persistTxnStateLocked() error {
 	}
 	for id, st := range s.txnStates {
 		snapshot.States[id] = storedTxnState{
-			ProducerID: st.producerID, Epoch: st.epoch,
-			Active: st.active, HasOutcome: st.hasOutcome,
-			LastCommit: st.lastCommit, Pending: st.pendingAction,
-			Sequences: st.sequences,
+			ProducerID: st.producerID, Epoch: st.epoch, Active: st.active,
+			HasOutcome: st.hasOutcome, LastCommit: st.lastCommit,
+			Pending: st.pendingAction, Instance: st.instance, Sequences: st.sequences,
 		}
 	}
-	if err := s.txnStore.save(snapshot); err != nil {
-		s.txnStoreErr = fmt.Errorf("durable transaction coordinator unavailable: %w", err)
+	if err := s.txnLog.AppendState(snapshot); err != nil {
+		s.txnStoreErr = fmt.Errorf("transaction WAL is unavailable: %w", err)
 		return s.txnStoreErr
 	}
 	return nil
 }
 
-// initializeTxnState reloads persisted producer IDs and outcomes. Any active
-// transaction without an acknowledged EndTxn outcome was discarded by the
-// filesystem staging recovery; it MUST NOT be resumed on a new server process.
-// All producer epochs require a fresh InitProducerID before new Produce.
+// initializeTxnState replays the shared WAL. The filesystem materializer must
+// have completed recovery *before* the server starts listening, when using a
+// shared WAL. A decided commit is only treated as complete if the materializer
+// has durably recorded publication of that exact transaction instance.
 func (s *Server) initializeTxnState() error {
-	if s.cfg.TransactionStateDir == "" {
+	if s.txnLog == nil && s.cfg.TransactionStateDir != "" {
+		log, err := OpenTransactionLog(s.cfg.TransactionStateDir)
+		if err != nil {
+			return err
+		}
+		s.txnLog = log
+		s.ownsTxnLog = true
+	}
+	if s.txnLog == nil {
 		return nil
 	}
-	store, snapshot, err := openDurableTxnStore(s.cfg.TransactionStateDir)
-	if err != nil {
-		return err
-	}
-	s.txnStore = store
+	snapshot := s.txnLog.CurrentState()
 	s.producerIDCounter.Store(snapshot.Counter)
+	dirty := false
 	for id, old := range snapshot.States {
 		if old.Sequences == nil {
 			old.Sequences = make(map[string]txnPartitionSequence)
 		}
-		s.txnStates[id] = &txnState{
-			producerID: old.ProducerID, epoch: old.Epoch,
+		st := &txnState{
+			producerID: old.ProducerID, epoch: old.Epoch, instance: old.Instance,
 			hasOutcome: old.HasOutcome, lastCommit: old.LastCommit,
 			pendingAction: old.Pending, sequences: old.Sequences,
 			restartRequired: true,
 		}
-		// Pending commit/abort is outcome-ambiguous across a process crash.
-		// Do not claim an EndTxn succeeded without a stored outcome.
-		if old.Pending != "" {
-			s.txnStates[id].hasOutcome = false
+		// A completed filesystem publication makes a pending COMMIT
+		// unambiguous. A crashed pending ABORT is likewise recoverable.
+		if old.Pending == "commit" && s.txnLog.Published(old.Instance) {
+			st.hasOutcome = true
+			st.lastCommit = true
+			st.pendingAction = ""
+			dirty = true
+		} else if old.Pending == "abort" && s.txnLog.Aborted(old.Instance) {
+			st.hasOutcome = true
+			st.lastCommit = false
+			st.pendingAction = ""
+			dirty = true
+		} else if old.Active && old.Pending == "" {
+			// No irreversible decision: the filesystem recovery has
+			// discarded the active staging. Never resume the old epoch.
+			st.hasOutcome = false
+			st.pendingAction = ""
+			dirty = true
+		} else if old.Pending != "" {
+			// Without a matching materializer recovery marker, do not
+			// acknowledge a decision or silently fence it away.
+			st.needsResolution = true
 		}
+		s.txnStates[id] = st
 	}
-	// The abort-on-restart decision, including the fact that old producer
-	// epochs cannot accept new writes, is made durable before opening port.
-	s.txnMu.Lock()
-	err = s.persistTxnStateLocked()
-	s.txnMu.Unlock()
-	if err != nil {
-		_ = store.close()
-		s.txnStore = nil
-		return err
+	if dirty {
+		s.txnMu.Lock()
+		err := s.persistTxnStateLocked()
+		s.txnMu.Unlock()
+		if err != nil {
+			if s.ownsTxnLog {
+				_ = s.txnLog.Close()
+				s.txnLog = nil
+			}
+			return err
+		}
 	}
 	return nil
 }
