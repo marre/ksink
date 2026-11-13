@@ -67,11 +67,14 @@ type MessagesEvent struct {
 // TxnCommitEvent indicates the transaction identified by TransactionalID was committed.
 type TxnCommitEvent struct {
 	TransactionalID string
+	// TransactionInstance identifies the exact durable transaction generation.
+	TransactionInstance string
 }
 
 // TxnAbortEvent indicates the transaction identified by TransactionalID was aborted.
 type TxnAbortEvent struct {
 	TransactionalID string
+	TransactionInstance string
 }
 
 func (*MessagesEvent) isEvent()  {}
@@ -90,6 +93,7 @@ type Message struct {
 	Tombstone       bool
 	ClientAddr      string
 	TransactionalID string // non-empty when produced inside a transaction
+	TransactionInstance string // stable per-transaction generation for WAL-backed output
 }
 
 // SASLCredential holds a SASL authentication credential.
@@ -146,11 +150,11 @@ type Config struct {
 	// semantics. This implies IdempotentWrite.
 	TransactionalWrite bool
 
-	// TransactionStateDir enables durable Kafka producer state and record
-	// sequence deduplication across restarts. The CLI defaults this to a
-	// private sidecar directory under transactional file output. A blank
-	// value retains legacy in-memory behavior for library callers.
-	// Multiple servers MUST NOT share one directory concurrently.
+	// TransactionStateDir opens a durable transaction WAL for embedded
+	// server use. The transactional CLI opens one shared WAL also used by its
+	// filesystem writer. A blank value retains in-memory state for library
+	// clients that do not supply WithTransactionLog.
+	// Multiple servers must not share a state directory concurrently.
 	TransactionStateDir string
 }
 
@@ -213,6 +217,13 @@ func WithLogger(l Logger) Option {
 	}
 }
 
+// WithTransactionLog attaches a shared WAL to an embedded Server. The caller
+// owns its lifetime and must close it after both the server and the
+// filesystem materializer stop. This prevents two independent authorities.
+func WithTransactionLog(log *TransactionLog) Option {
+	return func(s *Server) { s.txnLog = log }
+}
+
 // txnState tracks the state of a transactional producer identified by its
 // transactional.id. It stores the assigned producer ID, the current epoch
 // (bumped on each InitProducerID call), and whether a transaction is
@@ -226,6 +237,7 @@ type txnState struct {
 	hasOutcome      bool // remember successful EndTxn for response-loss retries
 	lastCommit      bool
 	inFlight        sync.WaitGroup // accepted Produce requests; EndTxn/fencing waits for these
+	instance        string         // durable identity for one producer transaction
 	produceMu       sync.Mutex     // serialize validation, delivery, and sequence journal
 	sequences       map[string]txnPartitionSequence
 	pendingAction   string // persisted EndTxn intent ("commit" or "abort")
@@ -261,7 +273,8 @@ type Server struct {
 	// Transaction state tracking: maps transactional.id -> txnState
 	txnMu       sync.Mutex
 	txnStates   map[string]*txnState
-	txnStore    *durableTxnStore
+	txnLog      *TransactionLog
+	ownsTxnLog  bool
 	txnStoreErr error
 
 	// Decompressor for parsing record batches
@@ -507,8 +520,8 @@ func (s *Server) Close(ctx context.Context) error {
 	// server instances to mutate the same durable coordinator state.
 	select {
 	case <-done:
-		if s.txnStore != nil {
-			return s.txnStore.close()
+		if s.ownsTxnLog && s.txnLog != nil {
+			return s.txnLog.Close()
 		}
 	default:
 	}
