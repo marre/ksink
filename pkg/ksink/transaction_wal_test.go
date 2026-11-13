@@ -1,6 +1,7 @@
 package ksink
 
 import (
+	"bytes"
 	"encoding/binary"
 	"os"
 	"path/filepath"
@@ -169,4 +170,125 @@ func TestTransactionWALMissingEstablishedLogFailsClosed(t *testing.T) {
 	require.NoError(t, os.WriteFile(walPath, nil, 0600))
 	_, err = OpenTransactionLog(dir)
 	require.ErrorContains(t, err, "established transaction WAL is missing or empty")
+}
+
+
+func TestTransactionWALCompactionRequiresMeaningfulReclamation(t *testing.T) {
+	// A large live transaction cannot be rewritten just because the WAL
+	// exceeds the former unconditional 64 MiB trigger.
+	require.False(t, shouldCompactWAL(1<<30, 0))
+	require.False(t, shouldCompactWAL(1<<30, 64<<20))
+	require.False(t, shouldCompactWAL(1<<30, 200<<20))
+	require.True(t, shouldCompactWAL(1<<30, 256<<20))
+
+	// Reclaimable space must be significant in absolute terms as well.
+	require.False(t, shouldCompactWAL(2<<20, 1<<20))
+	require.False(t, shouldCompactWAL(64<<20, 15<<20))
+	require.True(t, shouldCompactWAL(64<<20, 16<<20))
+	require.True(t, shouldCompactWAL(24<<20, 20<<20))
+}
+
+func TestTransactionWALDoesNotRepeatedlyCompactLargeLiveTransaction(t *testing.T) {
+	root := t.TempDir()
+	wal, instance := testOpenWALWithActiveTransaction(t, root)
+	defer func() { _ = wal.Close() }()
+
+	// The two frames contain >64 MiB of base64-encoded durable payload.
+	// Under the old total-size threshold each subsequent append would
+	// rewrite the large, still-active transaction.
+	data := bytes.Repeat([]byte("x"), 25<<20)
+	walPath := filepath.Join(root, ".ksink-kafka-state", "transactions.wal")
+	require.NoError(t, wal.AppendOutput("orders-producer", instance, "one.bin", data))
+	before, err := os.Stat(walPath)
+	require.NoError(t, err)
+	require.NoError(t, wal.AppendOutput("orders-producer", instance, "two.bin", data))
+	after, err := os.Stat(walPath)
+	require.NoError(t, err)
+	require.Greater(t, after.Size(), int64(64<<20))
+	require.True(t, os.SameFile(before, after), "live output must not trigger WAL replacement")
+	require.Less(t, wal.reclaimable, int64(transactionWALMinReclaim))
+
+	state := wal.CurrentState()
+	st := state.States["orders-producer"]
+	st.Pending = "commit"
+	state.States["orders-producer"] = st
+	require.NoError(t, wal.AppendState(state))
+	stillLive, err := os.Stat(walPath)
+	require.NoError(t, err)
+	require.True(t, os.SameFile(before, stillLive))
+
+	// MarkPublished is the last operation: there are no further writes.
+	// All payload space becomes reclaimable immediately at completion.
+	require.NoError(t, wal.MarkPublished("orders-producer", instance))
+	compacted, err := os.Stat(walPath)
+	require.NoError(t, err)
+	require.Less(t, compacted.Size(), int64(1<<20), "completion should reclaim large published payloads")
+	require.False(t, os.SameFile(before, compacted))
+	require.Zero(t, wal.reclaimable)
+	require.True(t, wal.Published(instance))
+
+	require.NoError(t, wal.Close())
+	reopened, err := OpenTransactionLog(filepath.Join(root, ".ksink-kafka-state"))
+	require.NoError(t, err)
+	defer func() { _ = reopened.Close() }()
+	entries := reopened.RecoveryTransactions()
+	require.Len(t, entries, 1)
+	require.True(t, entries[0].Published)
+	require.True(t, entries[0].PublishedHasOutput)
+	require.Empty(t, entries[0].Records)
+}
+
+func TestTransactionWALCompactsImmediatelyAfterSubstantialAbort(t *testing.T) {
+	root := t.TempDir()
+	wal, instance := testOpenWALWithActiveTransaction(t, root)
+	defer func() { _ = wal.Close() }()
+	data := bytes.Repeat([]byte("a"), 16<<20)
+	require.NoError(t, wal.AppendOutput("orders-producer", instance, "aborted.bin", data))
+	walPath := filepath.Join(root, ".ksink-kafka-state", "transactions.wal")
+	before, err := os.Stat(walPath)
+	require.NoError(t, err)
+	require.Greater(t, before.Size(), int64(transactionWALMinReclaim))
+
+	state := wal.CurrentState()
+	st := state.States["orders-producer"]
+	st.Pending = "abort"
+	state.States["orders-producer"] = st
+	require.NoError(t, wal.AppendState(state))
+	require.NoError(t, wal.MarkAborted("orders-producer", instance))
+	after, err := os.Stat(walPath)
+	require.NoError(t, err)
+	require.Less(t, after.Size(), int64(1<<20))
+	require.True(t, wal.Aborted(instance))
+	require.Zero(t, wal.reclaimable)
+
+	// A compacted abort marker must remain recognizable after restart.
+	require.NoError(t, wal.Close())
+	reopened, err := OpenTransactionLog(filepath.Join(root, ".ksink-kafka-state"))
+	require.NoError(t, err)
+	defer func() { _ = reopened.Close() }()
+	require.True(t, reopened.Aborted(instance))
+	require.Empty(t, reopened.RecoveryTransactions()[0].Records)
+}
+
+func TestTransactionWALReplayRetainsReclaimableAccounting(t *testing.T) {
+	root := t.TempDir()
+	wal, instance := testOpenWALWithActiveTransaction(t, root)
+	require.NoError(t, wal.AppendOutput("orders-producer", instance, "discard.bin", []byte("abc")))
+	state := wal.CurrentState()
+	st := state.States["orders-producer"]
+	st.Pending = "commit"
+	state.States["orders-producer"] = st
+	require.NoError(t, wal.AppendState(state))
+	require.NoError(t, wal.MarkPublished("orders-producer", instance))
+	beforeSize, beforeReclaimable := wal.size, wal.reclaimable
+	require.Greater(t, beforeReclaimable, int64(0))
+	require.NoError(t, wal.Close())
+	reopened, err := OpenTransactionLog(filepath.Join(root, ".ksink-kafka-state"))
+	require.NoError(t, err)
+	defer func() { _ = reopened.Close() }()
+	require.Equal(t, beforeSize, reopened.size)
+	require.Equal(t, beforeReclaimable, reopened.reclaimable)
+	// An explicit maintenance compaction still works with counters rebuilt.
+	require.NoError(t, reopened.Compact())
+	require.Zero(t, reopened.reclaimable)
 }
