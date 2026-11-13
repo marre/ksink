@@ -613,7 +613,7 @@ func TestFranzTransactionalFileCommit(t *testing.T) {
 	srv, err := New(Config{
 		Address:            addr,
 		Timeout:            5 * time.Second,
-		TransactionalWrite:  true, TransactionStateDir: t.TempDir(),
+		TransactionalWrite: true,
 	}, WithLogger(&integrationLogger{t}), ksink.WithTransactionLog(wal))
 	require.NoError(t, err)
 	require.NoError(t, srv.Start(context.Background()))
@@ -675,7 +675,7 @@ func TestFranzTransactionalFileAbort(t *testing.T) {
 	srv, err := New(Config{
 		Address:            addr,
 		Timeout:            5 * time.Second,
-		TransactionalWrite: true, TransactionStateDir: t.TempDir(),
+		TransactionalWrite: true,
 	}, WithLogger(&integrationLogger{t}), ksink.WithTransactionLog(wal))
 	require.NoError(t, err)
 	require.NoError(t, srv.Start(context.Background()))
@@ -736,7 +736,7 @@ func TestFranzTransactionalFileCommitAndAbort(t *testing.T) {
 	srv, err := New(Config{
 		Address:            addr,
 		Timeout:            5 * time.Second,
-		TransactionalWrite: true, TransactionStateDir: t.TempDir(),
+		TransactionalWrite: true,
 	}, WithLogger(&integrationLogger{t}), ksink.WithTransactionLog(wal))
 	require.NoError(t, err)
 	require.NoError(t, srv.Start(context.Background()))
