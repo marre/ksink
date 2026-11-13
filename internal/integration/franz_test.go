@@ -414,7 +414,7 @@ func TestFranzTransactionalProducer(t *testing.T) {
 
 	srv, addr := startTestServer(t, Config{
 		Timeout:            5 * time.Second,
-		TransactionalWrite: true,
+		TransactionalWrite: true, TransactionStateDir: t.TempDir(),
 	})
 	capture := startReadLoop(t, srv)
 
@@ -457,7 +457,7 @@ func TestFranzTransactionalProducerAbort(t *testing.T) {
 
 	srv, addr := startTestServer(t, Config{
 		Timeout:            5 * time.Second,
-		TransactionalWrite: true,
+		TransactionalWrite: true, TransactionStateDir: t.TempDir(),
 	})
 	capture := startReadLoop(t, srv)
 
@@ -509,7 +509,7 @@ func TestFranzTxnEvents(t *testing.T) {
 	srv, err := New(Config{
 		Address:            addr,
 		Timeout:            5 * time.Second,
-		TransactionalWrite: true,
+		TransactionalWrite: true, TransactionStateDir: t.TempDir(),
 	}, WithLogger(&integrationLogger{t}))
 	require.NoError(t, err)
 	require.NoError(t, srv.Start(context.Background()))
@@ -603,7 +603,7 @@ func TestFranzTransactionalFileCommit(t *testing.T) {
 	wal, err := ksink.OpenTransactionLog(filepath.Join(dir, ".ksink-kafka-state"))
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = wal.Close() })
-	tw, err := output.NewTxnFileWriterWithLog(pattern, wal)
+	tw, err := output.NewTxnFileWriter(pattern, wal)
 	require.NoError(t, err)
 	t.Cleanup(func() { tw.Close() }) //nolint:errcheck
 
@@ -613,8 +613,7 @@ func TestFranzTransactionalFileCommit(t *testing.T) {
 	srv, err := New(Config{
 		Address:            addr,
 		Timeout:            5 * time.Second,
-		TransactionalWrite:  true,
-		TransactionStateDir: filepath.Join(dir, ".ksink-kafka-state"),
+		TransactionalWrite:  true, TransactionStateDir: t.TempDir(),
 	}, WithLogger(&integrationLogger{t}), ksink.WithTransactionLog(wal))
 	require.NoError(t, err)
 	require.NoError(t, srv.Start(context.Background()))
@@ -663,7 +662,10 @@ func TestFranzTransactionalFileAbort(t *testing.T) {
 	dir := t.TempDir()
 	pattern := filepath.Join(dir, "out-{txnID}.jsonl")
 
-	tw, err := output.NewTxnFileWriter(pattern)
+	wal, err := ksink.OpenTransactionLog(output.KafkaTransactionStateDir(pattern))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = wal.Close() })
+	tw, err := output.NewTxnFileWriter(pattern, wal)
 	require.NoError(t, err)
 	t.Cleanup(func() { tw.Close() }) //nolint:errcheck
 
@@ -673,8 +675,8 @@ func TestFranzTransactionalFileAbort(t *testing.T) {
 	srv, err := New(Config{
 		Address:            addr,
 		Timeout:            5 * time.Second,
-		TransactionalWrite: true,
-	}, WithLogger(&integrationLogger{t}))
+		TransactionalWrite: true, TransactionStateDir: t.TempDir(),
+	}, WithLogger(&integrationLogger{t}), ksink.WithTransactionLog(wal))
 	require.NoError(t, err)
 	require.NoError(t, srv.Start(context.Background()))
 	t.Cleanup(func() { srv.Close(context.Background()) }) //nolint:errcheck
@@ -721,7 +723,10 @@ func TestFranzTransactionalFileCommitAndAbort(t *testing.T) {
 	dir := t.TempDir()
 	pattern := filepath.Join(dir, "out-{txnID}.jsonl")
 
-	tw, err := output.NewTxnFileWriter(pattern)
+	wal, err := ksink.OpenTransactionLog(output.KafkaTransactionStateDir(pattern))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = wal.Close() })
+	tw, err := output.NewTxnFileWriter(pattern, wal)
 	require.NoError(t, err)
 	t.Cleanup(func() { tw.Close() }) //nolint:errcheck
 
@@ -731,8 +736,8 @@ func TestFranzTransactionalFileCommitAndAbort(t *testing.T) {
 	srv, err := New(Config{
 		Address:            addr,
 		Timeout:            5 * time.Second,
-		TransactionalWrite: true,
-	}, WithLogger(&integrationLogger{t}))
+		TransactionalWrite: true, TransactionStateDir: t.TempDir(),
+	}, WithLogger(&integrationLogger{t}), ksink.WithTransactionLog(wal))
 	require.NoError(t, err)
 	require.NoError(t, srv.Start(context.Background()))
 	t.Cleanup(func() { srv.Close(context.Background()) }) //nolint:errcheck
@@ -808,7 +813,7 @@ func TestFranzZombieFencing(t *testing.T) {
 	srv, err := New(Config{
 		Address:            addr,
 		Timeout:            5 * time.Second,
-		TransactionalWrite: true,
+		TransactionalWrite: true, TransactionStateDir: t.TempDir(),
 	}, WithLogger(&integrationLogger{t}))
 	require.NoError(t, err)
 	require.NoError(t, srv.Start(context.Background()))
@@ -1389,6 +1394,9 @@ func startTestServer(t *testing.T, cfg Config) (*Server, string) {
 	port := getFreePort(t)
 	addr := fmt.Sprintf("127.0.0.1:%d", port)
 	cfg.Address = addr
+	if cfg.TransactionalWrite && cfg.TransactionStateDir == "" {
+		cfg.TransactionStateDir = t.TempDir()
+	}
 
 	srv, err := New(cfg, WithLogger(&integrationLogger{t}))
 	require.NoError(t, err)
