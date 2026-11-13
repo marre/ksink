@@ -103,6 +103,7 @@ type TransactionLog struct {
 	bindingRef walFrameRef
 	markerRefs map[string]walFrameRef
 	faultHook func(string) error // test-only, called while holding mu
+	segmentLimit int64 // tests may reduce rotation threshold; defaults to 64 MiB
 }
 
 func txnWALValidInstance(instance string) bool {
@@ -176,6 +177,7 @@ func OpenTransactionLog(path string) (*TransactionLog, error) {
 		markerFrameBytes:make(map[string]int64),
 		markerRefs:make(map[string]walFrameRef),
 		fileStats:make(map[walFileKey]*walFileStats),
+		segmentLimit:transactionWALSegmentBytes,
 	}
 	if err:=log.initSegmentStore();err!=nil{_ = log.Close();return nil,err}
 	if err:=log.load();err!=nil{_ = log.Close();return nil,err}
@@ -425,7 +427,9 @@ func (l *TransactionLog) appendBatchLocked(records []transactionWALRecord) error
 	key:=l.activeKey()
 	current:=l.fileStats[key]
 	if current==nil{current=&walFileStats{};l.fileStats[key]=current}
-	if current.size>0 && current.size+total>transactionWALSegmentBytes {
+	limit:=l.segmentLimit
+	if limit<=0{limit=transactionWALSegmentBytes}
+	if current.size>0 && current.size+total>limit {
 		if err:=l.rotateSegment();err!=nil {
 			l.broken=fmt.Errorf("rotate transaction WAL: %w",err)
 			return l.broken
