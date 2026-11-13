@@ -3,6 +3,7 @@ package ksink_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -26,8 +27,9 @@ func TestFranzSharedWALRecoversCommitBeforePublication(t *testing.T) {
 	writer, err := output.NewTxnFileWriterWithLog(pattern, wal)
 	require.NoError(t, err)
 
+	addr := fmt.Sprintf("127.0.0.1:%d", getFreePort(t))
 	srv, err := ksink.New(ksink.Config{
-		Address: "127.0.0.1:0", TransactionalWrite: true, Timeout: 3 * time.Second,
+		Address: addr, TransactionalWrite: true, Timeout: 5 * time.Second,
 	}, ksink.WithTransactionLog(wal), ksink.WithLogger(&integrationLogger{t}))
 	require.NoError(t, err)
 	require.NoError(t, srv.Start(context.Background()))
@@ -72,7 +74,7 @@ func TestFranzSharedWALRecoversCommitBeforePublication(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	client, err := kgo.NewClient(
-		kgo.SeedBrokers(srv.Addr().String()),
+		kgo.SeedBrokers(addr),
 		kgo.RequestTimeoutOverhead(5*time.Second),
 		kgo.TransactionalID("decided-commit"),
 	)
@@ -166,7 +168,8 @@ func TestSharedWALRestartDiscardsUndecidedStaging(t *testing.T) {
 	require.NoError(t, err)
 	writer, err := output.NewTxnFileWriterWithLog(pattern, wal)
 	require.NoError(t, err)
-	srv, err := ksink.New(ksink.Config{Address: "127.0.0.1:0", TransactionalWrite: true},
+	addr := fmt.Sprintf("127.0.0.1:%d", getFreePort(t))
+	srv, err := ksink.New(ksink.Config{Address: addr, TransactionalWrite: true},
 		ksink.WithTransactionLog(wal), ksink.WithLogger(&integrationLogger{t}))
 	require.NoError(t, err)
 	require.NoError(t, srv.Start(context.Background()))
@@ -174,7 +177,7 @@ func TestSharedWALRestartDiscardsUndecidedStaging(t *testing.T) {
 	startTxnReadLoop(t, srv, writer)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	client, err := kgo.NewClient(kgo.SeedBrokers(srv.Addr().String()),
+	client, err := kgo.NewClient(kgo.SeedBrokers(addr),
 		kgo.RequestTimeoutOverhead(5*time.Second), kgo.TransactionalID("undecided"))
 	require.NoError(t, err)
 	require.NoError(t, client.BeginTransaction())
