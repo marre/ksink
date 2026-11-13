@@ -78,7 +78,7 @@ func syncTxnParentChain(path, stop string) error {
 }
 
 // renameTxnCommitted publishes a transaction's directory in one operation.
-// The caller must have synced the commit intent and all payloads first.
+// The caller must have a durable WAL decision and synced output payloads first.
 func renameTxnCommitted(stagingDir, committedDir string) error {
 	_, stagingErr := os.Lstat(stagingDir)
 	_, committedErr := os.Lstat(committedDir)
