@@ -40,6 +40,7 @@ type WALRecoveryTransaction struct {
 	Instance      string
 	Decision      string
 	Published     bool
+	PublishedHasOutput bool
 	Aborted       bool
 	Records       []WALOutputRecord
 }
@@ -52,6 +53,7 @@ type transactionWALRecord struct {
 	Output   *WALOutputRecord
 	TxnID    string
 	Instance string
+	HasOutput bool
 }
 
 // TransactionLog is the single durable authority for transactional Kafka
@@ -70,6 +72,7 @@ type TransactionLog struct {
 	state     txnStateSnapshot
 	data      map[string][]WALOutputRecord
 	published map[string]bool
+	publishedHasOutput map[string]bool
 	aborted   map[string]bool
 	size      int64
 }
@@ -148,7 +151,12 @@ func OpenTransactionLog(path string) (*TransactionLog, error) {
 		state: txnStateSnapshot{Version: durableTxnStateVersion, States: make(map[string]storedTxnState)},
 		data: make(map[string][]WALOutputRecord),
 		published: make(map[string]bool),
+		publishedHasOutput: make(map[string]bool),
 		aborted: make(map[string]bool),
+	}
+	if err := txnSyncDirectory(dir); err != nil {
+		_ = log.Close()
+		return nil, err
 	}
 	if err := log.load(); err != nil {
 		_ = log.Close()
@@ -269,6 +277,7 @@ func (l *TransactionLog) apply(rec transactionWALRecord) error {
 			return fmt.Errorf("invalid WAL publication marker")
 		}
 		l.published[rec.Instance] = true
+		l.publishedHasOutput[rec.Instance] = rec.HasOutput
 		delete(l.data, rec.Instance)
 	case "aborted":
 		if rec.TxnID == "" || !txnWALValidInstance(rec.Instance) || l.published[rec.Instance] {
@@ -416,7 +425,10 @@ func (l *TransactionLog) MarkPublished(txnID, instance string) error {
 	if l.published[instance] {
 		return nil
 	}
-	return l.appendLocked(transactionWALRecord{Type: "published", TxnID: txnID, Instance: instance})
+	return l.appendLocked(transactionWALRecord{
+		Type: "published", TxnID: txnID, Instance: instance,
+		HasOutput: len(l.data[instance]) > 0,
+	})
 }
 
 func (l *TransactionLog) MarkAborted(txnID, instance string) error {
@@ -462,7 +474,8 @@ func (l *TransactionLog) RecoveryTransactions() []WALRecoveryTransaction {
 		}
 		out = append(out, WALRecoveryTransaction{
 			TransactionID: id, Instance: st.Instance, Decision: decision,
-			Published: l.published[st.Instance], Aborted: l.aborted[st.Instance],
+			Published: l.published[st.Instance], PublishedHasOutput: l.publishedHasOutput[st.Instance],
+			Aborted: l.aborted[st.Instance],
 			Records: copied,
 		})
 	}
@@ -517,7 +530,10 @@ func (l *TransactionLog) compactLocked() error {
 	}
 	for _, txn := range l.RecoveryTransactionsLocked() {
 		if txn.Published {
-			if err := write(transactionWALRecord{Type: "published", TxnID: txn.TransactionID, Instance: txn.Instance}); err != nil {
+			if err := write(transactionWALRecord{
+				Type: "published", TxnID: txn.TransactionID, Instance: txn.Instance,
+				HasOutput: txn.PublishedHasOutput,
+			}); err != nil {
 				return fail(err)
 			}
 		} else if txn.Aborted {
@@ -564,7 +580,8 @@ func (l *TransactionLog) RecoveryTransactionsLocked() []WALRecoveryTransaction {
 		}
 		out = append(out, WALRecoveryTransaction{
 			TransactionID: id, Instance: st.Instance,
-			Published: l.published[st.Instance], Aborted: l.aborted[st.Instance],
+			Published: l.published[st.Instance], PublishedHasOutput: l.publishedHasOutput[st.Instance],
+			Aborted: l.aborted[st.Instance],
 			Records: l.data[st.Instance],
 		})
 	}
