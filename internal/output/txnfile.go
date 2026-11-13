@@ -1,8 +1,6 @@
 package output
 
 import (
-	"crypto/rand"
-	"encoding/hex"
 	"fmt"
 	"io"
 	"os"
@@ -33,22 +31,13 @@ type txnDirectory struct {
 	poisoned     bool // a failed Write/Sync cannot be committed, only aborted
 }
 
-// txnFileWriter atomically publishes a whole transaction by renaming ONE
-// directory. Staging lives under <root>/.ksink-pending/<txnID>-<nonce> and
-// committed data under <root>/committed/<txnID>-<nonce>. All paths are on
-// the same filesystem; readers must only read under <root>/committed.
-//
-// The original output pattern names files INSIDE each transaction directory.
-// {topic} and {partition} may select different files or subdirectories.
-// This provides atomic visibility of all files. File payloads are synced
-// before a successful Write acknowledgement; a durable commit-intent marker
-// enables startup recovery of commits interrupted by a crash. Active staging
-// directories without intent are discarded on startup. Producer state
-// and outcomes are NOT persisted by the Kafka server.
+// txnFileWriter stages formatted records as a disposable cache. The single
+// WAL is authoritative for transaction data and commit/abort decisions.
+// Only committed/<txnID>-<instance>/ directories are publicly visible.
 type txnFileWriter struct {
 	pattern  string
 	root     string
-	wal      *ksink.TransactionLog // nil for legacy standalone writer
+	wal      *ksink.TransactionLog
 	lock     *os.File // advisory lock, held until Close or process exit
 	mu       sync.Mutex
 	txnFiles map[string]*txnDirectory // Kafka producer transactional.id => instance
@@ -79,60 +68,55 @@ func KafkaTransactionStateDir(pattern string) string {
 	return filepath.Join(transactionOutputRoot(pattern), ".ksink-kafka-state")
 }
 
-// NewTxnFileWriter creates a filesystem transactional writer. For example,
-// "messages-{txnID}.jsonl" produces:
-//    .ksink-pending/my-txn-<nonce>/messages-my-txn.jsonl (staging)
-//    committed/my-txn-<nonce>/messages-my-txn.jsonl    (after commit)
-//
-// A pattern such as "data/{topic}/{partition}-{txnID}.jsonl" produces
-// per-topic/per-partition files within ONE atomically published directory.
-// Staging and committed directories must reside on the same filesystem.
-func NewTxnFileWriter(pattern string) (TransactionalWriter, error) {
+// NewTxnFileWriter builds a WAL-backed filesystem writer, with a single
+// authoritative commit decision shared with the Kafka coordinator. Its
+// TransactionLog must remain open until the writer and server have stopped.
+func NewTxnFileWriter(pattern string, log *ksink.TransactionLog) (TransactionalWriter, error) {
+	if log == nil {
+		return nil, fmt.Errorf("transactional output requires a transaction WAL")
+	}
 	if !strings.Contains(pattern, TxnIDPlaceholder) {
 		return nil, fmt.Errorf("transactional output pattern must contain %s placeholder", TxnIDPlaceholder)
 	}
+	if err := log.BindOutput(pattern); err != nil {
+		return nil, fmt.Errorf("bind transaction WAL: %w", err)
+	}
 	root := transactionOutputRoot(pattern)
-	if err := mkdirTxnDurable(root); err != nil {
-		return nil, fmt.Errorf("prepare transactional file output %s: %w", root, err)
+	for _, dir := range []string{root, filepath.Join(root, ".ksink-pending"), filepath.Join(root, "committed")} {
+		if err := mkdirTxnDurable(dir); err != nil {
+			return nil, fmt.Errorf("prepare transactional output directory %s: %w", dir, err)
+		}
 	}
 	lockPath := filepath.Join(root, ".ksink-lock")
 	lock, err := os.OpenFile(lockPath, os.O_RDWR|os.O_CREATE, 0600)
 	if err != nil {
-		return nil, fmt.Errorf("open transaction recovery lock %s: %w", lockPath, err)
+		return nil, fmt.Errorf("open transaction output lock %s: %w", lockPath, err)
 	}
 	if err := acquireTxnFileLock(lock); err != nil {
 		_ = lock.Close()
 		return nil, fmt.Errorf("acquire exclusive transaction writer lock for %s: %w", root, err)
 	}
-	// Keep the lock held until Close, even after recovery completes, so
-	// a second ksink instance cannot delete this writer's active staging.
 	if err := syncTxnDirectory(root); err != nil {
 		_ = releaseTxnFileLock(lock)
 		_ = lock.Close()
 		return nil, err
 	}
-	if err := recoverTxnDirectories(root); err != nil {
-		_ = releaseTxnFileLock(lock)
-		_ = lock.Close()
-		return nil, fmt.Errorf("recover transactional file output under %s: %w", root, err)
-	}
-	return &txnFileWriter{
-		pattern:  filepath.Clean(pattern),
-		root:     root,
-		lock:     lock,
+	w := &txnFileWriter{
+		pattern: filepath.Clean(pattern),
+		root: root,
+		wal: log,
+		lock: lock,
 		txnFiles: make(map[string]*txnDirectory),
-	}, nil
+	}
+	if err := w.recoverFromWAL(); err != nil {
+		_ = w.Close()
+		return nil, fmt.Errorf("recover transaction output from WAL: %w", err)
+	}
+	return w, nil
 }
 
 func (w *txnFileWriter) newTransaction(txnID, instance string) (*txnDirectory, error) {
-	if instance == "" && w.wal == nil {
-		var nonce [16]byte
-		if _, err := rand.Read(nonce[:]); err != nil {
-			return nil, fmt.Errorf("generate transaction instance ID: %w", err)
-		}
-		instance = SanitizePathSegment(txnID) + "-" + hex.EncodeToString(nonce[:])
-	}
-	if w.wal != nil && (instance == "" || !strings.HasPrefix(instance, SanitizePathSegment(txnID)+"-")) {
+	if instance == "" || !strings.HasPrefix(instance, SanitizePathSegment(txnID)+"-") {
 		return nil, fmt.Errorf("invalid WAL instance for transaction %q", txnID)
 	}
 	stagingRoot := filepath.Join(w.root, ".ksink-pending")
@@ -171,10 +155,10 @@ func (w *txnFileWriter) Write(data []byte, msg *ksink.Message) error {
 	if txn != nil && txn.committing {
 		return fmt.Errorf("transaction %q has a pending commit; retry commit before writing", txnID)
 	}
-	if w.wal != nil && msg.TransactionInstance == "" {
+	if msg.TransactionInstance == "" {
 		return fmt.Errorf("transaction %q lacks a durable instance identifier", txnID)
 	}
-	if txn != nil && w.wal != nil && filepath.Base(txn.stagingDir) != msg.TransactionInstance {
+	if txn != nil && filepath.Base(txn.stagingDir) != msg.TransactionInstance {
 		return fmt.Errorf("transaction %q instance mismatch", txnID)
 	}
 	if txn != nil && txn.poisoned {
@@ -195,11 +179,9 @@ func (w *txnFileWriter) Write(data []byte, msg *ksink.Message) error {
 		w.txnFiles[txnID] = txn
 	}
 	stagedFile := filepath.Join(txn.stagingDir, relative)
-	if w.wal != nil {
-		if err := w.wal.AppendOutput(txnID, msg.TransactionInstance, relative, data); err != nil {
-			txn.poisoned = true
-			return fmt.Errorf("persist transaction %q output in WAL: %w", txnID, err)
-		}
+	if err := w.wal.AppendOutput(txnID, msg.TransactionInstance, relative, data); err != nil {
+		txn.poisoned = true
+		return fmt.Errorf("persist transaction %q output in WAL: %w", txnID, err)
 	}
 	entry := txn.files[stagedFile]
 	if entry == nil {
@@ -222,16 +204,6 @@ func (w *txnFileWriter) Write(data []byte, msg *ksink.Message) error {
 		txn.poisoned = true
 		return fmt.Errorf("write transaction %q file %s: wrote %d/%d bytes: %w", txnID, stagedFile, n, len(data), func() error { if err != nil { return err }; return io.ErrShortWrite }())
 	}
-	if w.wal == nil {
-		if err := entry.file.Sync(); err != nil {
-			txn.poisoned = true
-			return fmt.Errorf("sync transaction %q file %s: %w", txnID, stagedFile, err)
-		}
-		if err := syncTxnParentChain(filepath.Dir(stagedFile), txn.stagingDir); err != nil {
-			txn.poisoned = true
-			return fmt.Errorf("sync transaction %q staged filename %s: %w", txnID, stagedFile, err)
-		}
-	}
 	return nil
 }
 
@@ -242,54 +214,7 @@ func (w *txnFileWriter) CommitTxn(txnID string) error {
 	if w.closed {
 		return fmt.Errorf("transactional file writer is closed")
 	}
-	txn := w.txnFiles[txnID]
-	if w.wal != nil {
-		return w.commitTxnWALLocked(txnID, txn)
-	}
-	if txn == nil {
-		// The server validates EndTxn state; empty transactions create no files.
-		return nil
-	}
-	if txn.poisoned {
-		return fmt.Errorf("transaction %q has a failed write and cannot be committed; abort it", txnID)
-	}
-	txn.committing = true
-	for name, entry := range txn.files {
-		if entry.closed {
-			continue
-		}
-		if err := entry.file.Sync(); err != nil {
-			return fmt.Errorf("sync transaction %q file %s: %w", txnID, name, err)
-		}
-		err := entry.file.Close()
-		entry.closed = true
-		if err != nil {
-			return fmt.Errorf("close transaction %q file %s: %w", txnID, name, err)
-		}
-	}
-
-	// The intent decision must only be recorded once all payloads and all
-	// nested directory entries are safely on disk.
-	if _, statErr := os.Lstat(txn.stagingDir); statErr == nil {
-		for name := range txn.files {
-			if err := syncTxnParentChain(filepath.Dir(name), txn.stagingDir); err != nil {
-				return fmt.Errorf("sync transaction %q directory tree: %w", txnID, err)
-			}
-		}
-		if err := writeTxnCommitIntent(txn.stagingDir, txnID); err != nil {
-			return fmt.Errorf("record durable commit intent for %q: %w", txnID, err)
-		}
-	} else if !os.IsNotExist(statErr) {
-		return fmt.Errorf("stat transaction %q staging directory: %w", txnID, statErr)
-	}
-
-	// Publishing the whole directory is atomic. A successful rename is not
-	// acknowledged until both affected parent directories are synchronized.
-	if err := renameTxnCommitted(txn.stagingDir, txn.committedDir); err != nil {
-		return fmt.Errorf("commit transaction %q: %w", txnID, err)
-	}
-	delete(w.txnFiles, txnID)
-	return nil
+	return w.commitTxnWALLocked(txnID, w.txnFiles[txnID])
 }
 
 func (w *txnFileWriter) AbortTxn(txnID string) error {
@@ -299,42 +224,7 @@ func (w *txnFileWriter) AbortTxn(txnID string) error {
 	if w.closed {
 		return fmt.Errorf("transactional file writer is closed")
 	}
-	txn := w.txnFiles[txnID]
-	if w.wal != nil {
-		return w.abortTxnWALLocked(txnID, txn)
-	}
-	if txn == nil {
-		return nil
-	}
-	// The intent marker is an irreversible commit decision. A failed
-	// directory rename must be retried/recovered; it cannot be aborted.
-	if _, markerErr := os.Lstat(txnIntentPath(txn.stagingDir)); markerErr == nil {
-		return fmt.Errorf("transaction %q has a durable commit intent; retry commit instead of aborting", txnID)
-	} else if !os.IsNotExist(markerErr) {
-		return fmt.Errorf("inspect commit intent for %q: %w", txnID, markerErr)
-	}
-	if _, sourceErr := os.Lstat(txn.stagingDir); os.IsNotExist(sourceErr) {
-		if _, destErr := os.Lstat(txn.committedDir); destErr == nil {
-			return fmt.Errorf("transaction %q is already committed; cannot abort", txnID)
-		}
-	}
-	for name, entry := range txn.files {
-		if !entry.closed {
-			err := entry.file.Close()
-			entry.closed = true
-			if err != nil {
-				return fmt.Errorf("close aborted transaction %q file %s: %w", txnID, name, err)
-			}
-		}
-	}
-	if err := os.RemoveAll(txn.stagingDir); err != nil {
-		return fmt.Errorf("remove transaction %q staging directory %s: %w", txnID, txn.stagingDir, err)
-	}
-	if err := syncTxnDirectory(filepath.Dir(txn.stagingDir)); err != nil {
-		return fmt.Errorf("persist aborted transaction %q removal: %w", txnID, err)
-	}
-	delete(w.txnFiles, txnID)
-	return nil
+	return w.abortTxnWALLocked(txnID, w.txnFiles[txnID])
 }
 
 func (w *txnFileWriter) Close() error {
@@ -353,18 +243,7 @@ func (w *txnFileWriter) Close() error {
 				}
 			}
 		}
-		// WAL staging is disposable. Legacy standalone writers must preserve
-		// a durable filesystem commit-intent directory across shutdown.
-		if w.wal == nil {
-			if _, err := os.Lstat(txnIntentPath(txn.stagingDir)); err == nil {
-			continue
-		} else if !os.IsNotExist(err) {
-			if firstErr == nil {
-				firstErr = err
-			}
-			continue
-			}
-		}
+		// Staging is disposable. Reconstruct decided commits on restart.
 		if err := os.RemoveAll(txn.stagingDir); err != nil && firstErr == nil {
 			firstErr = err
 		}
