@@ -3,7 +3,6 @@ package ksink
 import (
 	"crypto/rand"
 	"encoding/binary"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"hash/crc32"
@@ -546,21 +545,36 @@ func (l *TransactionLog) BindOutput(pattern string) error {
 // AppendOutput persists a message as the exact formatted bytes and relative
 // filename which must be reproduced after a crash. The coordinator must
 // already have journaled this transaction's active instance.
-func (l *TransactionLog) AppendOutput(txnID, instance, relative string, data []byte) error {
-	if !validTxnWALPath(relative) || !txnWALValidInstance(instance) {
-		return fmt.Errorf("invalid transaction WAL output destination")
-	}
+// AppendOutputs persists a whole MessagesEvent with one fsync. The caller
+// should pass exact formatted bytes and output paths. Frames are checked and
+// indexed only after the entire batch has become durable. The caller may
+// retry a failed batch only by aborting/reinitializing its transaction.
+func (l *TransactionLog) AppendOutputs(records []WALOutputRecord) error {
+	if len(records)==0{return nil}
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if l.binding == "" {
-		return errors.New("WAL output writer is not bound")
+	if l.broken!=nil{return l.broken}
+	if l.binding==""{return errors.New("WAL output writer is not bound")}
+	changes:=make([]transactionWALRecord,0,len(records))
+	for _,r:=range records {
+		if r.TransactionID=="" || !txnWALValidInstance(r.Instance) || !validTxnWALPath(r.Path){
+			return fmt.Errorf("invalid transaction WAL output destination")
+		}
+		st,exists:=l.state.States[r.TransactionID]
+		if !exists || !st.Active || st.Pending!="" || st.Instance!=r.Instance {
+			return fmt.Errorf("transaction %q is not an active WAL instance",r.TransactionID)
+		}
+		copied:=WALOutputRecord{TransactionID:r.TransactionID,Instance:r.Instance,Path:r.Path,Data:append([]byte(nil),r.Data...)}
+		changes=append(changes,transactionWALRecord{Type:"output",Output:&copied})
 	}
-	st, exists := l.state.States[txnID]
-	if !exists || !st.Active || st.Pending != "" || st.Instance != instance {
-		return fmt.Errorf("transaction %q is not an active WAL instance", txnID)
-	}
-	payload := WALOutputRecord{TransactionID: txnID, Instance: instance, Path: relative, Data: append([]byte(nil), data...)}
-	return l.appendLocked(transactionWALRecord{Type: "output", Output: &payload})
+	return l.appendBatchLocked(changes)
+}
+
+// AppendOutput is the single-record specialization of AppendOutputs.
+func (l *TransactionLog) AppendOutput(txnID,instance,relative string,data []byte) error {
+	return l.AppendOutputs([]WALOutputRecord{{
+		TransactionID:txnID,Instance:instance,Path:relative,Data:data,
+	}})
 }
 
 func (l *TransactionLog) Decision(txnID, instance string) string {
@@ -660,116 +674,6 @@ func (l *TransactionLog) RecoveryTransactions() []WALRecoveryTransaction {
 		})
 	}
 	return out
-}
-
-func writeTransactionWALFrame(file *os.File, rec transactionWALRecord) (int64, error) {
-	rec.Version = transactionWALVersion
-	raw, err := json.Marshal(rec)
-	if err != nil {
-		return 0, err
-	}
-	if len(raw) > transactionWALMaxFrame {
-		return 0, fmt.Errorf("WAL checkpoint record exceeds %d bytes", transactionWALMaxFrame)
-	}
-	var hdr [8]byte
-	binary.BigEndian.PutUint32(hdr[:4], uint32(len(raw)))
-	binary.BigEndian.PutUint32(hdr[4:], crc32.Checksum(raw, transactionWALCRCTable))
-	buf := append(hdr[:], raw...)
-	n, err := file.Write(buf)
-	if err == nil && n != len(buf) {
-		err = io.ErrShortWrite
-	}
-	return int64(n), err
-}
-
-// compactLocked replaces the WAL with a durable checkpoint. The checkpoint
-// contains producer states, the output binding, and only uncompleted payloads.
-func (l *TransactionLog) compactLocked() error {
-	temp := filepath.Join(l.dir, "transactions.wal.compacting")
-	file, err := os.OpenFile(temp, os.O_CREATE|os.O_TRUNC|os.O_RDWR, 0600)
-	if err != nil {
-		return err
-	}
-	fail := func(err error) error {
-		_ = file.Close()
-		return err
-	}
-	var total int64
-	var bindingBytes, stateBytes int64
-	newMarkerFrameBytes := make(map[string]int64)
-	newData := make(map[string][]walOutputLocation)
-	write := func(rec transactionWALRecord) error {
-		n, err := writeTransactionWALFrame(file, rec)
-		total += n
-		return err
-	}
-	if l.binding != "" {
-		start := total
-		if err := write(transactionWALRecord{Type: "binding", Binding: l.binding}); err != nil {
-			return fail(err)
-		}
-		bindingBytes = total - start
-	}
-	stateStart := total
-	if err := write(transactionWALRecord{Type: "state", State: &l.state}); err != nil {
-		return fail(err)
-	}
-	stateBytes = total - stateStart
-	for _, txn := range l.RecoveryTransactionsLocked() {
-		if txn.Published {
-			start := total
-			if err := write(transactionWALRecord{
-				Type: "published", TxnID: txn.TransactionID, Instance: txn.Instance,
-				HasOutput: txn.PublishedHasOutput,
-			}); err != nil {
-				return fail(err)
-			}
-			newMarkerFrameBytes[txn.Instance] = total - start
-		} else if txn.Aborted {
-			start := total
-			if err := write(transactionWALRecord{Type: "aborted", TxnID: txn.TransactionID, Instance: txn.Instance}); err != nil {
-				return fail(err)
-			}
-			newMarkerFrameBytes[txn.Instance] = total - start
-		} else {
-			for _, ref := range l.data[txn.Instance] {
-				record, err := readWALOutputAt(l.logFile, ref)
-				if err != nil {
-					return fail(err)
-				}
-				start := total
-				if err := write(transactionWALRecord{Type: "output", Output: &record}); err != nil {
-					return fail(err)
-				}
-				newData[txn.Instance] = append(newData[txn.Instance],
-					walOutputLocation{offset: start, size: total - start, meta: ref.meta})
-			}
-		}
-	}
-	if err := file.Sync(); err != nil {
-		return fail(err)
-	}
-	if err := os.Rename(temp, filepath.Join(l.dir, "transactions.wal")); err != nil {
-		return fail(err)
-	}
-	if err := txnSyncDirectory(l.dir); err != nil {
-		return fail(err)
-	}
-	if _, err := file.Seek(0, io.SeekEnd); err != nil {
-		return fail(err)
-	}
-	old := l.logFile
-	l.logFile = file
-	l.data = newData
-	l.size = total
-	l.reclaimable = 0
-	l.stateFrameBytes = stateBytes
-	l.bindingFrameBytes = bindingBytes
-	l.markerFrameBytes = newMarkerFrameBytes
-	if err := old.Close(); err != nil {
-		return err
-	}
-	return nil
 }
 
 func (l *TransactionLog) RecoveryTransactionsLocked() []WALRecoveryTransaction {
