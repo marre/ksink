@@ -33,6 +33,13 @@ type WALOutputRecord struct {
 	Data          []byte
 }
 
+// walOutputLocation references the authoritative payload in the WAL
+// without retaining message bodies in coordinator memory.
+type walOutputLocation struct {
+	offset int64
+	meta   WALOutputRecord // Data is always nil
+}
+
 // WALRecoveryTransaction describes the last instance of a producer for a
 // materializer. A commit decision is irreversible even if publishing failed.
 type WALRecoveryTransaction struct {
@@ -42,7 +49,7 @@ type WALRecoveryTransaction struct {
 	Published     bool
 	PublishedHasOutput bool
 	Aborted       bool
-	Records       []WALOutputRecord
+	Records       []WALOutputRecord // metadata only; read bytes through StreamOutput
 }
 
 type transactionWALRecord struct {
@@ -70,7 +77,7 @@ type TransactionLog struct {
 	broken    error
 	binding   string
 	state     txnStateSnapshot
-	data      map[string][]WALOutputRecord
+	data      map[string][]walOutputLocation
 	published map[string]bool
 	publishedHasOutput map[string]bool
 	aborted   map[string]bool
@@ -172,7 +179,7 @@ func OpenTransactionLog(path string) (*TransactionLog, error) {
 	log := &TransactionLog{
 		dir: dir, lockFile: lock, logFile: file,
 		state: txnStateSnapshot{Version: durableTxnStateVersion, States: make(map[string]storedTxnState)},
-		data: make(map[string][]WALOutputRecord),
+		data: make(map[string][]walOutputLocation),
 		published: make(map[string]bool),
 		publishedHasOutput: make(map[string]bool),
 		aborted: make(map[string]bool),
@@ -257,7 +264,7 @@ func (l *TransactionLog) load() error {
 		if err := json.Unmarshal(payload, &record); err != nil {
 			return fmt.Errorf("decode WAL record at %d: %w", offset, err)
 		}
-		if err := l.apply(record); err != nil {
+		if err := l.apply(record, offset); err != nil {
 			return fmt.Errorf("invalid WAL record at %d: %w", offset, err)
 		}
 		offset += int64(len(header)) + int64(length)
@@ -281,7 +288,7 @@ func (l *TransactionLog) load() error {
 	return err
 }
 
-func (l *TransactionLog) apply(rec transactionWALRecord) error {
+func (l *TransactionLog) apply(rec transactionWALRecord, frameOffset int64) error {
 	if rec.Version != transactionWALVersion {
 		return fmt.Errorf("unsupported WAL record version %d", rec.Version)
 	}
@@ -315,7 +322,10 @@ func (l *TransactionLog) apply(rec transactionWALRecord) error {
 		if l.published[rec.Output.Instance] || l.aborted[rec.Output.Instance] {
 			return fmt.Errorf("payload appended after completed transaction %s", rec.Output.Instance)
 		}
-		l.data[rec.Output.Instance] = append(l.data[rec.Output.Instance], *rec.Output)
+		metadata := *rec.Output
+		metadata.Data = nil
+		l.data[rec.Output.Instance] = append(l.data[rec.Output.Instance],
+			walOutputLocation{offset: frameOffset, meta: metadata})
 	case "published":
 		if rec.TxnID == "" || !txnWALValidInstance(rec.Instance) || l.aborted[rec.Instance] {
 			return fmt.Errorf("invalid WAL publication marker")
@@ -365,7 +375,7 @@ func (l *TransactionLog) appendLocked(rec transactionWALRecord) error {
 		l.broken = fmt.Errorf("transaction WAL append permanently failed: %w", err)
 		return l.broken
 	}
-	if err := l.apply(rec); err != nil {
+	if err := l.apply(rec, l.size); err != nil {
 		l.broken = fmt.Errorf("transaction WAL invariant failed: %w", err)
 		return l.broken
 	}
@@ -534,8 +544,7 @@ func (l *TransactionLog) RecoveryTransactions() []WALRecoveryTransaction {
 		records := l.data[st.Instance]
 		copied := make([]WALOutputRecord, len(records))
 		for i, r := range records {
-			r.Data = append([]byte(nil), r.Data...)
-			copied[i] = r
+			copied[i] = r.meta
 		}
 		out = append(out, WALRecoveryTransaction{
 			TransactionID: id, Instance: st.Instance, Decision: decision,
@@ -647,7 +656,14 @@ func (l *TransactionLog) RecoveryTransactionsLocked() []WALRecoveryTransaction {
 			TransactionID: id, Instance: st.Instance,
 			Published: l.published[st.Instance], PublishedHasOutput: l.publishedHasOutput[st.Instance],
 			Aborted: l.aborted[st.Instance],
-			Records: l.data[st.Instance],
+			Records: func() []WALOutputRecord {
+				refs := l.data[st.Instance]
+				out := make([]WALOutputRecord, len(refs))
+				for i, ref := range refs {
+					out[i] = ref.meta
+				}
+				return out
+			}(),
 		})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].TransactionID < out[j].TransactionID })
