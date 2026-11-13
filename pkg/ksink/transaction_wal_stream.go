@@ -1,84 +1,47 @@
 package ksink
 
 import (
-	"encoding/binary"
-	"encoding/json"
 	"fmt"
-	"hash/crc32"
-	"io"
 	"os"
-	"path/filepath"
 )
 
-// readWALOutputAt validates and reads one checksummed output frame by offset.
-// The active log file and compacted-out files are safe for concurrent ReadAt.
+// readWALOutputAt verifies a checksummed indexed output record and its
+// transaction identity before returning the exact formatted bytes.
 func readWALOutputAt(file *os.File, ref walOutputLocation) (WALOutputRecord, error) {
-	var header [8]byte
-	if _, err := file.ReadAt(header[:], ref.offset); err != nil {
-		return WALOutputRecord{}, fmt.Errorf("read WAL output header at %d: %w", ref.offset, err)
+	rec,n,err:=readTxnWALFrameAt(file,ref.offset)
+	if err!=nil{return WALOutputRecord{},fmt.Errorf("read WAL output at %d: %w",ref.offset,err)}
+	if int64(n)!=ref.size || rec.Type!="output" || rec.Output==nil {
+		return WALOutputRecord{},fmt.Errorf("invalid WAL output index at %d",ref.offset)
 	}
-	length := binary.BigEndian.Uint32(header[:4])
-	if length == 0 || length > transactionWALMaxFrame {
-		return WALOutputRecord{}, fmt.Errorf("invalid WAL output length at %d", ref.offset)
+	o:=*rec.Output
+	if o.TransactionID!=ref.meta.TransactionID || o.Instance!=ref.meta.Instance || o.Path!=ref.meta.Path {
+		return WALOutputRecord{},fmt.Errorf("WAL output index disagrees with payload at %d",ref.offset)
 	}
-	raw := make([]byte, length)
-	if _, err := file.ReadAt(raw, ref.offset+8); err != nil {
-		return WALOutputRecord{}, fmt.Errorf("read WAL output at %d: %w", ref.offset, err)
-	}
-	if crc32.Checksum(raw, transactionWALCRCTable) != binary.BigEndian.Uint32(header[4:]) {
-		return WALOutputRecord{}, fmt.Errorf("WAL output checksum mismatch at %d", ref.offset)
-	}
-	var record transactionWALRecord
-	if err := json.Unmarshal(raw, &record); err != nil {
-		return WALOutputRecord{}, fmt.Errorf("decode WAL output at %d: %w", ref.offset, err)
-	}
-	if record.Version != transactionWALVersion || record.Type != "output" || record.Output == nil {
-		return WALOutputRecord{}, fmt.Errorf("invalid WAL output record at %d", ref.offset)
-	}
-	payload := *record.Output
-	if payload.TransactionID != ref.meta.TransactionID || payload.Instance != ref.meta.Instance ||
-		payload.Path != ref.meta.Path {
-		return WALOutputRecord{}, fmt.Errorf("WAL output index disagrees with payload at %d", ref.offset)
-	}
-	return payload, nil
+	return o,nil
 }
 
-// StreamOutput reads a transaction's exact durable output bytes from its WAL
-// frames one record at a time. Only small offsets and paths are retained in
-// memory; the caller may write each payload directly to a staged output file.
-// Callbacks must not call the same TransactionLog.
+// StreamOutput reads bounded frames in transaction order. The WAL mutex is
+// held across the stream, including callbacks, to prevent compaction from
+// changing indexed file sets while data is being materialized. The callback
+// must never invoke this TransactionLog.
 func (l *TransactionLog) StreamOutput(instance string, consume func(WALOutputRecord) error) error {
 	l.mu.Lock()
-	if l.broken != nil {
-		err := l.broken
-		l.mu.Unlock()
-		return err
-	}
-	if l.logFile == nil {
-		l.mu.Unlock()
-		return fmt.Errorf("transaction log is closed")
-	}
-	refs := append([]walOutputLocation(nil), l.data[instance]...)
-	// After checkpoint rename, file.Name() still refers to the temporary
-	// pre-rename path. Always open the canonical WAL path instead.
-	reader, err := os.Open(filepath.Join(l.dir, "transactions.wal"))
-	l.mu.Unlock()
-	if err != nil {
-		return err
-	}
-	defer reader.Close() //nolint:errcheck
-	for _, ref := range refs {
-		record, err := readWALOutputAt(reader, ref)
-		if err != nil {
-			return err
+	defer l.mu.Unlock()
+	if l.broken!=nil{return l.broken}
+	if l.logFile==nil{return fmt.Errorf("transaction log is closed")}
+	readers:=make(map[walFileKey]*os.File)
+	defer func(){for _,file:=range readers{_ = file.Close()}}()
+	for _,ref:=range l.data[instance]{
+		file:=readers[ref.key]
+		if file==nil {
+			var err error
+			file,err=os.Open(l.walPath(ref.key))
+			if err!=nil{return fmt.Errorf("open WAL output segment: %w",err)}
+			readers[ref.key]=file
 		}
-		if err := consume(record); err != nil {
-			return err
-		}
+		output,err:=readWALOutputAt(file,ref)
+		if err!=nil{return err}
+		if err=consume(output);err!=nil{return err}
 	}
 	return nil
 }
-
-// Ensure os.File ReadAt is the only reader interface we need; no full
-// transaction payload is materialized in memory by the coordinator.
-var _ io.ReaderAt = (*os.File)(nil)
