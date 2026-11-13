@@ -657,6 +657,8 @@ func (l *TransactionLog) compactLocked() error {
 		return err
 	}
 	var total int64
+	var bindingBytes, stateBytes int64
+	newMarkerFrameBytes := make(map[string]int64)
 	newData := make(map[string][]walOutputLocation)
 	write := func(rec transactionWALRecord) error {
 		n, err := writeTransactionWALFrame(file, rec)
@@ -664,25 +666,33 @@ func (l *TransactionLog) compactLocked() error {
 		return err
 	}
 	if l.binding != "" {
+		start := total
 		if err := write(transactionWALRecord{Type: "binding", Binding: l.binding}); err != nil {
 			return fail(err)
 		}
+		bindingBytes = total - start
 	}
+	stateStart := total
 	if err := write(transactionWALRecord{Type: "state", State: &l.state}); err != nil {
 		return fail(err)
 	}
+	stateBytes = total - stateStart
 	for _, txn := range l.RecoveryTransactionsLocked() {
 		if txn.Published {
+			start := total
 			if err := write(transactionWALRecord{
 				Type: "published", TxnID: txn.TransactionID, Instance: txn.Instance,
 				HasOutput: txn.PublishedHasOutput,
 			}); err != nil {
 				return fail(err)
 			}
+			newMarkerFrameBytes[txn.Instance] = total - start
 		} else if txn.Aborted {
+			start := total
 			if err := write(transactionWALRecord{Type: "aborted", TxnID: txn.TransactionID, Instance: txn.Instance}); err != nil {
 				return fail(err)
 			}
+			newMarkerFrameBytes[txn.Instance] = total - start
 		} else {
 			for _, ref := range l.data[txn.Instance] {
 				record, err := readWALOutputAt(l.logFile, ref)
@@ -694,7 +704,7 @@ func (l *TransactionLog) compactLocked() error {
 					return fail(err)
 				}
 				newData[txn.Instance] = append(newData[txn.Instance],
-					walOutputLocation{offset: start, meta: ref.meta})
+					walOutputLocation{offset: start, size: total - start, meta: ref.meta})
 			}
 		}
 	}
@@ -714,6 +724,10 @@ func (l *TransactionLog) compactLocked() error {
 	l.logFile = file
 	l.data = newData
 	l.size = total
+	l.reclaimable = 0
+	l.stateFrameBytes = stateBytes
+	l.bindingFrameBytes = bindingBytes
+	l.markerFrameBytes = newMarkerFrameBytes
 	if err := old.Close(); err != nil {
 		return err
 	}
