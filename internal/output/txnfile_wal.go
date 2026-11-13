@@ -151,7 +151,7 @@ func (w *txnFileWriter) commitTxnWALLocked(id string, cached *txnDirectory) erro
 			return err
 		}
 	}
-	if err := w.publishFromWAL(txn); err != nil {
+	if err := w.publishFromWAL(txn, cached != nil); err != nil {
 		return err
 	}
 	delete(w.txnFiles, id)
@@ -182,7 +182,7 @@ func (w *txnFileWriter) validateWALStaging(txn ksink.WALRecoveryTransaction) err
 	return nil
 }
 
-func (w *txnFileWriter) publishFromWAL(txn ksink.WALRecoveryTransaction) error {
+func (w *txnFileWriter) publishFromWAL(txn ksink.WALRecoveryTransaction, useCachedStaging bool) error {
 	stage := filepath.Join(w.root, ".ksink-pending", txn.Instance)
 	final := filepath.Join(w.root, "committed", txn.Instance)
 
@@ -211,17 +211,20 @@ func (w *txnFileWriter) publishFromWAL(txn ksink.WALRecoveryTransaction) error {
 		return w.wal.MarkPublished(txn.TransactionID, txn.Instance)
 	}
 
-	if _, err := os.Lstat(stage); errors.Is(err, fs.ErrNotExist) {
+	if useCachedStaging {
+		// All cached files were verified byte-for-byte against the WAL and
+		// their handles were synced/closed by CommitTxn. Persist file names.
+		for _, rec := range txn.Records {
+			if err := syncTxnParentChain(filepath.Dir(filepath.Join(stage, rec.Path)), stage); err != nil {
+				return err
+			}
+		}
+	} else {
+		// After a crash, staged bytes cannot be trusted. Throw them away
+		// and reconstruct every byte from the authoritative WAL.
 		if err := w.rebuildWALStaging(txn); err != nil {
 			return err
 		}
-	} else if err != nil {
-		return fmt.Errorf("stat WAL staging %s: %w", stage, err)
-	}
-	// A staging cache exists, possibly after a process crash. It cannot be
-	// trusted; reconstruct it from the log for deterministic replay.
-	if err := w.rebuildWALStaging(txn); err != nil {
-		return err
 	}
 	if err := ensureWALMarker(stage, txn); err != nil {
 		return err
@@ -319,7 +322,7 @@ func (w *txnFileWriter) recoverFromWAL() error {
 	for _, txn := range w.wal.RecoveryTransactions() {
 		switch txn.Decision {
 		case "commit":
-			if err := w.publishFromWAL(txn); err != nil {
+			if err := w.publishFromWAL(txn, false); err != nil {
 				return fmt.Errorf("finish decided commit %s: %w", txn.TransactionID, err)
 			}
 		case "abort":
