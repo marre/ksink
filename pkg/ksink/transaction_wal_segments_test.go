@@ -64,8 +64,16 @@ func TestWALRotationAndWholeSegmentReclamation(t *testing.T) {
 		payloads=append(payloads,append([]byte(nil),o.Data...));return nil
 	}))
 	require.Len(t,payloads,8)
+	olderSegments:=append([]uint64(nil),wal.manifest.Segments...)
 	require.NoError(t,wal.MarkPublished("orders-producer",instance))
 	require.True(t,wal.Published(instance))
+	require.Less(t,len(wal.manifest.Segments),len(olderSegments),
+		"fully obsolete sealed segments must be removed without full checkpoint compaction")
+	for _,oldID:=range olderSegments[:len(olderSegments)-1]{
+		present:=false
+		for _,id:=range wal.manifest.Segments{if oldID==id{present=true}}
+		if !present{require.NoFileExists(t,wal.walPath(walFileKey{id:oldID}))}
+	}
 	for _,seg:=range wal.manifest.Segments {
 		require.FileExists(t,wal.walPath(walFileKey{id:seg}))
 	}
@@ -139,4 +147,59 @@ func TestWALMissingReferencedSealedSegmentFailsClosed(t *testing.T) {
 	require.NoError(t,os.Remove(old))
 	_,err:=OpenTransactionLog(filepath.Join(root,".ksink-kafka-state"))
 	require.ErrorContains(t,err,"required WAL segment")
+}
+
+
+func TestWALCrashAfterGCManifestSwap(t *testing.T) {
+	root:=t.TempDir()
+	wal,instance:=testOpenWALWithActiveTransaction(t,root)
+	wal.segmentLimit=512
+	for i:=0;i<6;i++{
+		require.NoError(t,wal.AppendOutput("orders-producer",instance,"out.bin",bytes.Repeat([]byte{byte(i)},120)))
+	}
+	state:=wal.CurrentState()
+	st:=state.States["orders-producer"]
+	st.Pending="commit"
+	state.States["orders-producer"]=st
+	require.NoError(t,wal.AppendState(state))
+	wal.faultHook=func(stage string)error{
+		if stage=="gc:manifest-synced"{return errors.New("power failure after GC manifest")}
+		return nil
+	}
+	err:=wal.MarkPublished("orders-producer",instance)
+	require.ErrorContains(t,err,"power failure after GC manifest")
+	require.NoError(t,wal.Close())
+
+	next,err:=OpenTransactionLog(filepath.Join(root,".ksink-kafka-state"))
+	require.NoError(t,err)
+	defer func(){_ = next.Close()}()
+	require.True(t,next.Published(instance),"committed marker survives interrupted old-segment deletion")
+	require.Empty(t,next.RecoveryTransactions()[0].Records)
+	require.NoError(t,next.Compact())
+	require.True(t,next.Published(instance))
+}
+
+func TestWALInterruptedPayloadFrameIsNotAccepted(t *testing.T) {
+	root:=t.TempDir()
+	wal,instance:=testOpenWALWithActiveTransaction(t,root)
+	before:=wal.size
+	path:=wal.walPath(wal.activeKey())
+	require.NoError(t,wal.Close())
+
+	buf,err:=txnWALFrame(transactionWALRecord{
+		Type:"output",
+		Output:&WALOutputRecord{TransactionID:"orders-producer",Instance:instance,Path:"partial.bin",Data:[]byte("never acknowledged")},
+	})
+	require.NoError(t,err)
+	f,err:=os.OpenFile(path,os.O_WRONLY|os.O_APPEND,0600)
+	require.NoError(t,err)
+	_,err=f.Write(buf[:len(buf)-4])
+	require.NoError(t,err)
+	require.NoError(t,f.Close())
+
+	next,err:=OpenTransactionLog(filepath.Join(root,".ksink-kafka-state"))
+	require.NoError(t,err)
+	defer func(){_ = next.Close()}()
+	require.Equal(t,before,next.size)
+	require.Empty(t,next.RecoveryTransactions()[0].Records)
 }
