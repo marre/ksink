@@ -126,9 +126,7 @@ func seedTxnProducerCounter() (int64, error) {
 	return int64(1<<60) | int64(binary.BigEndian.Uint64(seed[:])&((1<<60)-1)), nil
 }
 
-// OpenTransactionLog opens the WAL in an exclusive, durable state directory.
-// A pre-existing state.json from the obsolete PR #52 prototype is not
-// silently ignored; such a directory requires explicit migration.
+// OpenTransactionLog opens a WAL in an exclusively locked state directory.
 func OpenTransactionLog(path string) (*TransactionLog, error) {
 	dir, err := filepath.Abs(path)
 	if err != nil {
@@ -150,16 +148,6 @@ func OpenTransactionLog(path string) (*TransactionLog, error) {
 		_ = lock.Close()
 		return nil, err
 	}
-	if _, err := os.Stat(filepath.Join(dir, "state.json")); err == nil {
-		_ = unlockTxnStateFile(lock)
-		_ = lock.Close()
-		return nil, fmt.Errorf("legacy state.json found in %s; migration is required before enabling the WAL", dir)
-	} else if !errors.Is(err, fs.ErrNotExist) {
-		_ = unlockTxnStateFile(lock)
-		_ = lock.Close()
-		return nil, err
-	}
-
 	// A nonauthoritative bootstrap marker catches accidental deletion or
 	// truncation of an established WAL. Never silently initialize a new
 	// producer history alongside previously committed output.
