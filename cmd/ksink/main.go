@@ -217,7 +217,7 @@ func run(addr, dst, fmtName, fmtStr string, jsonB64Key, jsonB64Val bool, separat
 		}
 		w, err = output.NewHTTPWriter(dst, httpOpts, tlsCfg)
 	} else if transactional && dst != "-" {
-		w, err = output.NewTxnFileWriterWithLog(dst, txnLog)
+		w, err = output.NewTxnFileWriter(dst, txnLog)
 	} else {
 		if transactional && dst == "-" {
 			return fmt.Errorf("--transactional is not supported with stdout output")
@@ -236,7 +236,6 @@ func run(addr, dst, fmtName, fmtStr string, jsonB64Key, jsonB64Val bool, separat
 	srv, err := ksink.New(ksink.Config{
 		Address:             addr,
 		TransactionalWrite:  transactional,
-		TransactionStateDir: stateDir,
 	}, serverOpts...)
 	if err != nil {
 		return fmt.Errorf("failed to create server: %w", err)
