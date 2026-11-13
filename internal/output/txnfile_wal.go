@@ -347,5 +347,17 @@ func (w *txnFileWriter) recoverFromWAL() error {
 			return fmt.Errorf("unexpected WAL decision %q", txn.Decision)
 		}
 	}
+	// All recoverable staging is represented by the WAL. Never silently
+	// process or delete an unfamiliar directory from an older transaction
+	// implementation (or from another process). Require an explicit cleanup
+	// by the operator instead of inventing a commit/abort decision.
+	entries, err := os.ReadDir(filepath.Join(w.root, ".ksink-pending"))
+	if err != nil {
+		return fmt.Errorf("scan WAL staging directory: %w", err)
+	}
+	if len(entries) != 0 {
+		return fmt.Errorf("unrecognized staging entry %q is not recorded in the transaction WAL",
+			entries[0].Name())
+	}
 	return nil
 }
