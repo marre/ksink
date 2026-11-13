@@ -92,9 +92,6 @@ type TransactionLog struct {
 	// transaction data, and published/aborted output frames. It is
 	// reconstructed during replay and reset after a successful checkpoint.
 	reclaimable int64
-	stateFrameBytes int64
-	bindingFrameBytes int64
-	markerFrameBytes map[string]int64
 	// The manifest selects the authoritative physical WAL files. Kafka
 	// transaction outcomes remain exclusively inside their records.
 	manifest walManifest
@@ -174,7 +171,6 @@ func OpenTransactionLog(path string) (*TransactionLog, error) {
 		published:make(map[string]bool),
 		publishedHasOutput:make(map[string]bool),
 		aborted:make(map[string]bool),
-		markerFrameBytes:make(map[string]int64),
 		markerRefs:make(map[string]walFrameRef),
 		fileStats:make(map[walFileKey]*walFileStats),
 		segmentLimit:transactionWALSegmentBytes,
@@ -231,7 +227,6 @@ func (l *TransactionLog) resetReplay() {
 	l.aborted=make(map[string]bool)
 	l.fileStats=make(map[walFileKey]*walFileStats)
 	l.markerRefs=make(map[string]walFrameRef)
-	l.markerFrameBytes=make(map[string]int64)
 	l.stateRef=walFrameRef{}
 	l.bindingRef=walFrameRef{}
 	l.size=0
