@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"hash"
 	"io"
 	"io/fs"
 	"os"
@@ -160,19 +161,42 @@ func (w *txnFileWriter) commitTxnWALLocked(id string, cached *txnDirectory) erro
 
 func (w *txnFileWriter) validateWALStaging(txn ksink.WALRecoveryTransaction) error {
 	stage := filepath.Join(w.root, ".ksink-pending", txn.Instance)
-	expected := make(map[string][]byte)
-	for _, rec := range txn.Records {
-		expected[rec.Path] = append(expected[rec.Path], rec.Data...)
+	type expectedFile struct {
+		digest hash.Hash
+		size int64
 	}
-	for relative, data := range expected {
-		path := filepath.Join(stage, relative)
-		actual, err := os.ReadFile(path)
-		if err != nil {
-			return fmt.Errorf("verify staged WAL payload %s: %w", path, err)
+	expected := make(map[string]*expectedFile)
+	err := w.wal.StreamOutput(txn.Instance, func(rec ksink.WALOutputRecord) error {
+		if rec.TransactionID != txn.TransactionID || rec.Instance != txn.Instance {
+			return fmt.Errorf("WAL record belongs to a different transaction")
 		}
-		want := sha256.Sum256(data)
-		got := sha256.Sum256(actual)
-		if len(actual) != len(data) || got != want {
+		info := expected[rec.Path]
+		if info == nil {
+			info = &expectedFile{digest: sha256.New()}
+			expected[rec.Path] = info
+		}
+		_, _ = info.digest.Write(rec.Data)
+		info.size += int64(len(rec.Data))
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	for relative, want := range expected {
+		path := filepath.Join(stage, relative)
+		file, err := os.Open(path)
+		if err != nil {
+			return fmt.Errorf("verify staged WAL file %s: %w", path, err)
+		}
+		digest := sha256.New()
+		size, readErr := io.Copy(digest, file)
+		if closeErr := file.Close(); readErr == nil {
+			readErr = closeErr
+		}
+		if readErr != nil {
+			return fmt.Errorf("read staged WAL file %s: %w", path, readErr)
+		}
+		if size != want.size || !bytes.Equal(digest.Sum(nil), want.digest.Sum(nil)) {
 			return fmt.Errorf("staged WAL file differs from logged payload: %s", path)
 		}
 		if err := syncTxnParentChain(filepath.Dir(path), stage); err != nil {
@@ -249,7 +273,9 @@ func (w *txnFileWriter) rebuildWALStaging(txn ksink.WALRecoveryTransaction) erro
 	if err := syncTxnDirectory(filepath.Dir(stage)); err != nil {
 		return err
 	}
-	for _, rec := range txn.Records {
+	// This streams one bounded WAL frame at a time. Memory usage does not
+	// grow with the total payload size of an uncommitted transaction.
+	return w.wal.StreamOutput(txn.Instance, func(rec ksink.WALOutputRecord) error {
 		if rec.Instance != txn.Instance || rec.TransactionID != txn.TransactionID {
 			return fmt.Errorf("WAL record is associated with wrong transaction instance")
 		}
@@ -274,11 +300,8 @@ func (w *txnFileWriter) rebuildWALStaging(txn ksink.WALRecoveryTransaction) erro
 		if writeErr != nil {
 			return fmt.Errorf("rebuild WAL staged file %s: %w", path, writeErr)
 		}
-		if err := syncTxnParentChain(filepath.Dir(path), stage); err != nil {
-			return err
-		}
-	}
-	return nil
+		return syncTxnParentChain(filepath.Dir(path), stage)
+	})
 }
 
 func (w *txnFileWriter) abortTxnWALLocked(id string, cached *txnDirectory) error {
