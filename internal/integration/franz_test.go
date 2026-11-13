@@ -600,7 +600,10 @@ func TestFranzTransactionalFileCommit(t *testing.T) {
 	dir := t.TempDir()
 	pattern := filepath.Join(dir, "out-{txnID}.jsonl")
 
-	tw, err := output.NewTxnFileWriter(pattern)
+	wal, err := ksink.OpenTransactionLog(filepath.Join(dir, ".ksink-kafka-state"))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = wal.Close() })
+	tw, err := output.NewTxnFileWriterWithLog(pattern, wal)
 	require.NoError(t, err)
 	t.Cleanup(func() { tw.Close() }) //nolint:errcheck
 
@@ -612,7 +615,7 @@ func TestFranzTransactionalFileCommit(t *testing.T) {
 		Timeout:            5 * time.Second,
 		TransactionalWrite:  true,
 		TransactionStateDir: filepath.Join(dir, ".ksink-kafka-state"),
-	}, WithLogger(&integrationLogger{t}))
+	}, WithLogger(&integrationLogger{t}), ksink.WithTransactionLog(wal))
 	require.NoError(t, err)
 	require.NoError(t, srv.Start(context.Background()))
 	t.Cleanup(func() { srv.Close(context.Background()) }) //nolint:errcheck
