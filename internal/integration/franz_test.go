@@ -1435,11 +1435,20 @@ func startTxnReadLoop(t *testing.T, srv *Server, tw output.TransactionalWriter) 
 			var writeErr error
 			switch e := event.(type) {
 			case *ksink.MessagesEvent:
-				for _, msg := range e.Messages {
-					data := append([]byte(msg.Value), '\n')
-					if werr := tw.Write(data, msg); werr != nil {
-						writeErr = werr
-						break
+				formatted := make([][]byte, len(e.Messages))
+				for i, msg := range e.Messages {
+					formatted[i] = append([]byte(msg.Value), '\n')
+				}
+				if batchWriter, ok := tw.(interface {
+					WriteBatch([][]byte, []*ksink.Message) error
+				}); ok {
+					writeErr = batchWriter.WriteBatch(formatted, e.Messages)
+				} else {
+					for i, msg := range e.Messages {
+						if werr := tw.Write(formatted[i], msg); werr != nil {
+							writeErr = werr
+							break
+						}
 					}
 				}
 			case *ksink.TxnCommitEvent:
