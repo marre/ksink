@@ -61,8 +61,8 @@ func (l *TransactionLog) compactLocked() error {
 	l.manifest=m
 	old:=l.logFile
 	l.logFile=nextSegment
-	if err=l.failpoint("compact:manifest-synced");err!=nil{return err}
 	if err=old.Close();err!=nil{return err}
+	if err=l.failpoint("compact:manifest-synced");err!=nil{return err}
 	if err=l.load();err!=nil{return fmt.Errorf("replay freshly checkpointed WAL: %w",err)}
 	if err=l.cleanupOrphanWALFiles();err!=nil{return fmt.Errorf("remove replaced WAL files: %w",err)}
 	return nil
