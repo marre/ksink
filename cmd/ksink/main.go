@@ -266,16 +266,28 @@ func run(addr, dst, fmtName, fmtStr string, jsonB64Key, jsonB64Val bool, separat
 			var writeErr error
 			switch e := event.(type) {
 			case *ksink.MessagesEvent:
+				formatted := make([][]byte, 0, len(e.Messages))
 				for _, msg := range e.Messages {
 					data, err := fmtr.Format(msg)
 					if err != nil {
 						writeErr = fmt.Errorf("failed to format message: %w", err)
 						break
 					}
-
-					if err := w.Write(data, msg); err != nil {
-						writeErr = fmt.Errorf("failed to write message: %w", err)
-						break
+					formatted = append(formatted, data)
+				}
+				if writeErr == nil {
+					if batchWriter, ok := w.(interface {
+						WriteBatch([][]byte, []*ksink.Message) error
+					}); ok {
+						// One WAL fsync for all records in this Produce event.
+						writeErr = batchWriter.WriteBatch(formatted, e.Messages)
+					} else {
+						for i, msg := range e.Messages {
+							if err := w.Write(formatted[i], msg); err != nil {
+								writeErr = fmt.Errorf("failed to write message: %w", err)
+								break
+							}
+						}
 					}
 				}
 			case *ksink.TxnCommitEvent:
