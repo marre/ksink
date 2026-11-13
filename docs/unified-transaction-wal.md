@@ -2,10 +2,10 @@
 
 Status: implementation design, reviewed against restart, concurrency, and external API failure semantics.
 
-## Goals and compatibility
+## Requirements
 
 - One authoritative durable history for producer IDs/epochs, per-partition batch sequences, transaction instance IDs, serialized output bytes, and irreversible commit/abort decisions.
-- Preserve existing Kafka producer protocol, public `Read()` events and `AckFunc`, output formats and `{topic}`/`{partition}`/`{txnID}` routing, atomic committed directories, and nontransactional writers.
+- Support Kafka producer protocol, public `Read()` events and `AckFunc`, output formats, `{topic}`/`{partition}`/`{txnID}` routing, atomic committed directories, and nontransactional writers.
 - Successful Produce must not precede durability of accepted output bytes **and** the corresponding sequence checkpoint. Successful EndTxn must not precede durable publication and a recorded outcome.
 - Process crashes must never cause an irreversible commit to be discarded or a second committed transaction directory to be created.
 - No database or third-party storage engine.
@@ -46,9 +46,22 @@ Status: implementation design, reviewed against restart, concurrency, and extern
 - **Reusing old epoch after restart:** rejected. Epoch must advance on reinitialization, while completed EndTxn response-loss retries may be recognized using recorded outcomes.
 - **Advertising generic exactly-once guarantees:** rejected. The guarantees apply to the controlled filesystem materializer, not arbitrary user `Read()` side effects, consumer offsets, HTTP/S3, or malicious alteration of the committed directory.
 
-## Migration and limits
+## Storage format and limits
 
-The existing committed directory layout from PR #50 remains. The existing PR #51 file-only recovery path remains available for embedders not opting into the unified WAL; the CLI uses the unified path by default and first reconciles any pre-WAL staged directories. The previously proposed `.ksink-kafka-state/state.json` from unmerged PR #52 is intentionally replaced. Old committed directories are never rewritten. The WAL shares the output filesystem and assumes trustworthy local filesystem rename/fsync semantics. Disk exhaustion and unrecoverable corruption fail closed. Compaction and recovery should have dedicated tests.
+There is one supported transactional storage model: a shared WAL and
+its derived committed directories. In transactional mode the Kafka server
+requires `Config.TransactionStateDir` or `WithTransactionLog`; the
+filesystem writer requires the same WAL. No standalone commit-intent
+journal, alternate in-memory transaction coordinator, automatic
+migration from earlier storage layouts, or legacy file-writer
+constructor remains.
+
+The WAL must have reliable filesystem sync and rename semantics and
+exclusive ownership during startup, writes and recovery. Unrecognized
+staging entries fail startup rather than being deleted or silently
+recovered. Disk exhaustion and unrecoverable corruption fail closed.
+The WAL does not automatically roll back external side effects from
+arbitrary `Read()` consumers.
 
 ## Verification checklist
 
