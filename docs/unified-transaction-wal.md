@@ -12,14 +12,14 @@ Status: implementation design, reviewed against restart, concurrency, and extern
 
 ## Architecture
 
-1. A single exclusive owner opens a **versioned checksummed append-only WAL** under the transactional output root. One OS lock covers the WAL and its materialized filesystem output. A startup validation binds the WAL to its output pattern to avoid replay to the wrong destination.
+1. A single exclusive owner opens a **versioned checksummed append-only WAL** under the transactional output root. Independent exclusive locks protect the WAL directory and the filesystem output root during startup, writes, and recovery. A startup validation binds the WAL to its output pattern to avoid replay to the wrong destination.
 2. Records are length-framed and checksummed. Replay verifies complete records, rejects corruption and unknown versions, and truncates only a verifiably torn **trailing** record. Each record is flushed and fsynced before its associated Kafka acknowledgement. A failure makes the owner fail closed.
-3. State-changing Kafka requests journal compact producer/epoch/sequence/transaction-state updates in the WAL. Every transaction receives a persisted, collision-resistant instance ID at `AddPartitionsToTxn`.
+3. State-changing Kafka requests append coordinator-state checkpoints in the WAL before success responses (future delta encoding can reduce snapshot overhead). Every transaction receives a persisted, collision-resistant instance ID at `AddPartitionsToTxn`.
 4. The filesystem writer appends **formatted payload bytes and relative output paths** as WAL data records. Those bytes—not staging files or a mutable output-format configuration—are authoritative during replay. Stage files can be written incrementally as a cache for fast commits but are disposable.
 5. After all admitted Produce requests drain, EndTxn appends a durable `COMMIT` decision (or `ABORT`), before publishing or deleting output. An existing decision is immutable. A publish failure can only be retried or recovered; never turned into an abort.
 6. The materializer makes a complete private transaction directory from logged bytes, fsyncs its files/directories, publishes with a same-filesystem directory rename, fsyncs parents, then appends a durable publication outcome. A previously published directory is recognized by instance ID. EndTxn records its successful response outcome before sending it.
 7. Startup holds the exclusive lock and replays the WAL **before listening**. Incomplete transactions with no decision are discarded. Committed transactions are reconstructed and published idempotently; aborted transactions are cleaned. Only after successful reconciliation may old epochs be fenced and new producers admitted.
-8. WAL compaction uses a verified, fsynced checkpoint plus surviving undecided/decided-but-unpublished payloads, swapped atomically. Committed/aborted payloads can be reclaimed after their outcome is durably in the checkpoint. There are no independent coordinator snapshots or output commit-intent markers in the new WAL path.
+8. WAL compaction uses a verified, fsynced checkpoint plus surviving undecided/decided-but-unpublished payloads, swapped atomically. Payload frames are indexed by disk offsets and read one at a time rather than retained in coordinator memory. Committed/aborted payloads can be reclaimed after their outcome is durably in the checkpoint. There are no independent coordinator snapshots or output commit-intent markers in the new WAL path.
 
 ## Failure review (acceptance criteria)
 
