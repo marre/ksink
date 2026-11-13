@@ -140,7 +140,30 @@ func OpenTransactionLog(path string) (*TransactionLog, error) {
 		return nil, err
 	}
 
-	file, err := os.OpenFile(filepath.Join(dir, "transactions.wal"), os.O_CREATE|os.O_RDWR, 0600)
+	// A nonauthoritative bootstrap marker catches accidental deletion or
+	// truncation of an established WAL. Never silently initialize a new
+	// producer history alongside previously committed output.
+	bootstrap := filepath.Join(dir, ".ksink-wal-created")
+	_, bootErr := os.Lstat(bootstrap)
+	if bootErr != nil && !errors.Is(bootErr, fs.ErrNotExist) {
+		_ = unlockTxnStateFile(lock)
+		_ = lock.Close()
+		return nil, bootErr
+	}
+	walPath := filepath.Join(dir, "transactions.wal")
+	walInfo, walErr := os.Stat(walPath)
+	if bootErr == nil && (errors.Is(walErr, fs.ErrNotExist) ||
+		(walErr == nil && walInfo.Size() == 0)) {
+		_ = unlockTxnStateFile(lock)
+		_ = lock.Close()
+		return nil, fmt.Errorf("established transaction WAL is missing or empty; refusing to reset producer history")
+	}
+	if walErr != nil && !errors.Is(walErr, fs.ErrNotExist) {
+		_ = unlockTxnStateFile(lock)
+		_ = lock.Close()
+		return nil, walErr
+	}
+	file, err := os.OpenFile(walPath, os.O_CREATE|os.O_RDWR, 0600)
 	if err != nil {
 		_ = unlockTxnStateFile(lock)
 		_ = lock.Close()
@@ -172,6 +195,27 @@ func OpenTransactionLog(path string) (*TransactionLog, error) {
 		if err := log.AppendState(log.state); err != nil {
 			_ = log.Close()
 			return nil, err
+		}
+	}
+	if errors.Is(bootErr, fs.ErrNotExist) {
+		marker, err := os.OpenFile(bootstrap, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+		if err != nil {
+			_ = log.Close()
+			return nil, fmt.Errorf("create WAL bootstrap marker: %w", err)
+		}
+		_, err = marker.Write([]byte("ksink-wal-v1\n"))
+		if err == nil {
+			err = marker.Sync()
+		}
+		if closeErr := marker.Close(); err == nil {
+			err = closeErr
+		}
+		if err == nil {
+			err = txnSyncDirectory(dir)
+		}
+		if err != nil {
+			_ = log.Close()
+			return nil, fmt.Errorf("persist WAL bootstrap marker: %w", err)
 		}
 	}
 	return log, nil
