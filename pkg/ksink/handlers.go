@@ -165,6 +165,7 @@ func (s *Server) handleProduce(ctx context.Context, conn net.Conn, connID uint64
 	var txnProduceErr int16
 	var txnProducerID int64
 	var txnProducerEpoch int16
+	var txnInstance string
 	var txnProduceState *txnState
 	if txnID != "" && s.cfg.TransactionalWrite {
 		s.txnMu.Lock()
@@ -178,6 +179,7 @@ func (s *Server) handleProduce(ctx context.Context, conn net.Conn, connID uint64
 			txnProduceErr = kerr.InvalidTxnState.Code
 		default:
 			txnProducerID, txnProducerEpoch = st.producerID, st.epoch
+			txnInstance = st.instance
 			// Adding while holding txnMu is paired with EndTxn marking the
 			// state as ending under the same mutex before waiting.
 			st.inFlight.Add(1)
@@ -257,6 +259,7 @@ func (s *Server) handleProduce(ctx context.Context, conn net.Conn, connID uint64
 			if txnID != "" {
 				for _, msg := range batch {
 					msg.TransactionalID = txnID
+					msg.TransactionInstance = txnInstance
 				}
 			}
 			allMsgs = append(allMsgs, batch...)
@@ -639,6 +642,17 @@ func (s *Server) handleAddPartitionsToTxn(conn net.Conn, connID uint64, correlat
 		return s.sendResponse(conn, connID, correlationID, resp)
 	}
 	if !st.active {
+		instance, instanceErr := newTxnInstance(req.TransactionalID)
+		if instanceErr != nil {
+			s.txnMu.Unlock()
+			for ti := range resp.Topics {
+				for pi := range resp.Topics[ti].Partitions {
+					resp.Topics[ti].Partitions[pi].ErrorCode = kerr.UnknownServerError.Code
+				}
+			}
+			return s.sendResponse(conn, connID, correlationID, resp)
+		}
+		st.instance = instance
 		st.active = true
 		st.hasOutcome = false
 		st.pendingAction = ""
@@ -719,23 +733,37 @@ func (s *Server) handleEndTxn(ctx context.Context, conn net.Conn, connID uint64,
 		resp.ErrorCode = kerr.InvalidTxnState.Code
 		return s.sendResponse(conn, connID, correlationID, resp)
 	}
-	st.ending = true
-	st.pendingAction = action
-	if err := s.persistTxnStateLocked(); err != nil {
+	st.ending = true // fence new Produce before draining admitted requests
+	s.txnMu.Unlock()
+	st.inFlight.Wait()
+
+	s.txnMu.Lock()
+	// A failed Produce may have appended partial data to the WAL or staged
+	// files. Never commit it, even if the producer sends EndTxn(commit).
+	if req.Commit && st.needsResolution && st.pendingAction == "" {
 		st.ending = false
 		s.txnMu.Unlock()
-		s.logger.Errorf("[conn:%d] EndTxn: failed to persist transaction decision: %v", connID, err)
-		resp.ErrorCode = kerr.UnknownServerError.Code
+		resp.ErrorCode = kerr.InvalidTxnState.Code
 		return s.sendResponse(conn, connID, correlationID, resp)
 	}
+	if st.pendingAction == "" {
+		st.pendingAction = action
+		if err := s.persistTxnStateLocked(); err != nil {
+			st.ending = false
+			s.txnMu.Unlock()
+			s.logger.Errorf("[conn:%d] EndTxn: failed to persist decision: %v", connID, err)
+			resp.ErrorCode = kerr.UnknownServerError.Code
+			return s.sendResponse(conn, connID, correlationID, resp)
+		}
+	}
+	instance := st.instance
 	s.txnMu.Unlock()
-	st.inFlight.Wait() // do not publish commit ahead of accepted Produce events
 
 	var evt Event
 	if req.Commit {
-		evt = &TxnCommitEvent{TransactionalID: req.TransactionalID}
+		evt = &TxnCommitEvent{TransactionalID: req.TransactionalID, TransactionInstance: instance}
 	} else {
-		evt = &TxnAbortEvent{TransactionalID: req.TransactionalID}
+		evt = &TxnAbortEvent{TransactionalID: req.TransactionalID, TransactionInstance: instance}
 	}
 	err := s.deliverEvent(ctx, evt)
 
