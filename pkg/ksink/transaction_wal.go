@@ -204,7 +204,7 @@ func OpenTransactionLog(path string) (*TransactionLog, error) {
 			_ = log.Close()
 			return nil, fmt.Errorf("create WAL bootstrap marker: %w", err)
 		}
-		_, err = marker.Write([]byte("ksink-wal-v1\n"))
+		_, err = marker.Write([]byte("ksink-wal-v2\n"))
 		if err == nil {
 			err = marker.Sync()
 		}
@@ -718,7 +718,13 @@ func (l *TransactionLog) Compact() error {
 	if l.broken != nil {
 		return l.broken
 	}
-	return l.compactLocked()
+	if err := l.compactLocked(); err != nil {
+		// The checkpoint manifest may already be authoritative when a
+		// filesystem error is returned. Never append using stale indexes.
+		l.broken = fmt.Errorf("transaction WAL checkpoint outcome requires restart: %w", err)
+		return l.broken
+	}
+	return nil
 }
 
 // Close releases the exclusive WAL lock after all Kafka and writer handlers
