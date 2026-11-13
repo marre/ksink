@@ -276,9 +276,11 @@ atomic directory moves (test network-mounted filesystems separately).
 
 ### Unified transaction WAL and filesystem recovery
 
-The `ksink --transactional` CLI uses a **single durable append-only WAL**
-under `.ksink-kafka-state/transactions.wal` at the fixed output root.
-`--transaction-state-dir` selects a different location for this WAL.
+The `ksink --transactional` CLI uses a **single authoritative durable
+transaction WAL** under `.ksink-kafka-state/` at the fixed output root.
+Its atomic `manifest.json` selects numbered append-only files in
+`segments/` and an optional compacted checkpoint in `snapshots/`.
+`--transaction-state-dir` selects a different directory for this WAL.
 The WAL is the authoritative record of:
 
 - Producer IDs and epochs, per-partition batch sequences and deduplication
@@ -286,17 +288,27 @@ The WAL is the authoritative record of:
 - **Exact formatted message bytes** and their relative output paths.
 - Irreversible COMMIT/ABORT decisions and completed publication markers.
 
-WAL records are checksummed and length-framed. Each acknowledged state
-transition or payload append is synchronized to disk. An incomplete final
-record can be discarded during replay; an invalid complete record fails
-startup. Compaction uses an fsynced, atomically replaced checkpoint,
-retaining undecided or unpublished transaction data.
+WAL records are checksummed and length-framed. Message payloads use a
+versioned binary record encoding (no JSON/base64 amplification); small
+coordinator metadata remains JSON. Each acknowledged state transition
+or payload batch is synchronized to disk. The transactional CLI formats
+one `MessagesEvent` and appends all its records with **one fsync**.
+Incomplete active-tail records are discarded on replay; corrupt complete
+records and truncated sealed files fail startup.
+
+Segments rotate at a nominal 64 MiB. A physically obsolete sealed segment
+can be removed without rewriting the still-live segments, but only after
+an atomic, fsynced manifest change. Partial-space compaction creates an
+fsynced checkpoint and fresh append segment and publishes both through
+one atomic manifest replacement **before** deleting older files.
 
 **Space reclamation:** ksink tracks obsolete WAL record bytes (superseded
 coordinator snapshots, abandoned transactions, and published/aborted output).
-It compacts automatically once **at least 16 MiB is reclaimable** and those
-bytes make up **at least 25% of the current WAL**. Completion of a commit or
-abort checks this policy immediately, without waiting for another Produce.
+It runs full compaction when **at least 16 MiB is reclaimable** and those
+bytes make up **at least 25% of the current WAL**. Fully obsolete sealed
+segments can be reclaimed independently of that threshold. Completion
+of a commit or abort checks reclamation immediately, without waiting for
+another Produce.
 A large active transaction does not repeatedly trigger compaction merely
 because the total log exceeds a fixed size. The WAL can still exceed these
 thresholds while holding live transaction payloads; plan disk space for
@@ -336,9 +348,11 @@ writer and server. The `Read()` and `AckFunc` event model still
 delivers messages before commit; external application side effects
 remain the application's responsibility.
 
-**Storage format:** The WAL is the only transaction authority. No
-`state.json` snapshot or `.ksink-commit-intent` journal is read or
-migrated. On startup, an unfamiliar staging directory stops recovery
+**Storage format:** The WAL is the only transaction authority. Its manifest describes
+which physical segment and snapshot files are authoritative; it does
+not decide whether Kafka transactions commit or abort. No
+`state.json`, single-file `transactions.wal`, or `.ksink-commit-intent`
+layout is read or migrated. On startup, an unfamiliar staging directory stops recovery
 rather than being deleted or interpreted as a committed transaction.
 Start with a clean WAL/staging directory when switching from older
 transactional storage implementations.
@@ -354,8 +368,7 @@ broker or a blanket exactly-once guarantee. External deletion of published
 directories, failed storage, or corrupt complete WAL records fail closed.
 
 **Performance:** Data temporarily exists in the WAL and staged/committed
-output; replay and file regeneration add work after a crash. Syncing each
-accepted record and periodic checkpoint compaction trade throughput for
-durability. The log requires disk-space monitoring and sizing for peak
+output; replay and file regeneration add work after a crash. Syncing each batch or coordinator state transition and checkpoint
+compaction trade throughput for durability. The log requires disk-space monitoring and sizing for peak
 uncommitted transactions. Large transactions retain record offsets and relative paths in memory,
 while payloads are streamed from the WAL during replay.
