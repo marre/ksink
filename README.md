@@ -289,8 +289,18 @@ The WAL is the authoritative record of:
 WAL records are checksummed and length-framed. Each acknowledged state
 transition or payload append is synchronized to disk. An incomplete final
 record can be discarded during replay; an invalid complete record fails
-startup. Periodic compaction writes an fsynced, atomically replaced
-checkpoint, retaining undecided or unpublished transaction data.
+startup. Compaction uses an fsynced, atomically replaced checkpoint,
+retaining undecided or unpublished transaction data.
+
+**Space reclamation:** ksink tracks obsolete WAL record bytes (superseded
+coordinator snapshots, abandoned transactions, and published/aborted output).
+It compacts automatically once **at least 16 MiB is reclaimable** and those
+bytes make up **at least 25% of the current WAL**. Completion of a commit or
+abort checks this policy immediately, without waiting for another Produce.
+A large active transaction does not repeatedly trigger compaction merely
+because the total log exceeds a fixed size. The WAL can still exceed these
+thresholds while holding live transaction payloads; plan disk space for
+the largest pending transactions. No timed compaction is required.
 
 **Commit protocol:** first drain all accepted Produce requests, then append
 and synchronize a COMMIT decision. The writer validates/rebuilds staging
