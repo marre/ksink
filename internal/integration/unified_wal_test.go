@@ -197,6 +197,8 @@ func TestSharedWALRestartDiscardsUndecidedStaging(t *testing.T) {
 	newWriter, err := output.NewTxnFileWriterWithLog(pattern, newLog)
 	require.NoError(t, err)
 	defer func() { _ = newWriter.Close() }()
+	require.True(t, newLog.Aborted(instances[0].Instance),
+		"startup must mark undecided output as aborted so its WAL bytes are reclaimable")
 	pending, err := filepath.Glob(filepath.Join(root, ".ksink-pending", "undecided-*"))
 	require.NoError(t, err)
 	require.Empty(t, pending)
