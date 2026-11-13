@@ -423,18 +423,23 @@ func (s *Server) handleInitProducerId(ctx context.Context, conn net.Conn, connID
 					})
 				}
 				existing.ending = true
-				existing.pendingAction = "abort"
-				if err := s.persistTxnStateLocked(); err != nil {
-					existing.ending = false
-					s.txnMu.Unlock()
-					s.logger.Errorf("[conn:%d] InitProducerId: durable abort decision failed: %v", connID, err)
-					return s.sendResponse(conn, connID, correlationID, &kmsg.InitProducerIDResponse{
-						Version: apiVersion, ErrorCode: kerr.UnknownServerError.Code, ProducerID: -1,
-					})
-				}
 				s.txnMu.Unlock()
 				existing.inFlight.Wait()
-				err := s.deliverEvent(ctx, &TxnAbortEvent{TransactionalID: txnID})
+				s.txnMu.Lock()
+				if existing.pendingAction == "" {
+					existing.pendingAction = "abort"
+					if err := s.persistTxnStateLocked(); err != nil {
+						existing.ending = false
+						s.txnMu.Unlock()
+						s.logger.Errorf("[conn:%d] InitProducerId: durable abort decision failed: %v", connID, err)
+						return s.sendResponse(conn, connID, correlationID, &kmsg.InitProducerIDResponse{
+							Version: apiVersion, ErrorCode: kerr.UnknownServerError.Code, ProducerID: -1,
+						})
+					}
+				}
+				instance := existing.instance
+				s.txnMu.Unlock()
+				err := s.deliverEvent(ctx, &TxnAbortEvent{TransactionalID: txnID, TransactionInstance: instance})
 				s.txnMu.Lock()
 				existing.ending = false
 				if err != nil {
@@ -450,8 +455,14 @@ func (s *Server) handleInitProducerId(ctx context.Context, conn net.Conn, connID
 				existing.needsResolution = false
 				existing.hasOutcome = false
 			}
+			// A restart may have restored an irreversible decision without a
+			// corresponding materializer outcome. Never fence it away and
+			// start a new transaction: require operator recovery instead.
 			if existing.pendingAction != "" && existing.restartRequired {
-				s.logger.Warnf("[conn:%d] InitProducerId: prior EndTxn outcome for %s is unknown after restart; fencing old epoch", connID, txnID)
+				s.txnMu.Unlock()
+				return s.sendResponse(conn, connID, correlationID, &kmsg.InitProducerIDResponse{
+					Version: apiVersion, ErrorCode: kerr.ConcurrentTransactions.Code, ProducerID: -1,
+				})
 			}
 			if existing.epoch == math.MaxInt16 {
 				existing.producerID = s.producerIDCounter.Add(1)
