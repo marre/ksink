@@ -589,6 +589,7 @@ func (l *TransactionLog) compactLocked() error {
 		return err
 	}
 	var total int64
+	newData := make(map[string][]walOutputLocation)
 	write := func(rec transactionWALRecord) error {
 		n, err := writeTransactionWALFrame(file, rec)
 		total += n
@@ -615,11 +616,17 @@ func (l *TransactionLog) compactLocked() error {
 				return fail(err)
 			}
 		} else {
-			for _, data := range txn.Records {
-				rec := data
-				if err := write(transactionWALRecord{Type: "output", Output: &rec}); err != nil {
+			for _, ref := range l.data[txn.Instance] {
+				record, err := readWALOutputAt(l.logFile, ref)
+				if err != nil {
 					return fail(err)
 				}
+				start := total
+				if err := write(transactionWALRecord{Type: "output", Output: &record}); err != nil {
+					return fail(err)
+				}
+				newData[txn.Instance] = append(newData[txn.Instance],
+					walOutputLocation{offset: start, meta: ref.meta})
 			}
 		}
 	}
@@ -637,6 +644,7 @@ func (l *TransactionLog) compactLocked() error {
 	}
 	old := l.logFile
 	l.logFile = file
+	l.data = newData
 	l.size = total
 	if err := old.Close(); err != nil {
 		return err
