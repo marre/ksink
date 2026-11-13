@@ -28,9 +28,10 @@ func TestFranzSharedWALRecoversCommitBeforePublication(t *testing.T) {
 
 	srv, err := ksink.New(ksink.Config{
 		Address: "127.0.0.1:0", TransactionalWrite: true, Timeout: 3 * time.Second,
-	}, ksink.WithTransactionLog(wal))
+	}, ksink.WithTransactionLog(wal), ksink.WithLogger(&integrationLogger{t}))
 	require.NoError(t, err)
 	require.NoError(t, srv.Start(context.Background()))
+	waitForTCPReady(t, srv.Addr().String(), 5*time.Second)
 
 	readCtx, cancelRead := context.WithCancel(context.Background())
 	commitDecisionSeen := make(chan struct{}, 1)
@@ -49,6 +50,9 @@ func TestFranzSharedWALRecoversCommitBeforePublication(t *testing.T) {
 					if writeErr = writer.Write(append(append([]byte(nil), msg.Value...), '\n'), msg); writeErr != nil {
 						break
 					}
+				}
+				if writeErr != nil {
+					t.Logf("WAL materializer message error: %v", writeErr)
 				}
 				ack(writeErr)
 			case *ksink.TxnCommitEvent:
@@ -69,7 +73,7 @@ func TestFranzSharedWALRecoversCommitBeforePublication(t *testing.T) {
 	defer cancel()
 	client, err := kgo.NewClient(
 		kgo.SeedBrokers(srv.Addr().String()),
-		kgo.RequestTimeoutOverhead(2*time.Second),
+		kgo.RequestTimeoutOverhead(5*time.Second),
 		kgo.TransactionalID("decided-commit"),
 	)
 	require.NoError(t, err)
@@ -163,13 +167,15 @@ func TestSharedWALRestartDiscardsUndecidedStaging(t *testing.T) {
 	writer, err := output.NewTxnFileWriterWithLog(pattern, wal)
 	require.NoError(t, err)
 	srv, err := ksink.New(ksink.Config{Address: "127.0.0.1:0", TransactionalWrite: true},
-		ksink.WithTransactionLog(wal))
+		ksink.WithTransactionLog(wal), ksink.WithLogger(&integrationLogger{t}))
 	require.NoError(t, err)
 	require.NoError(t, srv.Start(context.Background()))
+	waitForTCPReady(t, srv.Addr().String(), 5*time.Second)
 	startTxnReadLoop(t, srv, writer)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	client, err := kgo.NewClient(kgo.SeedBrokers(srv.Addr().String()), kgo.TransactionalID("undecided"))
+	client, err := kgo.NewClient(kgo.SeedBrokers(srv.Addr().String()),
+		kgo.RequestTimeoutOverhead(5*time.Second), kgo.TransactionalID("undecided"))
 	require.NoError(t, err)
 	require.NoError(t, client.BeginTransaction())
 	results := client.ProduceSync(ctx, &kgo.Record{Topic: "orders", Value: []byte("never-committed")})
