@@ -346,5 +346,5 @@ directories, failed storage, or corrupt complete WAL records fail closed.
 output; replay and file regeneration add work after a crash. Syncing each
 accepted record and periodic checkpoint compaction trade throughput for
 durability. The log requires disk-space monitoring and sizing for peak
-uncommitted transactions. Large transactions currently retain replay
-records in memory until publication.
+uncommitted transactions. Large transactions retain record offsets and relative paths in memory,
+while payloads are streamed from the WAL during replay.
