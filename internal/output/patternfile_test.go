@@ -116,7 +116,7 @@ func TestPatternFileWriterRoutesByPartition(t *testing.T) {
   "orders-1.jsonl":"b\n",
   "events-0.jsonl":"d\n",
  } {
-  b, err := os.ReadFile(oneMatch(t,filepath.Join(dir,path)))
+  b, err := os.ReadFile(filepath.Join(dir,path))
   require.NoError(t,err)
   assert.Equal(t,want,string(b))
  }
