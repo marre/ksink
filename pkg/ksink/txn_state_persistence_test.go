@@ -3,6 +3,7 @@ package ksink
 import (
 	"context"
 	"encoding/binary"
+	"fmt"
 	"os"
 	"net"
 	"path/filepath"
@@ -181,7 +182,7 @@ func TestDurableTxnStateLockAndCorruption(t *testing.T) {
 
 	// Append a complete but corrupt frame: replay must fail closed rather
 	// than interpreting its payload as an unacknowledged torn tail.
-	walPath := filepath.Join(dir, "transactions.wal")
+	walPath := filepath.Join(dir, "segments", fmt.Sprintf("%020d.wal", reopened.txnLog.activeKey().id))
 	file, err := os.OpenFile(walPath, os.O_WRONLY|os.O_APPEND, 0600)
 	require.NoError(t, err)
 	header := make([]byte, 8)
