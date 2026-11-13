@@ -7,7 +7,6 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
-	"sort"
 )
 
 const (
@@ -213,10 +212,3 @@ func (l *TransactionLog) deleteFullyDeadSegmentsLocked() error {
 	return nil
 }
 
-// sortedManifestSegments is used for deterministic assertions and verifies
-// that manifest segments remain monotonically increasing.
-func sortedManifestSegments(v []uint64) []uint64 {
-	out:=append([]uint64(nil),v...)
-	sort.Slice(out,func(i,j int)bool{return out[i]<out[j]})
-	return out
-}
