@@ -43,8 +43,12 @@ func TestTransactionWALReplayAndBinding(t *testing.T) {
 	require.Equal(t, instance, transactions[0].Instance)
 	require.Empty(t, transactions[0].Decision)
 	require.Len(t, transactions[0].Records, 2)
-	require.Equal(t, []byte("first\n"), transactions[0].Records[0].Data)
-	require.Equal(t, []byte("second\n"), transactions[0].Records[1].Data)
+	var got []string
+	require.NoError(t, restarted.StreamOutput(instance, func(rec WALOutputRecord) error {
+		got = append(got, string(rec.Data))
+		return nil
+	}))
+	require.Equal(t, []string{"first\n", "second\n"}, got)
 
 	// Returned state is isolated from the authoritative log.
 	delete(state.States, "orders-producer")
@@ -100,7 +104,12 @@ func TestTransactionWALCheckpointPreservesUnpublishedPayload(t *testing.T) {
 	require.Equal(t, "commit", recovery[0].Decision)
 	require.False(t, recovery[0].Published)
 	require.Len(t, recovery[0].Records, 1)
-	require.Equal(t, data, recovery[0].Records[0].Data)
+	var replayed [][]byte
+	require.NoError(t, next.StreamOutput(instance, func(rec WALOutputRecord) error {
+		replayed = append(replayed, rec.Data)
+		return nil
+	}))
+	require.Equal(t, [][]byte{data}, replayed)
 }
 
 func TestTransactionWALTornTailTruncatedAndChecksumCorruptionRejected(t *testing.T) {
