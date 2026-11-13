@@ -325,22 +325,23 @@ state/output. A corrupted WAL or committed-directory identity mismatch
 stops startup rather than guessing a transaction outcome. The WAL is the
 source of truth; staging directories are only a cache.
 
-**Embedded library compatibility:** `pkg/ksink` users without
-`Config.TransactionStateDir` or `WithTransactionLog` retain the in-memory
-coordinator. `output.NewTxnFileWriter` retains its independent PR #51
-file-journal behavior for callers not using the shared log. To opt into
-the unified design, open `ksink.OpenTransactionLog`, pass it to
-`output.NewTxnFileWriterWithLog` and `ksink.WithTransactionLog`, and close
-it only after stopping both writer and server. The public `Read()` and
-`AckFunc` event model is preserved, including delivery of messages
-before commit.
+**Embedded transactional server:** Configure `Config.TransactionStateDir`
+to give `pkg/ksink` an exclusively owned durable WAL, or pass an already
+opened WAL through `ksink.WithTransactionLog`. An in-memory transactional
+coordinator is not supported. For filesystem output, open
+`ksink.OpenTransactionLog`, pass it to both
+`output.NewTxnFileWriter(pattern, wal)` and
+`ksink.WithTransactionLog(wal)`, and close the WAL after stopping the
+writer and server. The `Read()` and `AckFunc` event model still
+delivers messages before commit; external application side effects
+remain the application's responsibility.
 
-**Migration:** PR #52 replaces its earlier unmerged `state.json` snapshot
-prototype with `transactions.wal`. A pre-existing `state.json` is
-rejected rather than silently ignored. Existing flat files and committed
-transaction directories from PRs #50/#51 are not rewritten; the output
-layout remains unchanged. The writer reconciles pre-WAL filesystem commit
-markers on startup.
+**Storage format:** The WAL is the only transaction authority. No
+`state.json` snapshot or `.ksink-commit-intent` journal is read or
+migrated. On startup, an unfamiliar staging directory stops recovery
+rather than being deleted or interpreted as a committed transaction.
+Start with a clean WAL/staging directory when switching from older
+transactional storage implementations.
 
 **Limits:** Filesystem guarantees require durable file/parent-directory
 fsync and atomic same-filesystem directory rename. Crashes before a durable
