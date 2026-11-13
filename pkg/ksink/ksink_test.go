@@ -36,6 +36,16 @@ func TestConfigTransactionalWriteEnablesIdempotent(t *testing.T) {
 	assert.True(t, cfg.IdempotentWrite, "setDefaults must enable IdempotentWrite when TransactionalWrite is true")
 }
 
+func TestTransactionalServerRequiresDurableWAL(t *testing.T) {
+	_, err := New(Config{TransactionalWrite: true})
+	require.ErrorContains(t, err, "transactional writes require WithTransactionLog or TransactionStateDir")
+
+	// Ordinary nontransactional sinks do not need a transactional WAL.
+	srv, err := New(Config{Address: "127.0.0.1:0"})
+	require.NoError(t, err)
+	require.NoError(t, srv.Close(context.Background()))
+}
+
 func TestConfigDoesNotOverrideSet(t *testing.T) {
 	cfg := Config{
 		Address:         "127.0.0.1:1234",
