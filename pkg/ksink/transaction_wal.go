@@ -19,7 +19,12 @@ import (
 const (
 	transactionWALVersion = 1
 	transactionWALMaxFrame = 64 << 20
-	transactionWALCompactAt = 64 << 20
+	// Compact only when enough WAL bytes are obsolete AND reclaiming
+	// them would remove a meaningful fraction of the file. A 1 GiB
+	// active transaction must not be copied repeatedly for small state
+	// updates or a few completed transactions alongside it.
+	transactionWALMinReclaim = 16 << 20
+	transactionWALReclaimFraction = 4 // at least 25% of the WAL
 )
 
 var transactionWALCRCTable = crc32.MakeTable(crc32.Castagnoli)
@@ -37,6 +42,7 @@ type WALOutputRecord struct {
 // without retaining message bodies in coordinator memory.
 type walOutputLocation struct {
 	offset int64
+	size   int64 // full checksummed frame, including its header
 	meta   WALOutputRecord // Data is always nil
 }
 
@@ -82,6 +88,13 @@ type TransactionLog struct {
 	publishedHasOutput map[string]bool
 	aborted   map[string]bool
 	size      int64
+	// reclaimable counts superseded coordinator snapshots, abandoned
+	// transaction data, and published/aborted output frames. It is
+	// reconstructed during replay and reset after a successful checkpoint.
+	reclaimable int64
+	stateFrameBytes int64
+	bindingFrameBytes int64
+	markerFrameBytes map[string]int64
 }
 
 func txnWALValidInstance(instance string) bool {
@@ -183,6 +196,7 @@ func OpenTransactionLog(path string) (*TransactionLog, error) {
 		published: make(map[string]bool),
 		publishedHasOutput: make(map[string]bool),
 		aborted: make(map[string]bool),
+		markerFrameBytes: make(map[string]int64),
 	}
 	if err := txnSyncDirectory(dir); err != nil {
 		_ = log.Close()
@@ -264,7 +278,7 @@ func (l *TransactionLog) load() error {
 		if err := json.Unmarshal(payload, &record); err != nil {
 			return fmt.Errorf("decode WAL record at %d: %w", offset, err)
 		}
-		if err := l.apply(record, offset); err != nil {
+		if err := l.apply(record, offset, int64(len(header))+int64(length)); err != nil {
 			return fmt.Errorf("invalid WAL record at %d: %w", offset, err)
 		}
 		offset += int64(len(header)) + int64(length)
@@ -288,7 +302,7 @@ func (l *TransactionLog) load() error {
 	return err
 }
 
-func (l *TransactionLog) apply(rec transactionWALRecord, frameOffset int64) error {
+func (l *TransactionLog) apply(rec transactionWALRecord, frameOffset, frameBytes int64) error {
 	if rec.Version != transactionWALVersion {
 		return fmt.Errorf("unsupported WAL record version %d", rec.Version)
 	}
@@ -297,12 +311,25 @@ func (l *TransactionLog) apply(rec transactionWALRecord, frameOffset int64) erro
 		if rec.Binding == "" || (l.binding != "" && l.binding != rec.Binding) {
 			return fmt.Errorf("conflicting WAL output binding")
 		}
+		l.reclaimable += l.bindingFrameBytes
+		l.bindingFrameBytes = frameBytes
 		l.binding = rec.Binding
 	case "state":
 		if rec.State == nil || rec.State.Version != durableTxnStateVersion ||
 			rec.State.Counter <= 0 || len(rec.State.States) > maxTxnStates {
 			return fmt.Errorf("invalid coordinator state checkpoint")
 		}
+		// Producer IDs can start a new transaction with a new instance.
+		// References and markers from older instances are then obsolete
+		// even if no explicit commit was recorded for the old generation.
+		for id, old := range l.state.States {
+			next, exists := rec.State.States[id]
+			if !exists || (old.Instance != "" && old.Instance != next.Instance) {
+				l.discardInstanceLocked(old.Instance)
+			}
+		}
+		l.reclaimable += l.stateFrameBytes
+		l.stateFrameBytes = frameBytes
 		l.state = *rec.State
 		if l.state.States == nil {
 			l.state.States = make(map[string]storedTxnState)
@@ -325,24 +352,64 @@ func (l *TransactionLog) apply(rec transactionWALRecord, frameOffset int64) erro
 		metadata := *rec.Output
 		metadata.Data = nil
 		l.data[rec.Output.Instance] = append(l.data[rec.Output.Instance],
-			walOutputLocation{offset: frameOffset, meta: metadata})
+			walOutputLocation{offset: frameOffset, size: frameBytes, meta: metadata})
 	case "published":
 		if rec.TxnID == "" || !txnWALValidInstance(rec.Instance) || l.aborted[rec.Instance] {
 			return fmt.Errorf("invalid WAL publication marker")
 		}
 		l.published[rec.Instance] = true
 		l.publishedHasOutput[rec.Instance] = rec.HasOutput
-		delete(l.data, rec.Instance)
+		l.discardOutputLocked(rec.Instance)
+		l.reclaimable += l.markerFrameBytes[rec.Instance]
+		l.markerFrameBytes[rec.Instance] = frameBytes
 	case "aborted":
 		if rec.TxnID == "" || !txnWALValidInstance(rec.Instance) || l.published[rec.Instance] {
 			return fmt.Errorf("invalid WAL abort marker")
 		}
 		l.aborted[rec.Instance] = true
-		delete(l.data, rec.Instance)
+		l.discardOutputLocked(rec.Instance)
+		l.reclaimable += l.markerFrameBytes[rec.Instance]
+		l.markerFrameBytes[rec.Instance] = frameBytes
 	default:
 		return fmt.Errorf("unknown WAL record type %q", rec.Type)
 	}
 	return nil
+}
+
+// discardOutputLocked marks logged payload bytes as obsolete without having
+// to scan the complete WAL. Only per-instance frame locations are visited.
+func (l *TransactionLog) discardOutputLocked(instance string) {
+	for _, ref := range l.data[instance] {
+		l.reclaimable += ref.size
+	}
+	delete(l.data, instance)
+}
+
+func (l *TransactionLog) discardInstanceLocked(instance string) {
+	if instance == "" {
+		return
+	}
+	l.discardOutputLocked(instance)
+	l.reclaimable += l.markerFrameBytes[instance]
+	delete(l.markerFrameBytes, instance)
+	delete(l.published, instance)
+	delete(l.publishedHasOutput, instance)
+	delete(l.aborted, instance)
+}
+
+// shouldCompactWAL requires both a minimum absolute saving and a minimum
+// fraction of dead space; a large, live transaction alone is never enough.
+// The division form avoids multiplication overflow with very large logs.
+func shouldCompactWAL(size, reclaimable int64) bool {
+	return reclaimable >= transactionWALMinReclaim &&
+		reclaimable >= size/transactionWALReclaimFraction
+}
+
+func (l *TransactionLog) maybeCompactLocked() error {
+	if !shouldCompactWAL(l.size, l.reclaimable) {
+		return nil
+	}
+	return l.compactLocked()
 }
 
 func (l *TransactionLog) appendLocked(rec transactionWALRecord) error {
@@ -375,16 +442,17 @@ func (l *TransactionLog) appendLocked(rec transactionWALRecord) error {
 		l.broken = fmt.Errorf("transaction WAL append permanently failed: %w", err)
 		return l.broken
 	}
-	if err := l.apply(rec, l.size); err != nil {
+	if err := l.apply(rec, l.size, int64(len(full))); err != nil {
 		l.broken = fmt.Errorf("transaction WAL invariant failed: %w", err)
 		return l.broken
 	}
 	l.size += int64(len(full))
-	if l.size > transactionWALCompactAt {
-		if err := l.compactLocked(); err != nil {
-			l.broken = fmt.Errorf("transaction WAL compaction failed: %w", err)
-			return l.broken
-		}
+	// This also runs on publication/abort markers: immediately reclaim
+	// completed transaction payloads when the saving is significant,
+	// without waiting for another Produce or a timer.
+	if err := l.maybeCompactLocked(); err != nil {
+		l.broken = fmt.Errorf("transaction WAL compaction failed: %w", err)
+		return l.broken
 	}
 	return nil
 }
