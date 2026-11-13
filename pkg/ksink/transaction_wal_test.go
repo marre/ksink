@@ -145,3 +145,19 @@ func TestTransactionWALRejectsUndecidedPublicationAndBadOutputPath(t *testing.T)
 	require.NoError(t, wal.AppendOutput("orders-producer", instance, "safe.bin", []byte("x")))
 	require.ErrorContains(t, wal.MarkPublished("orders-producer", "another-instance"), "no durable commit decision")
 }
+
+func TestTransactionWALMissingEstablishedLogFailsClosed(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), ".ksink-kafka-state")
+	wal, err := OpenTransactionLog(dir)
+	require.NoError(t, err)
+	require.NoError(t, wal.Close())
+	walPath := filepath.Join(dir, "transactions.wal")
+	require.NoError(t, os.Remove(walPath))
+	_, err = OpenTransactionLog(dir)
+	require.ErrorContains(t, err, "established transaction WAL is missing")
+
+	// A zero-length replacement also cannot be mistaken for a fresh store.
+	require.NoError(t, os.WriteFile(walPath, nil, 0600))
+	_, err = OpenTransactionLog(dir)
+	require.ErrorContains(t, err, "established transaction WAL is missing or empty")
+}
