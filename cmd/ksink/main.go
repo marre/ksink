@@ -199,13 +199,25 @@ func run(addr, dst, fmtName, fmtStr string, jsonB64Key, jsonB64Val bool, separat
 
 	var w output.Writer
 	isHTTP := strings.HasPrefix(dst, "http://") || strings.HasPrefix(dst, "https://")
+	var txnLog *ksink.TransactionLog
+	if transactional && dst != "-" && !isHTTP {
+		if stateDir == "" {
+			stateDir = output.KafkaTransactionStateDir(dst)
+		}
+		var logErr error
+		txnLog, logErr = ksink.OpenTransactionLog(stateDir)
+		if logErr != nil {
+			return fmt.Errorf("open shared transaction WAL: %w", logErr)
+		}
+		defer txnLog.Close() //nolint:errcheck
+	}
 	if isHTTP {
 		if transactional {
 			return fmt.Errorf("--transactional is not supported with HTTP output")
 		}
 		w, err = output.NewHTTPWriter(dst, httpOpts, tlsCfg)
 	} else if transactional && dst != "-" {
-		w, err = output.NewTxnFileWriter(dst)
+		w, err = output.NewTxnFileWriterWithLog(dst, txnLog)
 	} else {
 		if transactional && dst == "-" {
 			return fmt.Errorf("--transactional is not supported with stdout output")
@@ -218,8 +230,8 @@ func run(addr, dst, fmtName, fmtStr string, jsonB64Key, jsonB64Val bool, separat
 	defer w.Close() //nolint:errcheck
 
 	serverOpts := []ksink.Option{ksink.WithLogger(stdLogger{})}
-	if transactional && stateDir == "" {
-		stateDir = output.KafkaTransactionStateDir(dst)
+	if txnLog != nil {
+		serverOpts = append(serverOpts, ksink.WithTransactionLog(txnLog))
 	}
 	srv, err := ksink.New(ksink.Config{
 		Address:             addr,
