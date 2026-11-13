@@ -360,13 +360,18 @@ func (w *txnFileWriter) recoverFromWAL() error {
 				return err
 			}
 		case "":
-			// No irreversible decision: the producer must reinitialize.
+			// No irreversible decision: discard staged output and record
+			// the recovery abort in the WAL. This releases the payloads
+			// for compaction even when a transactional ID is never reused.
 			stage := filepath.Join(w.root, ".ksink-pending", txn.Instance)
 			if err := os.RemoveAll(stage); err != nil {
 				return err
 			}
 			if err := syncTxnDirectory(filepath.Dir(stage)); err != nil {
 				return err
+			}
+			if err := w.wal.MarkAborted(txn.TransactionID, txn.Instance); err != nil {
+				return fmt.Errorf("record recovery abort for %q: %w", txn.TransactionID, err)
 			}
 		default:
 			return fmt.Errorf("unexpected WAL decision %q", txn.Decision)
