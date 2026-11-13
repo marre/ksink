@@ -335,18 +335,33 @@ func (l *TransactionLog) appendLocked(rec transactionWALRecord) error {
 	return nil
 }
 
+func cloneTxnStateSnapshot(src txnStateSnapshot) txnStateSnapshot {
+	out := txnStateSnapshot{
+		Version: src.Version, Counter: src.Counter,
+		States: make(map[string]storedTxnState, len(src.States)),
+	}
+	for key, state := range src.States {
+		state.Sequences = copyTxnSequences(state.Sequences)
+		out.States[key] = state
+	}
+	return out
+}
+
 // AppendState durably replaces the coordinator's logical state. It shares
-// ordering and fsync with output records and irreversible decisions.
+// ordering and fsync with output records and irreversible decisions. Deep
+// copying prevents in-memory server mutations from changing replay state
+// without having passed the WAL durability barrier.
 func (l *TransactionLog) AppendState(snapshot txnStateSnapshot) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	return l.appendLocked(transactionWALRecord{Type: "state", State: &snapshot})
+	copied := cloneTxnStateSnapshot(snapshot)
+	return l.appendLocked(transactionWALRecord{Type: "state", State: &copied})
 }
 
 func (l *TransactionLog) CurrentState() txnStateSnapshot {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	return l.state
+	return cloneTxnStateSnapshot(l.state)
 }
 
 // BindOutput prevents a restart under an unintended output pattern/root.
