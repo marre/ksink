@@ -10,7 +10,6 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
-	"strings"
 
 	"github.com/marre/ksink/pkg/ksink"
 )
@@ -18,35 +17,6 @@ import (
 // txnWALMarkerFile binds the published directory to the exact transaction
 // generation chosen and journaled by the Kafka coordinator.
 const txnWALMarkerFile = ".ksink-wal-instance"
-
-// NewTxnFileWriterWithLog uses the shared transaction WAL as the ONLY
-// authoritative state for commit/recovery. The caller owns the WAL and must
-// close it only after the writer and the Kafka server have stopped.
-//
-// The standalone NewTxnFileWriter remains available for existing embedders.
-// It uses the independent filesystem journal from PR #51.
-func NewTxnFileWriterWithLog(pattern string, log *ksink.TransactionLog) (TransactionalWriter, error) {
-	if log == nil {
-		return nil, fmt.Errorf("transaction WAL must not be nil")
-	}
-	if !strings.Contains(pattern, TxnIDPlaceholder) {
-		return nil, fmt.Errorf("transactional output pattern must contain %s", TxnIDPlaceholder)
-	}
-	if err := log.BindOutput(pattern); err != nil {
-		return nil, fmt.Errorf("bind transaction WAL to output: %w", err)
-	}
-	raw, err := NewTxnFileWriter(pattern)
-	if err != nil {
-		return nil, err
-	}
-	w := raw.(*txnFileWriter)
-	w.wal = log
-	if err := w.recoverFromWAL(); err != nil {
-		_ = w.Close()
-		return nil, fmt.Errorf("recover transaction output from WAL: %w", err)
-	}
-	return w, nil
-}
 
 func walTxnInstance(log *ksink.TransactionLog, id string) (ksink.WALRecoveryTransaction, error) {
 	for _, txn := range log.RecoveryTransactions() {
