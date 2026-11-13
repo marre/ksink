@@ -484,7 +484,7 @@ func (l *TransactionLog) MarkPublished(txnID, instance string) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	st, ok := l.state.States[txnID]
-	if !ok || st.Instance != instance || (st.Pending != "commit" && !(st.HasOutcome && st.LastCommit)) {
+	if !ok || st.Instance != instance || (st.Pending != "commit" && (!st.HasOutcome || !st.LastCommit)) {
 		return fmt.Errorf("no durable commit decision for %s/%s", txnID, instance)
 	}
 	if l.published[instance] {
