@@ -2,7 +2,6 @@ package output
 
 import (
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -140,71 +139,9 @@ func (w *txnFileWriter) newTransaction(txnID, instance string) (*txnDirectory, e
 	}, nil
 }
 
+// Write is the single-message form of WriteBatch.
 func (w *txnFileWriter) Write(data []byte, msg *ksink.Message) error {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-
-	if w.closed {
-		return fmt.Errorf("transactional file writer is closed")
-	}
-	if msg == nil || msg.TransactionalID == "" {
-		return fmt.Errorf("transactional file writer requires a TransactionalID on every message")
-	}
-	txnID := msg.TransactionalID
-	txn := w.txnFiles[txnID]
-	if txn != nil && txn.committing {
-		return fmt.Errorf("transaction %q has a pending commit; retry commit before writing", txnID)
-	}
-	if msg.TransactionInstance == "" {
-		return fmt.Errorf("transaction %q lacks a durable instance identifier", txnID)
-	}
-	if txn != nil && filepath.Base(txn.stagingDir) != msg.TransactionInstance {
-		return fmt.Errorf("transaction %q instance mismatch", txnID)
-	}
-	if txn != nil && txn.poisoned {
-		return fmt.Errorf("transaction %q had an earlier write failure; abort before writing", txnID)
-	}
-
-	resolved := w.resolvePath(txnID, msg.Topic, msg.Partition)
-	relative, err := filepath.Rel(w.root, resolved)
-	if err != nil || relative == ".." || filepath.IsAbs(relative) ||
-		strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
-		return fmt.Errorf("transaction output path %q escapes root %q", resolved, w.root)
-	}
-	if txn == nil {
-		txn, err = w.newTransaction(txnID, msg.TransactionInstance)
-		if err != nil {
-			return err
-		}
-		w.txnFiles[txnID] = txn
-	}
-	stagedFile := filepath.Join(txn.stagingDir, relative)
-	if err := w.wal.AppendOutput(txnID, msg.TransactionInstance, relative, data); err != nil {
-		txn.poisoned = true
-		return fmt.Errorf("persist transaction %q output in WAL: %w", txnID, err)
-	}
-	entry := txn.files[stagedFile]
-	if entry == nil {
-		if err := os.MkdirAll(filepath.Dir(stagedFile), 0700); err != nil {
-			txn.poisoned = true
-			return fmt.Errorf("prepare transaction file directory %s: %w", stagedFile, err)
-		}
-		f, err := os.OpenFile(stagedFile, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
-		if err != nil {
-			txn.poisoned = true
-			return fmt.Errorf("create transaction staged file %s: %w", stagedFile, err)
-		}
-		entry = &txnFileEntry{file: f}
-		txn.files[stagedFile] = entry
-	}
-	// A successful Produce acknowledgement means the staged payload and its
-	// filename are persisted. The producer may still need to replay an
-	// uncommitted transaction after a server restart.
-	if n, err := entry.file.Write(data); err != nil || n != len(data) {
-		txn.poisoned = true
-		return fmt.Errorf("write transaction %q file %s: wrote %d/%d bytes: %w", txnID, stagedFile, n, len(data), func() error { if err != nil { return err }; return io.ErrShortWrite }())
-	}
-	return nil
+	return w.WriteBatch([][]byte{data}, []*ksink.Message{msg})
 }
 
 func (w *txnFileWriter) CommitTxn(txnID string) error {
