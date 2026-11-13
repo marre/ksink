@@ -258,10 +258,10 @@ intentionally simplified:
 | Real Kafka behaviour | ksink API behaviour | ksink tool behaviour |
 |---|---|---|
 | Records written inside a transaction are invisible to `read_committed` consumers until commit. | Records are delivered to `Read` as `*MessagesEvent` immediately when produced. The `TransactionalID` field is populated so the consumer can buffer them. When the transaction ends, a `*TxnCommitEvent` or `*TxnAbortEvent` is delivered so the consumer can decide what to do. | Messages are staged in a private transaction directory. On commit the entire directory is renamed into `committed/` in one atomic filesystem operation; abort removes staging. Consumers must read only from `committed/`. |
-| The transaction coordinator tracks transaction state across broker restarts. | `TransactionStateDir` enables durable producer IDs, epochs, transaction outcomes and bounded per-partition record-batch deduplication across restarts. In-flight transactions are conservatively aborted and old producers must call `InitProducerID` again. | On writer startup, staged transactions **without** a durable commit intent are aborted, and transactions **with** an intent are finished idempotently. Committed directories survive restarts. |
+| The transaction coordinator tracks transaction state across broker restarts. | A shared transactional WAL persists producer IDs, epochs, record-batch sequence history and commit/abort decisions. In-flight transactions without a decision are abandoned on restart, and old producers must reinitialize. | The WAL also includes formatted payload bytes and output paths, so a committed directory can be reconstructed from the same authoritative decision. |
 | `sendOffsetsToTransaction` atomically commits consumer offsets with the transaction. | Not supported. ksink is a sink, not a full broker with consumer groups. | Not supported. |
 | Zombie fencing: restarting a producer with the same `transactional.id` aborts the old instance's pending transaction. | **Supported.** `InitProducerID` fences an in-flight producer after aborting it; after a process restart, an old epoch cannot start a new transaction without first reinitializing. Durable epoch fencing requires `TransactionStateDir`. | The old transaction's private staging directory is deleted on abort. |
-| Transactions can span multiple topic-partitions atomically. | All events for the same `transactional.id` share a transaction context while active. The durable coordinator records commit/abort decisions and outcomes but does not commit its journal atomically with the filesystem writer. | All files within one transaction directory are made visible together via one same-filesystem directory rename. The atomicity guarantee applies only to readers of `committed/`. |
+| Transactions can span multiple topic-partitions atomically. | All events for the same `transactional.id` share a durable instance ID and one irreversible WAL decision. | All files within one transaction directory are made visible together via one same-filesystem directory rename. The atomicity guarantee applies only to readers of `committed/`. |
 | Aborted records are never visible to `read_committed` consumers. | Aborted records were already delivered to `Read`. The `*TxnAbortEvent` signals the consumer to clean up, but application-level processing that happened before the abort is not rolled back. | The private staging directory is deleted on abort, so it never appears under `committed/`. |
 | `isolation.level` consumer configuration. | Not applicable — ksink does not implement the consumer protocol. | Not applicable. |
 
@@ -274,76 +274,77 @@ pattern determines the output root. A rename requires staging and committed
 directories on the **same filesystem**, with filesystem semantics supporting
 atomic directory moves (test network-mounted filesystems separately).
 
-### Filesystem recovery and durability
+### Unified transaction WAL and filesystem recovery
 
-The transactional filesystem writer maintains a **durable commit-intent
-journal** inside each staging directory. It synchronizes each accepted
-message to disk before acknowledging its write. On commit, it closes and
-synchronizes the payloads and subdirectories, writes and synchronizes
-`.ksink-commit-intent`, and publishes the complete directory using one
-same-filesystem rename. It synchronizes the affected parent directories
-before reporting commit success.
+The `ksink --transactional` CLI uses a **single durable append-only WAL**
+under `.ksink-kafka-state/transactions.wal` at the fixed output root.
+`--transaction-state-dir` selects a different location for this WAL.
+The WAL is the authoritative record of:
 
-On startup, ksink takes an exclusive OS-level lock on the output root and
-reconciles pending directories **before accepting new messages**:
+- Producer IDs and epochs, per-partition batch sequences and deduplication
+  history, active transaction instances and EndTxn outcomes.
+- **Exact formatted message bytes** and their relative output paths.
+- Irreversible COMMIT/ABORT decisions and completed publication markers.
 
-- No commit-intent marker: discard the uncommitted staging directory.
-- Valid commit-intent marker: finish publishing the transaction.
-- Corrupt marker or irreconcilable filesystem error: fail startup rather than
-  silently discard data.
+WAL records are checksummed and length-framed. Each acknowledged state
+transition or payload append is synchronized to disk. An incomplete final
+record can be discarded during replay; an invalid complete record fails
+startup. Periodic compaction writes an fsynced, atomically replaced
+checkpoint, retaining undecided or unpublished transaction data.
 
-**A commit intent is irreversible.** Once recorded, an aborted/failed
-directory publication must be retried or recovered, not rolled back. A
-successful directory rename is never rolled back. On graceful shutdown,
-uncommitted staging is cleaned; pending committed intents are preserved
-for recovery. One active writer process per output root is enforced by
-the lock file `.ksink-lock`. The marker is metadata, not a message file,
-and readers must ignore it.
+**Commit protocol:** first drain all accepted Produce requests, then append
+and synchronize a COMMIT decision. The writer validates/rebuilds staging
+from the WAL if necessary, synchronizes files and directory entries, and
+publishes the whole transaction directory with one same-filesystem rename.
+It synchronizes the rename parents and records a durable publication
+outcome before EndTxn can return success. Once COMMIT is decided, abort is
+not allowed. `committed/<transactional.id>-<nonce>/` directories have
+a `.ksink-wal-instance` metadata file identifying the WAL generation.
+Consumers should ignore this marker and read only the payload files.
 
-### Persistent Kafka transaction coordinator
+**Restart recovery runs before the Kafka socket accepts connections.**
+The materializer discards uncommitted staged files, replays WAL payloads
+for decided commits, and publishes each committed generation at most once.
+A rename already completed is recognized and finalized. The server
+then reconstructs producer state and resolves completed EndTxn outcomes.
+An old producer epoch must call `InitProducerID` again before new writes.
 
-The `ksink --transactional` filesystem tool now automatically stores
-Kafka coordinator state in `.ksink-kafka-state/` under the fixed output
-root. Override this with `--transaction-state-dir=/persistent/path`.
-When embedding `pkg/ksink`, set `Config.TransactionStateDir` explicitly;
-leaving it blank preserves legacy in-memory state.
+An exclusive WAL file lock and an independent filesystem output-root lock
+reject concurrent processes attempting to use the same transaction
+state/output. A corrupted WAL or committed-directory identity mismatch
+stops startup rather than guessing a transaction outcome. The WAL is the
+source of truth; staging directories are only a cache.
 
-The coordinator persists producer IDs, monotonic ID allocation, epochs,
-active transaction status, pending commit/abort decisions, acknowledged
-EndTxn outcomes and a bounded history of Kafka RecordBatch sequences per
-topic/partition. A recently acknowledged, byte-identical Produce retry is
-acknowledged without being delivered to the sink again. Out-of-order or
-conflicting producer sequences are rejected. The sequence history follows
-the producer epoch, not the transaction boundary.
+**Embedded library compatibility:** `pkg/ksink` users without
+`Config.TransactionStateDir` or `WithTransactionLog` retain the in-memory
+coordinator. `output.NewTxnFileWriter` retains its independent PR #51
+file-journal behavior for callers not using the shared log. To opt into
+the unified design, open `ksink.OpenTransactionLog`, pass it to
+`output.NewTxnFileWriterWithLog` and `ksink.WithTransactionLog`, and close
+it only after stopping both writer and server. The public `Read()` and
+`AckFunc` event model is preserved, including delivery of messages
+before commit.
 
-The coordinator synchronizes its snapshot before successful protocol
-responses and holds an exclusive file lock so another ksink server cannot
-use the same state directory concurrently. A failed snapshot write makes
-the running coordinator reject further state changes rather than
-acknowledge an undurable result.
+**Migration:** PR #52 replaces its earlier unmerged `state.json` snapshot
+prototype with `transactions.wal`. A pre-existing `state.json` is
+rejected rather than silently ignored. Existing flat files and committed
+transaction directories from PRs #50/#51 are not rewritten; the output
+layout remains unchanged. The writer reconciles pre-WAL filesystem commit
+markers on startup.
 
-**On restart, incomplete active transactions do not resume.** The file
-writer discards staged output without a durable commit intent, while
-the Kafka coordinator requires a fresh `InitProducerID` before accepting
-new transactions from an old producer. A previously acknowledged EndTxn
-outcome remains recognizable for a response-loss retry.
+**Limits:** Filesystem guarantees require durable file/parent-directory
+fsync and atomic same-filesystem directory rename. Crashes before a durable
+commit decision abort the in-flight transaction even if Produce was
+previously acknowledged; the producer must reinitialize and resend.
+Arbitrary application side effects performed through `Read()` are **not**
+rolled back, and consumer offsets and non-filesystem outputs are not
+included in the WAL's publication protocol. This is not a general Kafka
+broker or a blanket exactly-once guarantee. External deletion of published
+directories, failed storage, or corrupt complete WAL records fail closed.
 
-**Important remaining boundary:** the coordinator journal and the
-filesystem commit-intent journal are *different durable state stores*.
-If a crash happens after the sink has committed but before the Kafka
-coordinator saves the EndTxn outcome, that response remains ambiguous.
-The old epoch is fenced when the producer reinitializes; automatic
-cross-store resolution and strict exactly-once delivery require a
-shared transaction-instance identity and reconciliation protocol.
-Do not interpret this implementation as full Kafka EOS.
-
-Consumers must inspect only `committed/`. Durable behavior requires a
-filesystem honoring file/parent-directory fsync and same-filesystem
-atomic directory rename; unsupported filesystems fail instead of silently
-claiming durability. Non-transactional idempotent Producer requests do
-not yet use the transactional sequence-deduplication path.
-
-**Performance note:** each transactional write synchronizes its payload
-and directory path, and each acknowledged new record batch checkpoints the
-coordinator snapshot. This favors correctness over maximum throughput;
-batching and configurable durability policies can be considered later.
+**Performance:** Data temporarily exists in the WAL and staged/committed
+output; replay and file regeneration add work after a crash. Syncing each
+accepted record and periodic checkpoint compaction trade throughput for
+durability. The log requires disk-space monitoring and sizing for peak
+uncommitted transactions. Large transactions currently retain replay
+records in memory until publication.
