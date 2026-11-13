@@ -69,3 +69,54 @@ arbitrary `Read()` consumers.
 - Recovery tests for every crash boundary with exact output contents and no duplicate directory.
 - Integration tests with real Franz-go transactional clients, concurrent retries and startup fencing.
 - `go build ./...`, `go vet ./...`, `go test -race -count=1 ./...`, and lint on the PR head.
+
+
+## Segmented binary WAL implementation plan and crash review
+
+This revision replaces the single `transactions.wal` data file (no storage-format
+compatibility required). The WAL is still the **only transactional authority**.
+A small `manifest.json` selects physical files, *not* commit outcomes.
+
+- **Files:** `manifest.json` lists an optional compacted snapshot and ordered
+  numbered segments in `segments/`. Each segment is immutable after rotation;
+  the last segment accepts new frames. A checkpoint is a separately fsynced
+  `snapshots/<id>.wal` containing the current producer state, binding, completed
+  outcome markers, and all live payload records.
+- **Crash-safe rotation:** sync a new empty segment and its directory before
+  atomically publishing a fsynced manifest referring to it. Append to the new
+  segment only *after* manifest publication; a crash before publication leaves
+  an unreferenced empty file, never an acknowledged record.
+- **Reclamation:** track live and obsolete frame bytes by file. Remove fully
+  obsolete, sealed segments by first atomically publishing a manifest without
+  those segments and then deleting them. If mixed live/dead bytes remain above
+  the reclaimable threshold, write a fresh checkpoint with the live frames,
+  fsync the checkpoint and new append segment, then atomically swap the
+  manifest. Only after the manifest is synced may old files be removed.
+  Replaying the selected snapshot/segments must never silently accept a missing
+  referenced file.
+- **Binary output records:** outer length + CRC32C stays; a tagged,
+  length-validated binary payload stores transaction ID, instance, relative
+  output filename, and raw message bytes without JSON/base64 expansion.
+  Compact coordinator snapshots may remain JSON. The frame tag/version
+  rejects unknown formats.
+- **Batch durable appends:** `AppendOutputs` validates a whole batch under
+  the WAL mutex, writes bounded checksummed frames, performs **one fsync**,
+  then publishes the in-memory index and returns success. Filesystem staging
+  remains disposable; the CLI formats one `MessagesEvent` at a time and calls
+  `WriteBatch`. State transitions and COMMIT still use their own durability
+  barriers; no acknowledgement may overtake the batch fsync.
+- **Concurrency:** recovery, compaction, output streaming and appends hold the
+  WAL mutex while reading indexed offsets, so no stream can observe a file
+  after the manifest has replaced or deleted it.
+- **Failure boundaries:** incomplete append is rolled back to the last fully
+  checksummed record; corruption of an acknowledged complete record fails
+  closed. Inject failures before/after segment fsync, manifest publication,
+  checkpoint fsync, checkpoint publication, and old-file removal. After any
+  crash, replay must yield exactly the old durable state or the new one,
+  never an acknowledged commit without payloads or duplicated materialization.
+
+The manifest is a physical file-set selector; it cannot itself make a
+transaction COMMIT or ABORT. Atomic replacement is required for segment-set
+changes. A manifest failure causes startup to fail closed rather than
+inventing an empty log. Tested filesystems must provide durable file and
+parent-directory fsync plus same-filesystem atomic rename.
