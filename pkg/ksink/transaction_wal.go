@@ -413,6 +413,12 @@ func (l *TransactionLog) Published(instance string) bool {
 	return l.published[instance]
 }
 
+func (l *TransactionLog) Aborted(instance string) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.aborted[instance]
+}
+
 // MarkPublished is written only after the output directory and both parent
 // directories have been synced. It can be safely retried after a crash.
 func (l *TransactionLog) MarkPublished(txnID, instance string) error {
