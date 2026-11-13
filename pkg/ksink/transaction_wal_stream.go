@@ -7,6 +7,7 @@ import (
 	"hash/crc32"
 	"io"
 	"os"
+	"path/filepath"
 )
 
 // readWALOutputAt validates and reads one checksummed output frame by offset.
@@ -58,7 +59,9 @@ func (l *TransactionLog) StreamOutput(instance string, consume func(WALOutputRec
 		return fmt.Errorf("transaction log is closed")
 	}
 	refs := append([]walOutputLocation(nil), l.data[instance]...)
-	reader, err := os.Open(l.logFile.Name())
+	// After checkpoint rename, file.Name() still refers to the temporary
+	// pre-rename path. Always open the canonical WAL path instead.
+	reader, err := os.Open(filepath.Join(l.dir, "transactions.wal"))
 	l.mu.Unlock()
 	if err != nil {
 		return err
