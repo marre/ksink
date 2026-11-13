@@ -422,7 +422,7 @@ func TestTxnStateZombieFencing(t *testing.T) {
 	)
 	srv, err := New(Config{
 		Address:            "127.0.0.1:0",
-		TransactionalWrite: true,
+		TransactionalWrite: true, TransactionStateDir: t.TempDir(),
 		Timeout:            5 * time.Second,
 	}, WithLogger(&testLogger{t}))
 	require.NoError(t, err)
@@ -487,7 +487,7 @@ func TestTxnStateEpochBumpNoActiveTransaction(t *testing.T) {
 	)
 	srv, err := New(Config{
 		Address:            "127.0.0.1:0",
-		TransactionalWrite: true,
+		TransactionalWrite: true, TransactionStateDir: t.TempDir(),
 		Timeout:            5 * time.Second,
 	}, WithLogger(&testLogger{t}))
 	require.NoError(t, err)
@@ -541,7 +541,7 @@ func TestTxnStateEpochBumpNoActiveTransaction(t *testing.T) {
 func TestTxnStateInitialized(t *testing.T) {
 	srv, err := New(Config{
 		Address:            "127.0.0.1:0",
-		TransactionalWrite: true,
+		TransactionalWrite: true, TransactionStateDir: t.TempDir(),
 	})
 	require.NoError(t, err)
 	assert.NotNil(t, srv.txnStates, "txnStates map should be initialized")
@@ -553,7 +553,7 @@ func TestTxnStatesMaxSize(t *testing.T) {
 	// number of tracked IDs is reached.
 	srv, err := New(Config{
 		Address:            "127.0.0.1:0",
-		TransactionalWrite: true,
+		TransactionalWrite: true, TransactionStateDir: t.TempDir(),
 		Timeout:            5 * time.Second,
 	}, WithLogger(&testLogger{t}))
 	require.NoError(t, err)
