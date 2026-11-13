@@ -144,17 +144,15 @@ type Config struct {
 	// IdempotentWrite enables idempotent produce support.
 	IdempotentWrite bool
 
-	// TransactionalWrite enables fake transactional produce support.
-	// When enabled, the server accepts transactional protocol requests
-	// (AddPartitionsToTxn, EndTxn) but does not enforce transactional
-	// semantics. This implies IdempotentWrite.
+	// TransactionalWrite enables durable transactional Produce and EndTxn.
+	// It requires a shared WAL (WithTransactionLog) or TransactionStateDir
+	// and implies IdempotentWrite.
 	TransactionalWrite bool
 
-	// TransactionStateDir opens a durable transaction WAL for embedded
-	// server use. The transactional CLI opens one shared WAL also used by its
-	// filesystem writer. A blank value retains in-memory state for library
-	// clients that do not supply WithTransactionLog.
-	// Multiple servers must not share a state directory concurrently.
+	// TransactionStateDir opens the durable WAL for an embedded transactional
+	// server. The CLI supplies its shared log through WithTransactionLog.
+	// No transactional in-memory fallback exists; multiple servers cannot
+	// share the same WAL directory concurrently.
 	TransactionStateDir string
 }
 
@@ -310,6 +308,9 @@ func New(cfg Config, opts ...Option) (*Server, error) {
 
 	for _, opt := range opts {
 		opt(s)
+	}
+	if cfg.TransactionalWrite && s.txnLog == nil && cfg.TransactionStateDir == "" {
+		return nil, fmt.Errorf("transactional writes require WithTransactionLog or TransactionStateDir")
 	}
 
 	// Set up allowed topics
