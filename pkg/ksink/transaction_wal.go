@@ -181,6 +181,10 @@ func OpenTransactionLog(path string) (*TransactionLog, error) {
 	if err:=log.load();err!=nil{_ = log.Close();return nil,err}
 	if err:=log.cleanupOrphanWALFiles();err!=nil{_ = log.Close();return nil,err}
 	if log.state.Counter == 0 {
+		if bootErr == nil {
+			_ = log.Close()
+			return nil, fmt.Errorf("established transaction WAL has lost its producer state; refusing to reset history")
+		}
 		counter, err := seedTxnProducerCounter()
 		if err != nil {
 			_ = log.Close()
