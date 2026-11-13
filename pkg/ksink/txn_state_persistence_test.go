@@ -179,13 +179,23 @@ func TestDurableTxnStateLockAndCorruption(t *testing.T) {
 	reopened.txnMu.Unlock()
 	require.NoError(t, reopened.Close(context.Background()))
 
-	require.NoError(t, os.WriteFile(filepath.Join(dir, "state.json"), []byte("{broken"), 0600))
-	_, err = New(cfg)
-	require.ErrorContains(t, err, "decode coordinator state")
-	// Corrupted state is not silently replaced with a blank snapshot.
-	contents, err := os.ReadFile(filepath.Join(dir, "state.json"))
+	// Append a complete but corrupt frame: replay must fail closed rather
+	// than interpreting its payload as an unacknowledged torn tail.
+	walPath := filepath.Join(dir, "transactions.wal")
+	file, err := os.OpenFile(walPath, os.O_WRONLY|os.O_APPEND, 0600)
 	require.NoError(t, err)
-	require.Equal(t, "{broken", string(contents))
+	header := make([]byte, 8)
+	binary.BigEndian.PutUint32(header[:4], 3)
+	require.NoError(t, binary.Write(file, binary.BigEndian, header))
+	_, err = file.Write([]byte("bad"))
+	require.NoError(t, err)
+	require.NoError(t, file.Close())
+	_, err = New(cfg)
+	require.ErrorContains(t, err, "checksum mismatch")
+	// Neither the WAL nor the producer ID history may be discarded.
+	contents, err := os.ReadFile(walPath)
+	require.NoError(t, err)
+	require.Equal(t, []byte("bad"), contents[len(contents)-3:])
 }
 
 func TestDurableTxnSequenceSnapshotSurvivesRestart(t *testing.T) {
@@ -230,9 +240,9 @@ func TestDurableTxnSnapshotFailureFencesFurtherOperations(t *testing.T) {
 	srv, err := New(cfg)
 	require.NoError(t, err)
 	defer func() { _ = srv.Close(context.Background()) }()
-	// A directory at the temporary snapshot path prevents creating the
-	// next journal checkpoint. The store must fail closed.
-	require.NoError(t, os.Mkdir(filepath.Join(dir, "state.json.tmp"), 0700))
+	// Inject a hard append failure. The same running coordinator must
+	// remain poisoned rather than retrying after uncertain disk writes.
+	require.NoError(t, srv.txnLog.logFile.Close())
 	srv.txnMu.Lock()
 	srv.producerIDCounter.Add(1)
 	require.Error(t, srv.persistTxnStateLocked())
