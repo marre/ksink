@@ -36,6 +36,9 @@ func (w *txnFileWriter) WriteBatch(data [][]byte, messages []*ksink.Message) err
 		if msg==nil || msg.TransactionalID=="" || msg.TransactionInstance=="" {
 			return fmt.Errorf("transactional WAL requires a transaction ID and instance on every message")
 		}
+		if msg.Partition != 0 {
+			return fmt.Errorf("partition %d is unsupported: ksink only accepts partition 0", msg.Partition)
+		}
 		txn:=w.txnFiles[msg.TransactionalID]
 		if txn!=nil && (txn.committing || txn.poisoned || filepath.Base(txn.stagingDir)!=msg.TransactionInstance){
 			return fmt.Errorf("transaction %q cannot accept more output",msg.TransactionalID)
