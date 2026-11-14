@@ -64,6 +64,7 @@ type transactionWALRecord struct {
 	Binding  string
 	State    *txnStateSnapshot
 	Output   *WALOutputRecord
+	TopicOutput *WALTopicRecord
 	TxnID    string
 	Instance string
 	HasOutput bool
@@ -84,6 +85,10 @@ type TransactionLog struct {
 	binding   string
 	state     txnStateSnapshot
 	data      map[string][]walOutputLocation
+	// Logical topic/partition-0 streams share physical WAL segments but have
+	// independent append offsets and indexes.
+	topicRecords map[string][]walTopicLocation
+	topicNext map[string]int64
 	published map[string]bool
 	publishedHasOutput map[string]bool
 	aborted   map[string]bool
@@ -168,6 +173,8 @@ func OpenTransactionLog(path string) (*TransactionLog, error) {
 		dir:dir, lockFile:lock,
 		state:txnStateSnapshot{Version:durableTxnStateVersion,States:make(map[string]storedTxnState)},
 		data:make(map[string][]walOutputLocation),
+		topicRecords:make(map[string][]walTopicLocation),
+		topicNext:make(map[string]int64),
 		published:make(map[string]bool),
 		publishedHasOutput:make(map[string]bool),
 		aborted:make(map[string]bool),
@@ -222,6 +229,8 @@ func (l *TransactionLog) resetReplay() {
 	l.binding=""
 	l.state=txnStateSnapshot{Version:durableTxnStateVersion,States:make(map[string]storedTxnState)}
 	l.data=make(map[string][]walOutputLocation)
+	l.topicRecords=make(map[string][]walTopicLocation)
+	l.topicNext=make(map[string]int64)
 	l.published=make(map[string]bool)
 	l.publishedHasOutput=make(map[string]bool)
 	l.aborted=make(map[string]bool)
@@ -344,6 +353,21 @@ func (l *TransactionLog) apply(rec transactionWALRecord, frameOffset, frameBytes
 		metadata.Data = nil
 		l.data[rec.Output.Instance] = append(l.data[rec.Output.Instance],
 			walOutputLocation{key:source,offset: frameOffset, size: frameBytes, meta: metadata})
+	case "topic-output":
+		if rec.TopicOutput == nil || rec.TopicOutput.Topic == "" ||
+			len(rec.TopicOutput.Topic) > 249 || rec.TopicOutput.Offset < 0 ||
+			rec.TopicOutput.Offset != l.topicNext[rec.TopicOutput.Topic] ||
+			((rec.TopicOutput.TransactionID == "") != (rec.TopicOutput.Instance == "")) ||
+			(rec.TopicOutput.Instance != "" && !txnWALValidInstance(rec.TopicOutput.Instance)) {
+			return fmt.Errorf("invalid or out-of-order logical topic WAL record")
+		}
+		metadata := *rec.TopicOutput
+		metadata.Data = nil
+		topic := metadata.Topic
+		l.topicRecords[topic] = append(l.topicRecords[topic], walTopicLocation{
+			key:source, offset:frameOffset, size:frameBytes, meta:metadata,
+		})
+		l.topicNext[topic]++
 	case "published":
 		if rec.TxnID == "" || !txnWALValidInstance(rec.Instance) || l.aborted[rec.Instance] {
 			return fmt.Errorf("invalid WAL publication marker")
