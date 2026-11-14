@@ -74,7 +74,7 @@ func parseS3OrderedDestination(dst string) (bucket, pattern, root string, width 
         return "", "", "", 0, errors.New("invalid S3 bucket name")
     }
     for _, c := range u.Host {
-        if !((c>='a' && c<='z') || (c>='0' && c<='9') || c=='.' || c=='-') {
+        if (c<'a' || c>'z') && (c<'0' || c>'9') && c!='.' && c!='-' {
             return "", "", "", 0, errors.New("invalid S3 bucket name")
         }
     }
