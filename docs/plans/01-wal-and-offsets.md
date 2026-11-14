@@ -1,6 +1,6 @@
 # Phases 1–2: close WAL gaps and establish per-topic offsets
 
-Status: **plan, not implementation**. Chosen architecture: **one shared physical WAL** containing independent logical streams for **partition 0 of each topic**, plus coordinator and transaction-decision frames in that **same WAL**. See [roadmap](00-ordered-output-roadmap.md).
+Status: **plan with partial implementation underway**, not a completed storage redesign. Chosen architecture: **one shared physical WAL** containing independent logical streams for **partition 0 of each topic**, plus coordinator and transaction-decision frames in that **same WAL**. See [roadmap](00-ordered-output-roadmap.md).
 
 ## Current code facts and risks in PR #52
 
@@ -74,3 +74,9 @@ A process crash between record append and the shared WAL commit decision leaves 
 ## Gate
 
 Move on only when the shared WAL can replay a fully accepted multi-topic transaction and independent logical topic offset/dedup histories **without touching transaction output directories**. CI build, vet, race and lint must pass; fault-injection tests must cover coordinator decisions, each logical topic stream and their shared replay order.
+
+## Revalidated implementation status
+
+The new shared-WAL record version is **3**, with manifest version **2**; older unmerged WAL state is explicitly rejected. `AddPartitionsToTxn` persists sorted topic participants, and EndTxn allocates their Kafka control-marker offsets with the durable outcome in one WAL record. A read-committed per-topic cursor must skip marker offsets and aborted records, yet preserve their offsets as gaps. Snapshot compaction reconstructs payloads and markers in each topic's offset order. The new publication receipt API is independent per topic but **does not yet reclaim historical payloads**; keep it that way until the immutable file materializer, safe compaction and replay tests establish that all data needed by a blocked topic remains live.
+
+**Outstanding correctness review:** idempotent nontransactional producers still need deduplication equivalent to the transactional producer path, and WAL compaction must eventually encode durable next-offset counters even when older published payload frames are discarded. Neither is a prerequisite for testing an isolated writer, but both are required before the final merge.

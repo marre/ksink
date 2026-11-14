@@ -1,6 +1,6 @@
 # Phases 3–4: transaction decisions, read-committed visibility, ordered files
 
-Status: **implementation plan, not yet implemented**. Depends on [WAL/offsets](01-wal-and-offsets.md).
+Status: **partially implemented** (WAL participant, marker and publication primitives); actual ordered writer and cutover are not implemented. Depends on [WAL/offsets](01-wal-and-offsets.md).
 
 ## Goal and explicit scope
 
@@ -58,3 +58,9 @@ payments/0:  50 C("received")
 ## Exit gate
 
 The ordered materializer fully replaces per-transaction directories, and Kafka-compatible commit/abort responses and per-topic `read_committed` behavior remain recoverable under all tested crash boundaries.
+
+## Crash-window and deletion contract (revalidated)
+
+The shared WAL now stores per-topic `WALTopicProgress` cursors and receipt metadata, with explicit skip advances over aborted data and control markers. Checkpoint recovery preserves the **absolute** cursor and next file number; old receipts can be coalesced. This does **not** make publishing a filesystem rename and recording a WAL receipt one atomic operation. If a process crashes after a final filename appears but before the receipt is durable, it must compare the existing final file with WAL-derived expected bytes and record the receipt idempotently. If a consumer removes that file in the same window, the publisher cannot distinguish “processed and removed” from “never published.” The reader must checkpoint `(topic, fileSeq)` to deduplicate effects; without a reader acknowledgement protocol ksink should not promise end-to-end exactly-once processing. Never overwrite a preexisting final file with different bytes.
+
+**Next implementation stage:** introduce `OrderedTopicMaterializer`, operating exclusively on durable WAL records below the per-topic stable offset; it must skip aborted/control positions, finalise immutable files without replacement, verify the file's WAL-derived digest and append `RecordTopicFile` only after file and parent directory are durable. The current CLI remains on the transaction-directory writer until this and restart/failpoint tests pass. Safe WAL GC and producer idempotence completion follow, then filename/rotation cutover.

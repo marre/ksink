@@ -52,3 +52,11 @@ Every failpoint must assert one of two outcomes: the exact expected committed-on
 ## Delivery recommendation
 
 Build changes on the unmerged PR #52 branch in the dependency order from [roadmap](00-ordered-output-roadmap.md). Keep each stage separately reviewable and CI green. A failing or uncertain durability invariant blocks later stages. Merge only after complete protocol, output, crash and performance criteria are met; avoid merging the intermediate directory-based WAL layout.
+
+## Additional mandatory failure tests discovered during implementation
+
+- A rejected `RecordTopicFile` or `SkipTopicOffsets` attempt **must not poison the WAL**; preflight all semantic checks before a checksummed append, and independently revalidate at replay time.
+- Crash after multi-topic terminal decision fsync but before coordinator snapshot: recovering must preserve COMMIT and every enrolled topic marker, **never** incorrectly convert it to ABORT.
+- Control-marker offsets remain gaps in application output after checkpoint; later records must receive the correct next Kafka offset.
+- Crash after file finalization and before publication receipt, with the final file present: reconcile digest then commit receipt. Document the intrinsically ambiguous case where a reader has already consumed and removed that file without a read-side checkpoint/handshake.
+- WAL v2 manifest opened with WAL v3 code must fail without modifying acknowledged old state.

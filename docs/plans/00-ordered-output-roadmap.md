@@ -40,7 +40,7 @@ output/
 | **1. WAL correctness / lifecycle** | [01-wal-and-offsets.md](01-wal-and-offsets.md) | Durable record positions and outcomes in the shared WAL, generation retention through delayed publication, producer fencing and fail-closed tests |
 | **2. Logical topic streams and append offsets** | [01-wal-and-offsets.md](01-wal-and-offsets.md) | Independent topic offsets and producer dedup state indexed in one WAL; atomic WAL fsync barrier for multi-topic batches |
 | **3. Transaction resolution and stable-prefix reader** | [02-transactions-and-materializer.md](02-transactions-and-materializer.md) | One durable transaction decision, no cross-log protocol, per-topic read-committed gating |
-| **4. Ordered file materializer, remove transaction directories** | [02-transactions-and-materializer.md](02-transactions-and-materializer.md) | Per-topic publication cursor, immutable files and replay without duplication; old staging/commit directory code removed |
+| **4. Ordered file materializer, remove transaction directories** | [02-transactions-and-materializer.md](02-transactions-and-materializer.md) | WAL publication cursors/receipts are now present; implement actual crash-recoverable immutable file publication and remove old staging/commit directory code |
 | **5. Filename parameters and file rotation** | [03-filenames-and-rotation.md](03-filenames-and-rotation.md) | User-controlled per-topic file patterns, size/time rotation, finalized-file reader contract |
 | **6. Verification and merge gate** | [04-testing-rollout.md](04-testing-rollout.md) | Real clients, crash injection, race/load/retention tests, docs and rollout contract verified |
 
@@ -63,7 +63,7 @@ The output filenames are sorted **within one topic**, not across topics. `{seq}`
 1. No Produce success unless data and assigned Kafka-compatible positions/dedup result are durable; no EndTxn success unless the irreversible transaction decision is durable.
 2. Multi-topic commit is one logical durable outcome; no partial visibility of undecided/aborted transactions after reboot.
 3. At most one partition per topic. All records from a topic are read from completed files in ascending topic-offset order, with legitimate gaps for control/aborted records.
-4. File finalization and publication-cursor updates survive crashes without double output. A completed filename is immutable and verified before already-needed WAL bytes are reclaimed.
+4. File finalization and publication-cursor updates survive crashes without reusing a **durably receipted** filename. The writer must reconcile a final file after a crash but before its WAL receipt. A reader deleting that file in this window makes the outcome indistinguishable from no publication: end-to-end exactly-once external effects require a reader checkpoint/handshake, not just WAL durability.
 5. Shared WAL payloads stay live through compaction and GC until their output is provably and durably finalized; producer ID reuse must not destroy pending older generations.
 6. Slow materialization and unresolved transactions have bounded, observable backlog and an explicit backpressure/fail-closed policy.
 7. Existing acknowledged state is never silently reset. Changes in output pattern, codec version or directory layout cannot change replay interpretation.
@@ -75,3 +75,7 @@ The output filenames are sorted **within one topic**, not across topics. `{seq}`
 **Defaults chosen:** committed-only output, size rotation target 128 MiB, time rotation 1 minute, output pattern `data/{topic}/messages-{seq:08}.jsonl`, no rotation at transaction boundaries, independent per-topic file counters. Existing nontransactional backends remain supported.
 
 See [01](01-wal-and-offsets.md) through [04](04-testing-rollout.md) for detailed acceptance criteria.
+
+## Design validation checkpoint — November 14, 2026
+
+The intended single shared WAL remains appropriate. Implemented incrementally on PR #52: durable sorted participant enrollment, checksummed single-frame multi-topic transaction terminal decisions (including one Kafka control-marker offset per enrolled topic), independent topic stable offsets, replay-aware offsets/deduplication, WAL v3 format rejection of older manifests, and durable per-topic publication receipts with monotonic file numbers. The ordered filesystem materializer, retention GC, idempotent nontransactional producer semantics and size/time rotation are **not complete**. The PR intentionally remains draft.
