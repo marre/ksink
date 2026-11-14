@@ -48,6 +48,18 @@ func (l *TransactionLog) compactLocked() error {
 			}
 		}
 	}
+	// A transaction may be committed but still blocked behind an earlier
+	// unresolved offset. Its decision must survive producer identity reuse
+	// and WAL compaction independently of the current producer state.
+	decided := make([]string, 0, len(l.topicDecisions))
+	for instance := range l.topicDecisions { decided = append(decided, instance) }
+	sort.Strings(decided)
+	for _, instance := range decided {
+		if err := write(transactionWALRecord{
+			Type: "topic-decision", TxnID: l.topicDecisionOwners[instance],
+			Instance: instance, Decision: l.topicDecisions[instance],
+		}); err != nil { return failed(err) }
+	}
 	// Keep logical topic streams in the same authoritative checkpoint. In
 	// particular, their unmaterialized committed records must survive WAL
 	// compaction and producer transactional.id reuse.
