@@ -108,6 +108,17 @@ func (l *TransactionLog) compactLocked() error {
 		}
 		if err:=flushPending();err!=nil{return failed(err)}
 	}
+	// Preserve per-topic durable publication cursors and file sequences. The
+	// reader may have deleted historical finalized files; never recreate them.
+	pubTopics:=make([]string,0,len(l.topicProgress))
+	for topic:=range l.topicProgress { pubTopics=append(pubTopics,topic) }
+	sort.Strings(pubTopics)
+	for _,topic:=range pubTopics {
+		state:=l.topicProgress[topic]
+		if err:=write(transactionWALRecord{Type:"topic-progress",TopicProgress:&state});err!=nil {
+			return failed(err)
+		}
+	}
 	if err=f.Sync();err!=nil{return failed(fmt.Errorf("sync WAL checkpoint: %w",err))}
 	if err=f.Close();err!=nil{return err}
 	if err=txnSyncDirectory(filepath.Dir(snapshotPath));err!=nil{return err}

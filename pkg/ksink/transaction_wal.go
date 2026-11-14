@@ -70,6 +70,7 @@ type transactionWALRecord struct {
 	// marker offsets; no crash may observe only some participants.
 	TopicTerminal *walTopicTerminal
 	TopicMarker *walTopicMarker // checkpoint-only representation
+	TopicProgress *WALTopicProgress
 	Decision string
 	BatchCount int
 	TxnID    string
@@ -97,6 +98,8 @@ type TransactionLog struct {
 	topicRecords map[string][]walTopicLocation
 	topicMarkers map[string][]walTopicMarker
 	topicNext map[string]int64
+	topicProgress map[string]WALTopicProgress
+	topicProgressRefs map[string]walFrameRef
 	// Immutable decisions are keyed by transaction instance, not mutable
 	// transactional.id. Their history is retained until topic output is safe.
 	topicDecisions map[string]string
@@ -190,6 +193,8 @@ func OpenTransactionLog(path string) (*TransactionLog, error) {
 		topicRecords:make(map[string][]walTopicLocation),
 		topicMarkers:make(map[string][]walTopicMarker),
 		topicNext:make(map[string]int64),
+		topicProgress:make(map[string]WALTopicProgress),
+		topicProgressRefs:make(map[string]walFrameRef),
 		topicDecisions:make(map[string]string),
 		topicDecisionOwners:make(map[string]string),
 		topicDecisionRefs:make(map[string]walFrameRef),
@@ -251,6 +256,8 @@ func (l *TransactionLog) resetReplay() {
 	l.topicRecords=make(map[string][]walTopicLocation)
 	l.topicMarkers=make(map[string][]walTopicMarker)
 	l.topicNext=make(map[string]int64)
+	l.topicProgress=make(map[string]WALTopicProgress)
+	l.topicProgressRefs=make(map[string]walFrameRef)
 	l.topicDecisions=make(map[string]string)
 	l.topicDecisionOwners=make(map[string]string)
 	l.topicDecisionRefs=make(map[string]walFrameRef)
@@ -516,6 +523,8 @@ func (l *TransactionLog) apply(rec transactionWALRecord, frameOffset, frameBytes
 		l.topicMarkers[marker.Topic] = append(l.topicMarkers[marker.Topic], *marker)
 		l.topicNext[marker.Topic]++
 		// Checkpoint marker refs are kept until publication of that topic.
+	case "topic-progress":
+		return l.applyTopicProgress(rec.TopicProgress, frameBytes, source)
 	case "topic-decision":
 		if rec.TxnID == "" || !txnWALValidInstance(rec.Instance) ||
 			(rec.Decision != "commit" && rec.Decision != "abort") {
