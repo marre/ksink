@@ -69,9 +69,7 @@ instead of retrying output writes. The
 command waits for the worker to exit before forced shutdown flush; a flush
 failure is reported as an error, not a successful drain.
 
-Regression coverage includes a pre-existing conflicting final file causing
-the worker to fail, safe subsequent publication after recovery, an oversized
-single record, and file-number continuity across restart.
+Regression coverage includes a conflicting final file stopping the worker immediately, publication after the error is resolved, a simulated process restart after final-file creation but before its WAL receipt, oversized records, and file-number continuity across restart.
 
 **Remaining merge gate:** verify fatal WAL and output error propagation, restart recovery, and finish correctness/fault-injection tests. Disk-space reservation, backlog admission control, metrics and persisted rotation deadlines are explicitly excluded.
 
