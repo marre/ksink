@@ -1,6 +1,6 @@
 # Phase 6: verification, operational guardrails and merge readiness
 
-Status: **active release checklist**. WAL crash tests, race tests, and ordered output tests exist; disk pressure and extended soak are still open. Prerequisite: [ordered materializer](02-transactions-and-materializer.md) and [rotation](03-filenames-and-rotation.md).
+Status: **active release checklist**. WAL crash tests, race tests, and ordered output tests exist; fatal I/O failure recovery and extended soak remain open. Prerequisite: [ordered materializer](02-transactions-and-materializer.md) and [rotation](03-filenames-and-rotation.md).
 
 ## Protocol and semantics matrix
 
@@ -23,7 +23,7 @@ Status: **active release checklist**. WAL crash tests, race tests, and ordered o
 - **Coordinator:** after participant enrollment, after record-set validation, before/after durable COMMIT/ABORT state, response lost, epoch fence, timeout abort and restart.
 - **Shared WAL / logical topic streams:** frame write, fsync, segment rotation before/after manifest rename, partial active tail, checksum failure in sealed segment, checkpoint/GC with one topic blocked and another published, corrupt required file, limit overflow.
 - **Cross-topic transaction:** records from several topics fsynced in one shared WAL, then commit decision fsync; crash before/after the decision; one topic published and another pending; replay consistently recognizes one authoritative decision.
-- **Materializer:** read lease vs WAL GC; temp file create, write, sync, close; rename, parent sync, cursor receipt; crash each boundary; topic writer blocked by storage errors while others proceed.
+- **Materializer:** read lease vs WAL GC; temp file creation/write/sync, finalization, parent sync and receipt crashes. Output write errors must cause nonzero process termination; restart recovers durable records.
 - **Rotation:** size boundary, age boundary without new Produce, restart while active, shutdown flush, filename overflow, path collision, output rename conflict and output deletion after receipt. Verify deleted finalized files are never recreated/reused and the next sequence remains monotonic; no assumption of automatic loss recovery after consumer deletion.
 - **Corruption and operator errors:** missing manifest, unknown WAL/storage format, changed output path/formatter, swapped topic directories, checksum mismatch, unsupported filesystem, insufficient disk.
 
@@ -36,14 +36,14 @@ Every failpoint must assert one of two outcomes: the exact expected committed-on
 - Fuzz raw WAL codec, topic/path decoding and manifest parser for oversized lengths, integer rollover and invalid state transitions.
 - Benchmarks: Produce ack p50/p95/p99, coordinator commit latency, per-topic segment fsync frequency, allocation/lock contention, publisher throughput, file rotation overhead and backlog growth.
 - Long-running stress with 10+ concurrent topic streams, large unresolved transactions, forced crashes, concurrent WAL checkpoint and GC, repeated producer generation reuse and slow/failed disk publication.
-- Measured disk budget/backpressure and drain time under blocked topic; no unbounded memory growth.
+- Test disk-full WAL/output errors cause nonzero exit and preserve acknowledged data across restart. No admission-control/backpressure or metrics feature is required.
 - Verify read-only inspection and recovery diagnostics, low-volume timeout rotation, and clean shutdown.
 
 ## Documentation and compatibility gate
 
 - Update README with the designed one-partition limit, **one physical WAL with independent logical topic streams** as the storage model, committed-only semantics, cross-topic visibility caveat, and simple read-final-files example.
 - Replace examples referring to `committed/<txn-id>/` and old `{txnID}` patterns with `{topic}` and `{seq}` templates.
-- Document filenames and rotation defaults, atomic rename filesystem requirements, background publication/backpressure, WAL retention, recovery, failure states and output-directory deletion hazards.
+- Document filenames and rotation defaults, atomic rename filesystem requirements, fatal output/WAL write failures, WAL retention, recovery, failure states and output-directory deletion hazards.
 - Document compatibility: unmerged PR #52 old WAL version is intentionally incompatible; never silently reinitialize acknowledged previous state. Existing nontransactional backends unchanged.
 - Ensure no README/CLI claim suggests support for consumer group, Kafka Fetch API or global order across topics.
 - Confirm worktree diff and migration/removal checklist has no stale test/command/documentation references.
@@ -74,8 +74,11 @@ Regression coverage includes a pre-existing conflicting final file on one
 topic while another publishes, subsequent recovery of the blocked topic, an
 oversized single record, and file-number continuity across restart.
 
-**Not yet a completed merge gate:** disk-space reservation / bounded backlog
-admission control and prolonged real filesystem fault-injection testing. A
-durable WAL prevents acknowledgement of unsuccessful disk writes but does not
-by itself impose a finite backlog while output remains unavailable. Do not
-interpret passing CI as proof of those operational guarantees.
+**Remaining merge gate:** change the current retrying output worker to terminate on write failure, verify WAL and output error propagation and restart recovery, and finish correctness/fault-injection tests. Disk-space reservation, backlog admission control, metrics and persisted rotation deadlines are explicitly excluded.
+
+
+## Revised operating policy (November 2026)
+
+- **Fatal I/O:** any WAL or output write/sync/finalization failure must cause nonzero process termination; never acknowledge undurable data. Restart replays durable WAL and reconciles immutable output receipts. This policy is a requirement, not proof that all current code paths already enforce it.
+- **No metrics or backpressure feature:** no metrics endpoint, per-topic health metrics, configured disk budget or bounded-backlog admission control is required. Disk exhaustion is a fatal I/O failure.
+- **Rotation restart:** a process crash or restart may reset a pending in-memory time-rotation interval. Durable topic offsets, output cursors and file sequence numbers must not reset.
