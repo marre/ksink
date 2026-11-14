@@ -38,7 +38,7 @@ In the **same WAL**, coordinator frames store producer ID/epoch fencing, transac
 4. **Materializer:** each logical topic independently scans its stable readable prefix, consulting shared-WAL decisions. Emit committed or nontransactional records, skip aborted records. Earlier unresolved offsets block **only their own topic**.
 5. **Crash recovery:** replay the single selected WAL manifest; reconstruct every logical topic stream, producer dedup state, all outstanding transaction generations and each topic's output cursor. Never assume the last producer epoch's transaction is the only outstanding unpublished generation.
 
-A process crash between topic WAL append and coordinator decision leaves no visible committed record; replay must not reuse that topic offset incorrectly. Repeated produce requests must have specified lost-response behavior. Avoid needing a second fsync for every Produce unless correctness requires it; if necessary, first define and benchmark the cost.
+A process crash between record append and the shared WAL commit decision leaves no visible committed record; replay must not reuse that topic offset incorrectly. Repeated produce requests must have specified lost-response behavior. Avoid needing a second fsync for every Produce unless correctness requires it; if necessary, first define and benchmark the cost.
 
 ## Implementation tasks (dependency order)
 
@@ -58,10 +58,10 @@ A process crash between topic WAL append and coordinator decision leaves no visi
 - Cross-topic transaction with one missing/corrupt required **shared WAL segment** fails closed. No false commit and no data loss.
 - Exact retry after lost Produce response returns the same topic base offset, no extra records. Out-of-order producer sequence rejected.
 - Producer ID reused for new generation while older committed generation remains blocked; all older bytes still recover after checkpoint and GC.
-- Crash after manifest creation/rotation/checkpoint/fsync, partial active tail and corrupt sealed segment; deletion guard holds for every topic WAL.
+- Crash after manifest creation/rotation/checkpoint/fsync, partial active tail and corrupt sealed segment; deletion guard holds for the shared WAL.
 - Large backlog, many topics and concurrent materialization with bounded memory, fair locks and measured fsync rates.
 - No code path holds the shared WAL's write mutex across callback I/O to final output files.
 
 ## Gate
 
-Move on only when the shared WAL can replay a fully accepted multi-topic transaction and independent logical topic offset/dedup histories **without touching transaction output directories**. CI build, vet, race and lint must pass; fault-injection tests must cover both coordinator and topic journals.
+Move on only when the shared WAL can replay a fully accepted multi-topic transaction and independent logical topic offset/dedup histories **without touching transaction output directories**. CI build, vet, race and lint must pass; fault-injection tests must cover coordinator decisions, each logical topic stream and their shared replay order.
