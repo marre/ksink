@@ -8,6 +8,7 @@ Strengths worth retaining: checksum-framed binary output payloads, segmented WAL
 
 1. **No authoritative topic offset assignment.** `Message.Offset` originates in `parseRecords` from a synthetic fetch decode. `ProduceResponseTopicPartition` does not contain a meaningful assigned base offset. Need per-topic partition-0 offsets durable before Produce acknowledgement.
 2. **Producer state and payload are written separately.** `handleProduce` first delivers to filesystem writer (WAL), then calls `persistTxnStateLocked()` to journal dedup sequences. The new append protocol must define crash/response-loss behavior atomically; a duplicate batch must not allocate offsets or append again.
+   **Separate failure mode:** one fsynced batch of several physical WAL frames is not necessarily a replay-atomic unit. If a process dies after some complete frames but before the last frame / its producer dedup checkpoint, replay must ignore the uncommitted partial batch rather than treating it as accepted data. Specify explicit batch boundaries or a single atomic-acceptance record; test crash at every frame boundary and response-loss retry.
 3. **Publisher-dependent GC.** A `published` record makes all transaction output frames obsolete. Coordinator checkpoint replay can discard older instance references on transactional.id reuse. Both are wrong when output is delayed behind earlier unresolved records: retain all unmaterialized committed generations.
 4. **Latest-instance-only recovery.** `RecoveryTransactions()` iterates current producer states, not arbitrary outstanding older generations with committed-but-unpublished data.
 5. **Output paths are coupled to WAL payloads.** `WALOutputRecord` has `Path` and formatted `Data`; per-topic file names and rotation must be materializer decisions, while the WAL records logical topic + offset + deterministic payload.
@@ -43,7 +44,7 @@ A process crash between record append and the shared WAL commit decision leaves 
 ## Implementation tasks (dependency order)
 
 1. **Schema and ownership:** versioned shared-WAL records and in-memory `TopicStream` / `CoordinatorState` indexes; validate topic names, offset counters, producer IDs and participant references. Explicitly reject the old PR #52 WAL v2/transaction directory format; no silent migration.
-2. **Logical topic append and offsets:** one physical WAL, per-topic offset counters and indexed records; persist accepted batches, signatures and offset reservations atomically, with correct base-offset responses and no duplicate offset consumption. Confirm behavior for nontransactional records and Kafka control-marker offsets.
+2. **Logical topic append and offsets:** one physical WAL, per-topic offset counters and indexed records; persist accepted batches, signatures and offset reservations atomically, with explicit replay-visible batch completion barriers, correct base-offset responses and no duplicate offset consumption. Confirm behavior for nontransactional records and Kafka control-marker offsets.
 3. **Participant fencing and decision barrier:** transaction coordination serialized with producer writes and topic enrollment; COMMIT follows one shared WAL's existing durable record fsyncs. A decision must not depend on file output.
 4. **Replay and retention:** rebuild all outstanding generations and topic-offset ordered indexes; retain data through producer reuse; reject missing acknowledged data; safe shared-segment GC respecting **every topic** publisher cursor.
 5. **Reader API / lock design:** bounded offset-ordered WAL iterators with safe segment lifetimes; keep slow materializer disk writes outside producer/WAL mutexes; measure fairness and blocked startup cases.
@@ -56,7 +57,7 @@ A process crash between record append and the shared WAL commit decision leaves 
 - A/B/A interleaving on one topic; B commits before A; outputs remain offset ordered after A resolves.
 - One transaction spans `orders` and `payments`; neither topic emits until the **single** coordinator COMMIT is durable; crash at each topic-fsync, coordinator-fsync and decision-response boundary.
 - Cross-topic transaction with one missing/corrupt required **shared WAL segment** fails closed. No false commit and no data loss.
-- Exact retry after lost Produce response returns the same topic base offset, no extra records. Out-of-order producer sequence rejected.
+- Exact retry after lost Produce response returns the same topic base offset, no extra records. Out-of-order producer sequence rejected. Inject crashes after every *complete* output frame of a multi-record append and before/after its acceptance barrier; no partial replayed batch may be published.
 - Producer ID reused for new generation while older committed generation remains blocked; all older bytes still recover after checkpoint and GC.
 - Crash after manifest creation/rotation/checkpoint/fsync, partial active tail and corrupt sealed segment; deletion guard holds for the shared WAL.
 - Large backlog, many topics and concurrent materialization with bounded memory, fair locks and measured fsync rates.
