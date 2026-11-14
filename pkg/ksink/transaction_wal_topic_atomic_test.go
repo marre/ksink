@@ -2,6 +2,7 @@ package ksink
 
 import (
 	"fmt"
+	"os"
 	"path/filepath"
 	"testing"
 
@@ -283,4 +284,94 @@ func TestSharedWALRejectsEmptyFormattedRecordsBeforeAcknowledgement(t *testing.T
 	}},state,func(int,int64)([]byte,error){return []byte("nonempty"),nil})
 	require.NoError(t,err)
 	require.Equal(t,[]int64{0},offsets)
+}
+
+func TestSharedWALTornMultiTopicBatchDoesNotExposePartialRecords(t *testing.T) {
+	root:=t.TempDir()
+	wal,err:=OpenTransactionLog(filepath.Join(root,"state"))
+	require.NoError(t,err)
+	require.NoError(t,wal.BindOutput(filepath.Join(root,"{topic}","messages-{seq:08}.jsonl")))
+	_,err=wal.AppendTopicBatch([]WALTopicRecord{{Topic:"orders",Data:[]byte("before")}})
+	require.NoError(t,err)
+	// A complete, checksummed record frame is not a committed batch until
+	// the acceptance delimiter is durable. This frame belongs to an
+	// interrupted batch that would also have contained a payments record.
+	frame,err:=txnWALFrame(transactionWALRecord{Type:"topic-output",
+		TopicOutput:&WALTopicRecord{Topic:"orders",Offset:1,Data:[]byte("unaccepted")}})
+	require.NoError(t,err)
+	_,err=wal.logFile.Write(frame)
+	require.NoError(t,err)
+	require.NoError(t,wal.logFile.Sync())
+	require.NoError(t,wal.Close())
+	reopened,err:=OpenTransactionLog(filepath.Join(root,"state"))
+	require.NoError(t,err)
+	defer func(){_ = reopened.Close()}()
+	require.Equal(t,int64(1),reopened.NextTopicOffset("orders"))
+	require.Zero(t,reopened.NextTopicOffset("payments"))
+	_,found,err:=reopened.ReadTopicRecord("orders",1)
+	require.NoError(t,err)
+	require.False(t,found)
+	offsets,err:=reopened.AppendTopicBatch([]WALTopicRecord{
+		{Topic:"orders",Data:[]byte("accepted")},
+		{Topic:"payments",Data:[]byte("accepted")},
+	})
+	require.NoError(t,err)
+	require.Equal(t,[]int64{1,0},offsets)
+	require.NoError(t,reopened.Compact())
+}
+
+func TestSharedWALRejectsInvalidBatchWithoutConsumingAnyTopicOffset(t *testing.T) {
+	root:=t.TempDir()
+	wal,err:=OpenTransactionLog(filepath.Join(root,"state"))
+	require.NoError(t,err)
+	defer func(){_ = wal.Close()}()
+	require.NoError(t,wal.BindOutput(filepath.Join(root,"{topic}","messages-{seq:08}.jsonl")))
+	for _,bad:=range []WALTopicRecord{
+		{Topic:"",Data:[]byte("bad")},
+		{Topic:"payments"},
+		{Topic:"payments",TransactionID:"unknown",Instance:"invalid",Data:[]byte("bad")},
+	} {
+		_,err=wal.AppendTopicBatch([]WALTopicRecord{
+			{Topic:"orders",Data:[]byte("valid")},
+			bad,
+		})
+		require.Error(t,err)
+		require.Zero(t,wal.NextTopicOffset("orders"))
+		require.Zero(t,wal.NextTopicOffset("payments"))
+	}
+	offsets,err:=wal.AppendTopicBatch([]WALTopicRecord{
+		{Topic:"orders",Data:[]byte("valid")},
+		{Topic:"payments",Data:[]byte("valid")},
+	})
+	require.NoError(t,err)
+	require.Equal(t,[]int64{0,0},offsets)
+}
+
+func TestSharedWALCorruptAcceptedTopicPayloadFailsClosed(t *testing.T) {
+	root:=t.TempDir()
+	wal,err:=OpenTransactionLog(filepath.Join(root,"state"))
+	require.NoError(t,err)
+	require.NoError(t,wal.BindOutput(filepath.Join(root,"{topic}","messages-{seq:08}.jsonl")))
+	_,err=wal.AppendTopicBatch([]WALTopicRecord{{Topic:"orders",Data:[]byte("must-survive")}})
+	require.NoError(t,err)
+	path:=wal.walPath(wal.activeKey())
+	require.NoError(t,wal.Close())
+	raw,err:=os.ReadFile(path)
+	require.NoError(t,err)
+	needle:=[]byte("must-survive")
+	at:=-1
+	for i:=0;i+len(needle)<=len(raw);i++ {
+		if string(raw[i:i+len(needle)])==string(needle) {at=i;break}
+	}
+	require.NotEqual(t,-1,at)
+	raw[at]^=0x01
+	require.NoError(t,os.WriteFile(path,raw,0600))
+	reopened,err:=OpenTransactionLog(filepath.Join(root,"state"))
+	if err==nil {
+		defer func(){_ = reopened.Close()}()
+		rec,found,readErr:=reopened.ReadTopicRecord("orders",0)
+		require.Error(t,readErr,"corrupted acknowledged data must not be returned")
+		require.False(t,found)
+		require.Empty(t,rec.Data)
+	}
 }
