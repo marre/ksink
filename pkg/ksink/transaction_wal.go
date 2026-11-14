@@ -787,15 +787,25 @@ func (l *TransactionLog) BindOutput(pattern string) error {
 	if err != nil {
 		return err
 	}
+	return l.BindOutputIdentity(abs)
+}
+
+// BindOutputIdentity binds an opaque, canonical destination identity to WAL
+// state. Filesystem callers retain their original absolute-path identity;
+// S3 callers include endpoint, bucket and key pattern, not retry settings.
+func (l *TransactionLog) BindOutputIdentity(identity string) error {
+	if identity == "" {
+		return errors.New("empty transaction WAL output identity")
+	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if l.binding == abs {
+	if l.binding == identity {
 		return nil
 	}
 	if l.binding != "" {
-		return fmt.Errorf("transaction WAL output binding changed: %q != %q", l.binding, abs)
+		return fmt.Errorf("transaction WAL output binding changed: %q != %q", l.binding, identity)
 	}
-	return l.appendLocked(transactionWALRecord{Type: "binding", Binding: abs})
+	return l.appendLocked(transactionWALRecord{Type: "binding", Binding: identity})
 }
 
 // BindFormatter ensures that a restarted ordered writer uses the exact same
