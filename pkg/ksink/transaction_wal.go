@@ -395,6 +395,12 @@ func (l *TransactionLog) apply(rec transactionWALRecord, frameOffset, frameBytes
 				(st.Instance != "" && !txnWALValidInstance(st.Instance)) {
 				return fmt.Errorf("invalid persisted transaction %q", id)
 			}
+			for i, topic := range st.Topics {
+				if topic == "" || len(topic) > 249 ||
+					(i > 0 && topic <= st.Topics[i-1]) {
+					return fmt.Errorf("invalid or unsorted transaction participant in %q", id)
+				}
+			}
 			// The coordinator state itself is a fully checksummed atomic
 			// frame. It is already a durable COMMIT/ABORT decision if the
 			// separate history marker was interrupted before it was written.
@@ -625,6 +631,7 @@ func cloneTxnStateSnapshot(src txnStateSnapshot) txnStateSnapshot {
 	}
 	for key, state := range src.States {
 		state.Sequences = copyTxnSequences(state.Sequences)
+		state.Topics = append([]string(nil), state.Topics...)
 		out.States[key] = state
 	}
 	return out

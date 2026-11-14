@@ -35,6 +35,9 @@ type storedTxnState struct {
 	Pending    string
 	Instance   string
 	Sequences  map[string]txnPartitionSequence
+	// Topics is the durable participant set for this transaction generation.
+	// Every topic has exactly partition 0. Names are unique and sorted.
+	Topics []string
 }
 
 type txnStateSnapshot struct {
@@ -119,6 +122,7 @@ func (s *Server) txnSnapshotLocked() txnStateSnapshot {
 			ProducerID: st.producerID, Epoch: st.epoch, Active: st.active,
 			HasOutcome: st.hasOutcome, LastCommit: st.lastCommit,
 			Pending: st.pendingAction, Instance: st.instance, Sequences: st.sequences,
+			Topics: append([]string(nil), st.topics...),
 		}
 	}
 	return snapshot
@@ -169,6 +173,7 @@ func (s *Server) initializeTxnState() error {
 			producerID: old.ProducerID, epoch: old.Epoch, instance: old.Instance,
 			hasOutcome: old.HasOutcome, lastCommit: old.LastCommit,
 			pendingAction: old.Pending, sequences: old.Sequences,
+			topics: append([]string(nil), old.Topics...),
 			restartRequired: true,
 		}
 		// A completed filesystem publication makes a pending COMMIT

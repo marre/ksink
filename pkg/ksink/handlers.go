@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"math"
 	"net"
+	"sort"
 	"strconv"
 
 	"github.com/twmb/franz-go/pkg/kerr"
@@ -230,6 +231,19 @@ func (s *Server) handleProduce(ctx context.Context, conn net.Conn, connID uint64
 			if txnProduceErr != 0 {
 				results[key] = partResult{errCode: txnProduceErr}
 				continue
+			}
+			// Kafka requires enrollment before writing transaction records.
+			// Only the new ordered WAL path enforces this so the existing
+			// legacy filesystem backend remains unchanged until cutover.
+			if s.orderedFormatter != nil && txnProduceState != nil {
+				found := false
+				for _, name := range txnProduceState.topics {
+					if name == topicData.Topic { found = true; break }
+				}
+				if !found {
+					results[key] = partResult{errCode: kerr.InvalidTxnState.Code}
+					continue
+				}
 			}
 			recordBatches := partData.Records
 			var candidate map[string]txnPartitionSequence
@@ -577,6 +591,7 @@ func (s *Server) handleInitProducerId(ctx context.Context, conn net.Conn, connID
 			existing.hasOutcome = false
 			existing.restartRequired = false
 			existing.sequences = make(map[string]txnPartitionSequence)
+			existing.topics = nil
 			if err := s.persistTxnStateLocked(); err != nil {
 				s.txnMu.Unlock()
 				s.logger.Errorf("[conn:%d] InitProducerId: persist epoch change: %v", connID, err)
@@ -777,12 +792,32 @@ func (s *Server) handleAddPartitionsToTxn(conn net.Conn, connID uint64, correlat
 			return s.sendResponse(conn, connID, correlationID, resp)
 		}
 		st.instance = instance
+		st.topics = nil
 		st.active = true
 		st.hasOutcome = false
 		st.pendingAction = ""
+	}
+	// All supported topic participants must be persisted, including topics
+	// enrolled AFTER the transaction was already active. Retried enrollment
+	// is idempotent, and rejected partitions never enter the participant set.
+	participants := make(map[string]bool, len(st.topics))
+	for _, topic := range st.topics { participants[topic] = true }
+	changed := false
+	for _, topic := range req.Topics {
+		if !s.isTopicAllowed(topic.Topic) { continue }
+		for _, partition := range topic.Partitions {
+			if partition == onlyPartition && !participants[topic.Topic] {
+				participants[topic.Topic] = true
+				st.topics = append(st.topics, topic.Topic)
+				changed = true
+			}
+		}
+	}
+	if changed { sort.Strings(st.topics) }
+	if changed || len(st.topics)==0 {
 		if err := s.persistTxnStateLocked(); err != nil {
 			s.txnMu.Unlock()
-			s.logger.Errorf("[conn:%d] AddPartitionsToTxn: persist active state: %v", connID, err)
+			s.logger.Errorf("[conn:%d] AddPartitionsToTxn: persist active participant set: %v", connID, err)
 			for ti := range resp.Topics {
 				for pi := range resp.Topics[ti].Partitions {
 					resp.Topics[ti].Partitions[pi].ErrorCode = kerr.UnknownServerError.Code

@@ -248,6 +248,7 @@ type txnState struct {
 	instance        string         // durable identity for one producer transaction
 	produceMu       sync.Mutex     // serialize validation, delivery, and sequence journal
 	sequences       map[string]txnPartitionSequence
+	topics          []string // sorted, unique enrolled topic/partition-0 names
 	pendingAction   string // persisted EndTxn intent ("commit" or "abort")
 	restartRequired bool   // prevent old producer epochs from resuming after crash
 }
