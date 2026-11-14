@@ -101,7 +101,8 @@ func TestOrderedWALReclaimsDecisionOnlyAfterAllTopicsAdvance(t *testing.T) {
 	txnID:="decision-gc"
 	init:=sendInitProducerID(t,conn,1,&txnID,30000)
 	require.Zero(t,init.ErrorCode)
-	sendAddPartitionsToTxn(t,conn,2,txnID,init.ProducerID,init.ProducerEpoch,"orders","payments")
+	sendAddPartitionsToTxn(t,conn,2,txnID,init.ProducerID,init.ProducerEpoch,"orders")
+	sendAddPartitionsToTxn(t,conn,3,txnID,init.ProducerID,init.ProducerEpoch,"payments")
 	wal.mu.Lock()
 	instance:=wal.state.States[txnID].Instance
 	wal.mu.Unlock()
@@ -110,11 +111,11 @@ func TestOrderedWALReclaimsDecisionOnlyAfterAllTopicsAdvance(t *testing.T) {
 		{Topic:"payments",TransactionID:txnID,Instance:instance,Data:[]byte("payment")},
 	})
 	require.NoError(t,err)
-	require.Zero(t,sendEndTxnForSafetyTest(t,conn,3,txnID,init.ProducerID,init.ProducerEpoch,false).ErrorCode)
+	require.Zero(t,sendEndTxnForSafetyTest(t,conn,4,txnID,init.ProducerID,init.ProducerEpoch,false).ErrorCode)
 	require.Equal(t,"abort",wal.TopicTransactionDecision(instance))
 	// Move the producer to a new generation, removing its old coordinator
 	// reference. The old decision must still be available to both topics.
-	next:=sendInitProducerID(t,conn,4,&txnID,30000)
+	next:=sendInitProducerID(t,conn,5,&txnID,30000)
 	require.Zero(t,next.ErrorCode)
 	require.NoError(t,wal.SkipTopicOffsets("orders",2))
 	require.Equal(t,"abort",wal.TopicTransactionDecision(instance))
