@@ -186,3 +186,64 @@ func TestSharedWALReadCommittedStableOffsetAndGenerationReuse(t *testing.T) {
 		require.Equal(t, want, string(rec.Data))
 	}
 }
+
+func TestSharedWALDiscardsCompleteUnacceptedTopicBatchTail(t *testing.T) {
+	root := t.TempDir()
+	wal, instance := testOpenWALWithActiveTransaction(t, root)
+	// Emulate power loss after multiple complete, checksummed payload frames
+	// reached disk, but before their acceptance delimiter.
+	for i := 0; i < 2; i++ {
+		buf, err := txnWALFrame(transactionWALRecord{
+			Type: "topic-output", TopicOutput: &WALTopicRecord{
+				Topic: "orders", Offset: int64(i), TransactionID: "orders-producer",
+				Instance: instance, Data: []byte("unaccepted"),
+			},
+		})
+		require.NoError(t, err)
+		_, err = wal.logFile.Write(buf)
+		require.NoError(t, err)
+	}
+	require.NoError(t, wal.logFile.Sync())
+	require.NoError(t, wal.Close())
+
+	replayed, err := OpenTransactionLog(filepath.Join(root, ".ksink-kafka-state"))
+	require.NoError(t, err)
+	require.Zero(t, replayed.NextTopicOffset("orders"), "unaccepted complete frames must be rolled back")
+	_, found, err := replayed.ReadTopicRecord("orders", 0)
+	require.NoError(t, err)
+	require.False(t, found)
+	offsets, err := replayed.AppendTopicBatch([]WALTopicRecord{{Topic: "orders", Data: []byte("accepted")}})
+	require.NoError(t, err)
+	require.Equal(t, []int64{0}, offsets)
+	require.NoError(t, replayed.Close())
+	next, err := OpenTransactionLog(filepath.Join(root, ".ksink-kafka-state"))
+	require.NoError(t, err)
+	defer func() { _ = next.Close() }()
+	require.Equal(t, int64(1), next.NextTopicOffset("orders"))
+	record, ok, err := next.ReadTopicRecord("orders", 0)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, "accepted", string(record.Data))
+}
+
+func TestSharedWALRejectsMismatchedTopicAcceptanceMarker(t *testing.T) {
+	root := t.TempDir()
+	wal, instance := testOpenWALWithActiveTransaction(t, root)
+	frames := []transactionWALRecord{
+		{Type: "topic-output", TopicOutput: &WALTopicRecord{
+			Topic: "orders", Offset: 0, TransactionID: "orders-producer",
+			Instance: instance, Data: []byte("first"),
+		}},
+		{Type: "topic-accept", BatchCount: 2},
+	}
+	for _, rec := range frames {
+		buf, err := txnWALFrame(rec)
+		require.NoError(t, err)
+		_, err = wal.logFile.Write(buf)
+		require.NoError(t, err)
+	}
+	require.NoError(t, wal.logFile.Sync())
+	require.NoError(t, wal.Close())
+	_, err := OpenTransactionLog(filepath.Join(root, ".ksink-kafka-state"))
+	require.ErrorContains(t, err, "mismatched topic WAL acceptance")
+}
