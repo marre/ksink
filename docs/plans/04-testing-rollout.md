@@ -1,6 +1,6 @@
 # Phase 6: verification, operational guardrails and merge readiness
 
-Status: **test/release plan**, not completed. Prerequisite: [ordered materializer](02-transactions-and-materializer.md) and [rotation](03-filenames-and-rotation.md).
+Status: **active release checklist**. WAL crash tests, race tests, and ordered output tests exist; disk pressure and extended soak are still open. Prerequisite: [ordered materializer](02-transactions-and-materializer.md) and [rotation](03-filenames-and-rotation.md).
 
 ## Protocol and semantics matrix
 
