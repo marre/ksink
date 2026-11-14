@@ -525,6 +525,8 @@ func (l *TransactionLog) apply(rec transactionWALRecord, frameOffset, frameBytes
 		// Checkpoint marker refs are kept until publication of that topic.
 	case "topic-progress":
 		return l.applyTopicProgress(rec.TopicProgress, frameBytes, source)
+	case "topic-progress-checkpoint":
+		return l.applyTopicProgressCheckpoint(rec.TopicProgress, frameBytes, source)
 	case "topic-decision":
 		if rec.TxnID == "" || !txnWALValidInstance(rec.Instance) ||
 			(rec.Decision != "commit" && rec.Decision != "abort") {

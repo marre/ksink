@@ -115,7 +115,7 @@ func (l *TransactionLog) compactLocked() error {
 	sort.Strings(pubTopics)
 	for _,topic:=range pubTopics {
 		state:=l.topicProgress[topic]
-		if err:=write(transactionWALRecord{Type:"topic-progress",TopicProgress:&state});err!=nil {
+		if err:=write(transactionWALRecord{Type:"topic-progress-checkpoint",TopicProgress:&state});err!=nil {
 			return failed(err)
 		}
 	}
