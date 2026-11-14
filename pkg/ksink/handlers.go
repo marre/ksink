@@ -756,6 +756,28 @@ func (s *Server) handleInitProducerId(ctx context.Context, conn net.Conn, connID
 	producerID := s.producerIDCounter.Add(1)
 	if s.orderedFormatter!=nil {
 		if len(s.idempotentStates)>=maxTxnStates {
+			// Reclaim only producers with a durable inactivity timestamp.
+			// The state checkpoint must become durable before we reuse the
+			// capacity; a failure poisons further coordinator mutations.
+			cutoff:=time.Now().Add(-idempotentProducerRetention).UnixNano()
+			snapshot:=s.txnSnapshotLocked()
+			for id,st:=range snapshot.Idempotent {
+				if st.LastActivityUnixNano>0 && st.LastActivityUnixNano<cutoff {
+					delete(snapshot.Idempotent,id)
+				}
+			}
+			if len(snapshot.Idempotent)<len(s.idempotentStates) {
+				if err:=s.txnLog.AppendState(snapshot);err!=nil {
+					s.txnStoreErr=fmt.Errorf("persist idempotent producer reclamation: %w",err)
+					s.txnMu.Unlock()
+					return s.sendResponse(conn,connID,correlationID,&kmsg.InitProducerIDResponse{
+						Version:apiVersion,ErrorCode:kerr.UnknownServerError.Code,ProducerID:-1,
+					})
+				}
+				s.idempotentStates=snapshot.Idempotent
+			}
+		}
+		if len(s.idempotentStates)>=maxTxnStates {
 			s.txnMu.Unlock()
 			return s.sendResponse(conn,connID,correlationID,&kmsg.InitProducerIDResponse{
 				Version:apiVersion,ErrorCode:kerr.UnknownServerError.Code,ProducerID:-1,
