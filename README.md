@@ -42,17 +42,10 @@ go run ./cmd/ksink --addr :9092 --transactional --output 'messages-{txnID}.jsonl
 go run ./cmd/ksink --addr :9092 --output '{topic}.jsonl'
 # produces orders.jsonl, events.jsonl, etc. — one file per topic
 
-# Route to separate files per partition (or combine topic and partition)
-go run ./cmd/ksink --addr :9092 --output '{topic}-{partition}.jsonl'
-# produces orders-0.jsonl, orders-1.jsonl, etc.
-
 # Combine {topic} with transactional output
 go run ./cmd/ksink --addr :9092 --transactional --output '{topic}-{txnID}.jsonl'
 # produces committed/my-txn-<unique-id>/orders-my-txn.jsonl
 #          committed/my-txn-<unique-id>/events-my-txn.jsonl
-
-# Transactional files may also be split by partition:
-# go run ./cmd/ksink --transactional --output '{topic}-{partition}-{txnID}.jsonl'
 
 # Transactional file output — the --output pattern must contain {txnID}.
 # All files in a transaction live in ONE directory beneath the first static
@@ -195,6 +188,25 @@ cfg := ksink.Config{
 }
 ```
 
+### Designed limitation: one partition per topic
+
+ksink intentionally supports **exactly one partition (partition 0) per topic**.
+Kafka metadata advertises only partition 0, and direct `Produce` or
+`AddPartitionsToTxn` requests for other partition numbers are rejected with
+`UNKNOWN_TOPIC_OR_PARTITION`. This is a design choice to keep ksink a small
+single-process sink rather than a general-purpose multi-partition Kafka broker.
+
+Multiple topics are supported, and one transaction can atomically publish files
+from several topics (each topic's partition 0). Use `{topic}` to route files
+by topic. The `{partition}` output placeholder is deliberately unsupported;
+ksink does not split data into multiple partition files.
+
+This limitation does **not** make transaction commit order and record
+production order equivalent. A later-produced transaction may commit before an
+earlier one. Transaction directory names contain random instance identifiers,
+not sortable sequence numbers; stable commit-order and record-offset ordering
+metadata are not yet exposed to file readers.
+
 ### Transactional Producer Support
 
 When `TransactionalWrite` is enabled, ksink accepts the Kafka transactional
@@ -261,7 +273,7 @@ intentionally simplified:
 | The transaction coordinator tracks transaction state across broker restarts. | A shared transactional WAL persists producer IDs, epochs, record-batch sequence history and commit/abort decisions. In-flight transactions without a decision are abandoned on restart, and old producers must reinitialize. | The WAL also includes formatted payload bytes and output paths, so a committed directory can be reconstructed from the same authoritative decision. |
 | `sendOffsetsToTransaction` atomically commits consumer offsets with the transaction. | Not supported. ksink is a sink, not a full broker with consumer groups. | Not supported. |
 | Zombie fencing: restarting a producer with the same `transactional.id` aborts the old instance's pending transaction. | **Supported.** `InitProducerID` fences an in-flight producer after aborting it; after a process restart, an old epoch cannot start a new transaction without first reinitializing. Durable epoch fencing requires `TransactionStateDir`. | The old transaction's private staging directory is deleted on abort. |
-| Transactions can span multiple topic-partitions atomically. | All events for the same `transactional.id` share a durable instance ID and one irreversible WAL decision. | All files within one transaction directory are made visible together via one same-filesystem directory rename. The atomicity guarantee applies only to readers of `committed/`. |
+| Transactions can span multiple topic-partitions atomically. | ksink supports multiple topics but **only partition 0 of each topic**. All events for the same `transactional.id` share a durable instance ID and one irreversible WAL decision. | All files within one transaction directory are made visible together via one same-filesystem directory rename. The atomicity guarantee applies only to readers of `committed/`. |
 | Aborted records are never visible to `read_committed` consumers. | Aborted records were already delivered to `Read`. The `*TxnAbortEvent` signals the consumer to clean up, but application-level processing that happened before the abort is not rolled back. | The private staging directory is deleted on abort, so it never appears under `committed/`. |
 | `isolation.level` consumer configuration. | Not applicable — ksink does not implement the consumer protocol. | Not applicable. |
 
