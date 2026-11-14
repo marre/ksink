@@ -17,6 +17,7 @@ import (
 	"github.com/marre/ksink/internal/output"
 	"github.com/marre/ksink/pkg/ksink"
 	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
 )
 
 // Set via ldflags at build time by goreleaser.
@@ -45,9 +46,12 @@ func main() {
 		sepHex        string
 		noSeparator   bool
 		transactional bool
+		stateDir      string
+		rotateSizeText string
+		rotateInterval time.Duration
 		tOpts         output.TLSOpts
 		httpOpts      output.HTTPOpts
-		s3Opts        output.S3Opts
+		s3Opts        output.S3OrderedOpts
 	)
 
 	rootCmd := &cobra.Command{
@@ -62,7 +66,7 @@ Output destinations (--output):
   messages.jsonl                    Write to a file
   http://host:port/path             POST messages via HTTP
   https://host:port/path            POST messages via HTTPS
-  s3://bucket/key-pattern           Write messages to S3 objects
+  s3://bucket/prefix/{topic}/messages-{seq:08}.jsonl  Transactional WAL-backed ordered S3 objects
 
 Use --output-tls-* flags to configure client certificates (mTLS) and
 CA certificates for server verification on https outputs.
@@ -70,10 +74,6 @@ CA certificates for server verification on https outputs.
 HTTP output sends one message at a time and waits for a 200 OK response
 before proceeding to the next message. Use --output-http-* flags to
 configure retries and a dead-letter queue for failed messages.
-
-S3 output:
-  Use --output-s3-* flags to configure region, endpoint/path-style,
-  retries, and object batching behavior.
 
 Message formats (--output-format):
   binary       Raw message value bytes (default, newline-delimited)
@@ -95,41 +95,60 @@ kcat format specifiers (--output-format-string):
   %K  key length  %S  value length
   %%  literal %%   \n  newline     \t  tab     \\  backslash`,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			// Ordered output defaults to structured, self-describing JSONL.
+			// The existing nontransactional default remains raw binary.
+			if transactional && !cmd.Flags().Changed("output-format") {
+				fmtName = "jsonl"
+			}
 			if fmtName != "binary" {
 				if cmd.Flags().Changed("output-separator") || cmd.Flags().Changed("output-separator-hex") || cmd.Flags().Changed("no-separator") {
 					return fmt.Errorf("--output-separator, --output-separator-hex, and --no-separator are only supported with --output-format=binary")
 				}
 			}
-			if !strings.HasPrefix(dst, "s3://") {
-				for _, name := range []string{
-					"output-s3-region",
-					"output-s3-endpoint",
-					"output-s3-force-path-style",
-					"output-s3-retries",
-					"output-s3-retry-delay",
-					"output-s3-batch-max-bytes",
-					"output-s3-batch-max-messages",
-					"output-s3-multipart-part-size",
-				} {
-					if cmd.Flags().Changed(name) {
-						return fmt.Errorf("--output-s3-* flags require an s3:// output destination")
-					}
-				}
+			if !transactional && (cmd.Flags().Changed("rotate-size") || cmd.Flags().Changed("rotate-interval")) {
+				return fmt.Errorf("--rotate-size and --rotate-interval require --transactional")
 			}
-			return run(addr, dst, fmtName, fmtStr, jsonB64Key, jsonB64Val, separator, sepHex, noSeparator, transactional, tOpts, httpOpts, s3Opts)
+			size,err:=parseRotationSize(rotateSizeText)
+			if err!=nil{return err}
+			if strings.HasPrefix(dst,"s3://") && !transactional {
+				return fmt.Errorf("s3:// output requires --transactional and a shared WAL")
+			}
+			var changedS3 bool
+			cmd.Flags().Visit(func(f *pflag.Flag) {
+				if strings.HasPrefix(f.Name,"output-s3-") {changedS3=true}
+			})
+			if changedS3 && (!transactional || !strings.HasPrefix(dst,"s3://")) {
+				return fmt.Errorf("S3 flags require --transactional with an s3:// output destination")
+			}
+			return runWithRotationS3(addr, dst, fmtName, fmtStr, jsonB64Key, jsonB64Val, separator, sepHex, noSeparator, transactional, stateDir, tOpts, httpOpts, size, rotateInterval, s3Opts)
 		},
 	}
 
 	rootCmd.Flags().StringVar(&addr, "addr", ":9092", "Address to listen on")
 	rootCmd.Flags().BoolVar(&transactional, "transactional", false,
-		"Enable transactional produce support (per-transaction files with rename-as-commit/delete-as-abort). Requires {txnID} in --output.")
+		"Durable Kafka transactions with per-topic ordered committed-only files. Requires {topic} and {seq:08} in --output.")
+	rootCmd.Flags().StringVar(&stateDir, "transaction-state-dir", "",
+		"Shared durable Kafka transaction WAL directory (default: .ksink-kafka-state under the ordered output root)")
+	rootCmd.Flags().StringVar(&rotateSizeText, "rotate-size", "128MiB",
+		"Committed file rotation size target (e.g. 128MiB, 1GiB; 0 disables)")
+	rootCmd.Flags().DurationVar(&rotateInterval, "rotate-interval", time.Minute,
+		"Maximum nonempty committed-file age before rotation (e.g. 1m, 10s; 0 disables)")
 	rootCmd.Flags().StringVar(&dst, "output", "-",
-		`Output destination: "-" for stdout (default), file path, http(s):// URL, or s3://bucket/key-pattern.
-The path may contain {topic} to route messages to per-topic files.
+		`Output destination: "-" for stdout (default), file path, or http(s):// URL.
+The path may contain {topic} to route messages to per-topic files
 (e.g. "{topic}.jsonl" produces "orders.jsonl", "events.jsonl", etc.).
-With --transactional, it must also contain {txnID}.
-(e.g. "{topic}-{txnID}.jsonl" produces "orders-my-txn.jsonl").
-Topic names are sanitised to prevent path traversal.`)
+Only partition 0 exists for each topic; {partition} is not supported.
+With --transactional, use ROOT/{topic}/messages-{seq:08}.jsonl\n or s3://bucket/prefix/{topic}/messages-{seq:08}.jsonl (requires --transaction-state-dir).
+Each topic has an independent monotonically numbered committed-only file
+sequence, rotated by --rotate-size or --rotate-interval. There are no
+transaction directories and {txnID} is not supported in ordered output.
+Topic names are encoded to prevent collisions and path traversal.`)
+	rootCmd.Flags().StringVar(&s3Opts.Region,"output-s3-region","","AWS region (from SDK environment/config when unset)")
+	rootCmd.Flags().StringVar(&s3Opts.Endpoint,"output-s3-endpoint","","Custom S3-compatible endpoint (for example MinIO)")
+	rootCmd.Flags().BoolVar(&s3Opts.ForcePathStyle,"output-s3-force-path-style",false,"Use path-style S3 URLs (often required by MinIO)")
+	rootCmd.Flags().IntVar(&s3Opts.RetryMaxAttempts,"output-s3-retries",3,"Maximum SDK attempts per S3 request")
+	rootCmd.Flags().DurationVar(&s3Opts.RequestTimeout,"output-s3-request-timeout",30*time.Second,"Timeout per S3 request")
+	rootCmd.Flags().Int64Var(&s3Opts.MultipartPartSize,"output-s3-multipart-part-size",8<<20,"S3 multipart part size in bytes (at least 5 MiB)")
 	rootCmd.Flags().StringVar(&fmtName, "output-format", "binary",
 		"Message format: binary, jsonl, kcat")
 	rootCmd.Flags().StringVar(&fmtStr, "output-format-string", "",
@@ -160,22 +179,6 @@ Topic names are sanitised to prevent path traversal.`)
 		"File path for dead-letter queue; failed HTTP messages are appended here instead of stopping the process")
 	rootCmd.Flags().DurationVar(&httpOpts.Timeout, "output-http-timeout", 30*time.Second,
 		"HTTP request timeout per message")
-	rootCmd.Flags().StringVar(&s3Opts.Region, "output-s3-region", "",
-		"AWS region for S3 output (if empty, uses AWS SDK default chain)")
-	rootCmd.Flags().StringVar(&s3Opts.Endpoint, "output-s3-endpoint", "",
-		"Custom S3 endpoint URL (e.g. http://127.0.0.1:9000 for MinIO)")
-	rootCmd.Flags().BoolVar(&s3Opts.ForcePathStyle, "output-s3-force-path-style", false,
-		"Use path-style S3 addressing (required by some S3-compatible endpoints)")
-	rootCmd.Flags().IntVar(&s3Opts.RetryMaxAttempts, "output-s3-retries", 3,
-		"Maximum S3 write attempts for each operation")
-	rootCmd.Flags().DurationVar(&s3Opts.RetryDelay, "output-s3-retry-delay", 250*time.Millisecond,
-		"Delay between S3 retry attempts")
-	rootCmd.Flags().IntVar(&s3Opts.BatchMaxBytes, "output-s3-batch-max-bytes", 5*1024*1024,
-		"Maximum buffered bytes per S3 object before flush")
-	rootCmd.Flags().IntVar(&s3Opts.BatchMaxMessages, "output-s3-batch-max-messages", 1000,
-		"Maximum buffered messages per S3 object before flush")
-	rootCmd.Flags().Int64Var(&s3Opts.MultipartPartSize, "output-s3-multipart-part-size", 5*1024*1024,
-		"Multipart upload part size in bytes (minimum 5 MiB for non-final parts)")
 
 	rootCmd.AddCommand(&cobra.Command{
 		Use:   "json-schema",
@@ -191,7 +194,7 @@ Topic names are sanitised to prevent path traversal.`)
 	}
 }
 
-func run(addr, dst, fmtName, fmtStr string, jsonB64Key, jsonB64Val bool, separator, sepHex string, noSeparator, transactional bool, tOpts output.TLSOpts, httpOpts output.HTTPOpts, s3Opts output.S3Opts) error {
+func runWithRotationS3(addr, dst, fmtName, fmtStr string, jsonB64Key, jsonB64Val bool, separator, sepHex string, noSeparator, transactional bool, stateDir string, tOpts output.TLSOpts, httpOpts output.HTTPOpts, rotateSize int64, rotateInterval time.Duration,s3Opts output.S3OrderedOpts) error {
 	var sep []byte
 	if fmtName == "binary" {
 		var err error
@@ -201,6 +204,9 @@ func run(addr, dst, fmtName, fmtStr string, jsonB64Key, jsonB64Val bool, separat
 		}
 	}
 
+	if !transactional && stateDir != "" {
+		return fmt.Errorf("--transaction-state-dir requires --transactional")
+	}
 	// Validate format-specific flag combinations before constructing anything.
 	if fmtStr != "" && fmtName != "kcat" {
 		return fmt.Errorf("--output-format-string is only supported with --output-format=kcat")
@@ -223,6 +229,13 @@ func run(addr, dst, fmtName, fmtStr string, jsonB64Key, jsonB64Val bool, separat
 	if err != nil {
 		return err
 	}
+	if transactional {
+		// Bytes were formatted before being durably accepted into the WAL.
+		// A restart must not silently mix encodings within one file series.
+		serialization:=fmt.Sprintf("ordered-v1|%q|%q|%t|%t|%x",
+			fmtName,fmtStr,jsonB64Key,jsonB64Val,sep)
+		return runOrderedWithS3(addr,dst,stateDir,fmtr,serialization,rotateSize,rotateInterval,s3Opts)
+	}
 
 	tlsCfg, err := tOpts.BuildTLSConfig()
 	if err != nil {
@@ -230,38 +243,21 @@ func run(addr, dst, fmtName, fmtStr string, jsonB64Key, jsonB64Val bool, separat
 	}
 
 	var w output.Writer
-	isHTTP := strings.HasPrefix(dst, "http://") || strings.HasPrefix(dst, "https://")
-	isS3 := strings.HasPrefix(dst, "s3://")
+	isHTTP := strings.HasPrefix(dst,"http://") || strings.HasPrefix(dst,"https://")
 	if isHTTP {
-		if transactional {
-			return fmt.Errorf("--transactional is not supported with HTTP output")
-		}
-		w, err = output.NewHTTPWriter(dst, httpOpts, tlsCfg)
-	} else if isS3 {
-		if transactional {
-			w, err = output.NewTxnS3Writer(dst, s3Opts)
-		} else {
-			w, err = output.NewS3Writer(dst, s3Opts)
-		}
-	} else if transactional && dst != "-" {
-		w, err = output.NewTxnFileWriter(dst)
+		w,err=output.NewHTTPWriter(dst,httpOpts,tlsCfg)
 	} else {
-		if transactional && dst == "-" {
-			return fmt.Errorf("--transactional is not supported with stdout output")
-		}
-		w, err = output.Open(dst, tlsCfg)
+		w,err=output.Open(dst,tlsCfg)
 	}
 	if err != nil {
 		return err
 	}
 	defer w.Close() //nolint:errcheck
 
-	serverOpts := []ksink.Option{ksink.WithLogger(stdLogger{})}
-
 	srv, err := ksink.New(ksink.Config{
-		Address:            addr,
-		TransactionalWrite: transactional,
-	}, serverOpts...)
+		Address:addr,
+		TransactionalWrite:false,
+	}, ksink.WithLogger(stdLogger{}))
 	if err != nil {
 		return fmt.Errorf("failed to create server: %w", err)
 	}
@@ -280,7 +276,6 @@ func run(addr, dst, fmtName, fmtStr string, jsonB64Key, jsonB64Val bool, separat
 	log.Printf("Kafka server listening on %s, output=%s", srv.Addr(), outputLabel)
 
 	// Start read loop
-	txnWriter, _ := w.(output.TransactionalWriter)
 	go func() {
 		for {
 			event, ack, readErr := srv.Read(ctx)
@@ -291,35 +286,28 @@ func run(addr, dst, fmtName, fmtStr string, jsonB64Key, jsonB64Val bool, separat
 			var writeErr error
 			switch e := event.(type) {
 			case *ksink.MessagesEvent:
+				formatted := make([][]byte, 0, len(e.Messages))
 				for _, msg := range e.Messages {
 					data, err := fmtr.Format(msg)
 					if err != nil {
 						writeErr = fmt.Errorf("failed to format message: %w", err)
 						break
 					}
-
-					if err := w.Write(data, msg); err != nil {
-						writeErr = fmt.Errorf("failed to write message: %w", err)
-						break
-					}
+					formatted = append(formatted, data)
 				}
 				if writeErr == nil {
-					if flusher, ok := w.(output.Flusher); ok {
-						if err := flusher.Flush(); err != nil {
-							writeErr = fmt.Errorf("failed to flush output: %w", err)
+					if batchWriter, ok := w.(interface {
+						WriteBatch([][]byte, []*ksink.Message) error
+					}); ok {
+						// One WAL fsync for all records in this Produce event.
+						writeErr = batchWriter.WriteBatch(formatted, e.Messages)
+					} else {
+						for i, msg := range e.Messages {
+							if err := w.Write(formatted[i], msg); err != nil {
+								writeErr = fmt.Errorf("failed to write message: %w", err)
+								break
+							}
 						}
-					}
-				}
-			case *ksink.TxnCommitEvent:
-				if txnWriter != nil {
-					if err := txnWriter.CommitTxn(e.TransactionalID); err != nil {
-						writeErr = fmt.Errorf("failed to commit txn %s: %w", e.TransactionalID, err)
-					}
-				}
-			case *ksink.TxnAbortEvent:
-				if txnWriter != nil {
-					if err := txnWriter.AbortTxn(e.TransactionalID); err != nil {
-						writeErr = fmt.Errorf("failed to abort txn %s: %w", e.TransactionalID, err)
 					}
 				}
 			}

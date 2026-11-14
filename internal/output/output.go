@@ -4,7 +4,6 @@
 //   - -                              Standard output (stdout)
 //   - http://host:port/path         HTTP POST
 //   - https://host:port/path        HTTPS POST
-//   - s3://bucket/key-pattern       S3 object output
 //   - <path>                        File output
 package output
 
@@ -24,21 +23,6 @@ import (
 type Writer interface {
 	io.Closer
 	Write(data []byte, msg *ksink.Message) error
-}
-
-// Flusher is implemented by writers that buffer data and need explicit flushes
-// at acknowledgement boundaries.
-type Flusher interface {
-	Flush() error
-}
-
-// TransactionalWriter extends [Writer] with transaction commit and abort
-// operations. File-based backends can implement this to write into temporary
-// files during a transaction and then rename on commit or delete on abort.
-type TransactionalWriter interface {
-	Writer
-	CommitTxn(txnID string) error
-	AbortTxn(txnID string) error
 }
 
 // TLSOpts holds TLS configuration options for output connections.
@@ -93,6 +77,10 @@ func (o *TLSOpts) BuildTLSConfig() (*tls.Config, error) {
 // to route messages to per-topic files.
 const TopicPlaceholder = "{topic}"
 
+// A single partition per topic is a deliberate limitation. Reject this
+// formerly supported placeholder rather than writing it as a literal name.
+const unsupportedPartitionPlaceholder = "{partition}"
+
 // SanitizePathSegment returns a safe single-component file name from an
 // untrusted string. It uses [filepath.Clean] and [filepath.Base] to strip
 // any directory traversal, then rejects the special names "." and "..".
@@ -108,20 +96,21 @@ func SanitizePathSegment(s string) string {
 // The special value "-" writes to standard output.
 // For http:// and https:// URLs, Open creates an HTTP writer with default
 // options (no retries, no DLQ). Use NewHTTPWriter for full configuration.
-// If the destination contains the {topic} placeholder, a pattern-based writer
-// is returned that routes messages to per-topic files.
+// If the destination contains {topic}, a pattern-based writer is returned
+// that routes messages to per-topic files. Partition routing is unsupported.
 func Open(dst string, tlsCfg *tls.Config) (Writer, error) {
 	switch {
 	case dst == "-":
 		return newStdoutWriter(), nil
 	case strings.HasPrefix(dst, "https://"), strings.HasPrefix(dst, "http://"):
 		return NewHTTPWriter(dst, HTTPOpts{}, tlsCfg)
-	case strings.HasPrefix(dst, "s3://"):
-		return NewS3Writer(dst, S3Opts{})
 	default:
 		// Reject unknown URL-like schemes explicitly to avoid treating them as file paths.
 		if strings.Contains(dst, "://") {
-			return nil, fmt.Errorf("unsupported output scheme in %q; only -, http(s), s3, or file paths are supported", dst)
+			return nil, fmt.Errorf("unsupported output scheme in %q; only -, http(s), or file paths are supported", dst)
+		}
+		if strings.Contains(dst, unsupportedPartitionPlaceholder) {
+			return nil, fmt.Errorf("{partition} is unsupported: ksink exposes only partition 0 per topic")
 		}
 		if strings.Contains(dst, TopicPlaceholder) {
 			return newPatternFileWriter(dst), nil

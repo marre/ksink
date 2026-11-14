@@ -67,5 +67,6 @@ func (w *patternFileWriter) Close() error {
 }
 
 func (w *patternFileWriter) resolvePath(topic string) string {
-	return filepath.Clean(strings.ReplaceAll(w.pattern, TopicPlaceholder, SanitizePathSegment(topic)))
+	path := strings.ReplaceAll(w.pattern, TopicPlaceholder, SanitizePathSegment(topic))
+	return filepath.Clean(path)
 }

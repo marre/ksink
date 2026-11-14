@@ -3,10 +3,13 @@ package ksink
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/binary"
 	"fmt"
 	"math"
 	"net"
+	"sort"
 	"strconv"
+	"time"
 
 	"github.com/twmb/franz-go/pkg/kerr"
 	"github.com/twmb/franz-go/pkg/kgo"
@@ -109,12 +112,17 @@ func (s *Server) handleMetadata(conn net.Conn, connID uint64, correlationID int3
 	return s.sendResponse(conn, connID, correlationID, resp)
 }
 
+// ksink intentionally exposes exactly one partition (partition 0) for each
+// topic. Do not accept direct Produce or AddPartitionsToTxn requests for
+// partitions that the metadata endpoint does not advertise.
+const onlyPartition int32 = 0
+
 func (s *Server) buildTopicMetadata(topic string, apiVersion int16) kmsg.MetadataResponseTopic {
 	t := kmsg.MetadataResponseTopic{
 		Topic: new(topic),
 		Partitions: []kmsg.MetadataResponseTopicPartition{
 			{
-				Partition:   0,
+				Partition:   onlyPartition,
 				Leader:      1,
 				LeaderEpoch: 1,
 				Replicas:    []int32{1},
@@ -159,50 +167,328 @@ func (s *Server) handleProduce(ctx context.Context, conn net.Conn, connID uint64
 		txnID = *req.TransactionID
 	}
 
+	// Kafka producers without a transactional.id may still use idempotence.
+	// Serialize their validation, WAL append and producer-sequence snapshot
+	// so concurrent retries cannot append the same batch twice.
+	orderedNonTxn:=s.orderedFormatter!=nil && txnID==""
+	if orderedNonTxn { s.txnMu.Lock(); defer s.txnMu.Unlock() }
+	proposedIdempotent:=make(map[int64]storedIdempotentProducer)
+	changedIdempotent:=false
+
+	// For transactional produce, verify the active transaction and producer
+	// epoch. The epoch lives in each record-batch header, not in ProduceRequest.
+	var txnProduceErr int16
+	var txnProducerID int64
+	var txnProducerEpoch int16
+	var txnInstance string
+	var txnProduceState *txnState
+	if txnID != "" && s.cfg.TransactionalWrite {
+		s.txnMu.Lock()
+		st, ok := s.txnStates[txnID]
+		switch {
+		case !ok:
+			txnProduceErr = kerr.ProducerFenced.Code
+		case st.restartRequired:
+			txnProduceErr = kerr.ProducerFenced.Code
+		case !st.active || st.ending || st.needsResolution || s.txnStoreErr != nil:
+			txnProduceErr = kerr.InvalidTxnState.Code
+		default:
+			txnProducerID, txnProducerEpoch = st.producerID, st.epoch
+			txnInstance = st.instance
+			// Adding while holding txnMu is paired with EndTxn marking the
+			// state as ending under the same mutex before waiting.
+			st.inFlight.Add(1)
+			txnProduceState = st
+		}
+		s.txnMu.Unlock()
+	}
+	var proposedSequences map[string]txnPartitionSequence
+	var sequenceChanged bool
+	if txnProduceState != nil {
+		// Transaction batches may arrive over multiple connections. Serialize
+		// the dedup check, sink delivery, and durable sequence checkpoint so
+		// two concurrent retries cannot both deliver the same batch.
+		txnProduceState.produceMu.Lock()
+		defer txnProduceState.produceMu.Unlock()
+		defer txnProduceState.inFlight.Done()
+		proposedSequences = copyTxnSequences(txnProduceState.sequences)
+	}
+
 	// First pass: parse all records and track per-partition status
 	type partResult struct {
 		errCode int16
+		first int
+		count int
+		accepted []byte
+		baseOffset int64
 	}
 	type partKey struct {
 		topicIdx, partIdx int
 	}
 	results := make(map[partKey]partResult)
+	partProducers:=make(map[partKey]int64)
 	var allMsgs []*Message
 
 	for ti, topicData := range req.Topics {
 		for pi, partData := range topicData.Partitions {
 			key := partKey{ti, pi}
 
-			if !s.isTopicAllowed(topicData.Topic) {
-				s.logger.Warnf("[conn:%d] Rejected produce to disallowed topic: %s", connID, topicData.Topic)
+			if !s.isTopicAllowed(topicData.Topic) || partData.Partition != onlyPartition {
+				s.logger.Warnf("[conn:%d] Rejected produce to unsupported topic-partition: %s/%d", connID, topicData.Topic, partData.Partition)
 				results[key] = partResult{errCode: kerr.UnknownTopicOrPartition.Code}
 				continue
 			}
+			if txnProduceErr != 0 {
+				results[key] = partResult{errCode: txnProduceErr}
+				continue
+			}
+			// Kafka requires enrollment before writing transaction records.
+			// Only the new ordered WAL path enforces this so the existing
+			// legacy filesystem backend remains unchanged until cutover.
+			if s.orderedFormatter != nil && txnProduceState != nil {
+				found := false
+				for _, name := range txnProduceState.topics {
+					if name == topicData.Topic { found = true; break }
+				}
+				if !found {
+					results[key] = partResult{errCode: kerr.InvalidTxnState.Code}
+					continue
+				}
+			}
+			recordBatches := partData.Records
+			var candidate map[string]txnPartitionSequence
+			var idempotentCandidate map[string]txnPartitionSequence
+			var producerID int64=-1
+			if orderedNonTxn {
+				id,epoch,code:=orderedNonTxnBatchIdentity(recordBatches)
+				if code!=0 {
+					results[key]=partResult{errCode:code,baseOffset:-1}
+					continue
+				}
+				producerID=id
+				if id>=0 {
+					st,found:=s.idempotentStates[id]
+					if !found || st.Epoch!=epoch || s.txnStoreErr!=nil {
+						results[key]=partResult{errCode:kerr.ProducerFenced.Code,baseOffset:-1}
+						continue
+					}
+					if proposed,ok:=proposedIdempotent[id];ok {st=proposed}
+					idempotentCandidate=copyTxnSequences(st.Sequences)
+					var code int16
+					recordBatches,code=acceptTxnBatches(recordBatches,
+						txnSequenceKey(topicData.Topic,partData.Partition),idempotentCandidate)
+					if code!=0 {
+						results[key]=partResult{errCode:code,baseOffset:-1}
+						continue
+					}
+					if len(recordBatches)==0 {
+						result:=partResult{baseOffset:-1}
+						if offset,ok:=txnBatchFirstOffset(partData.Records,
+							st.Sequences[txnSequenceKey(topicData.Topic,partData.Partition)]);ok {
+							result.baseOffset=offset
+						}
+						results[key]=result
+						continue
+					}
+				}
+			}
+			if txnID != "" && s.cfg.TransactionalWrite {
+				if code := validateTxnBatchProducer(recordBatches, txnProducerID, txnProducerEpoch); code != 0 {
+					results[key] = partResult{errCode: code}
+					continue
+				}
+				// Don't advance any sequence for batches that fail decoding.
+				candidate = copyTxnSequences(proposedSequences)
+				var code int16
+				recordBatches, code = acceptTxnBatches(recordBatches,
+					txnSequenceKey(topicData.Topic, partData.Partition), candidate)
+				if code != 0 {
+					results[key] = partResult{errCode: code}
+					continue
+				}
+				if len(recordBatches) == 0 {
+					// An exact retransmission must keep its ORIGINAL Kafka
+					// base offset, not return a new append position.
+					result := partResult{baseOffset: -1}
+					if s.orderedFormatter != nil {
+						if offset, ok := txnBatchFirstOffset(partData.Records,
+							txnProduceState.sequences[txnSequenceKey(topicData.Topic, partData.Partition)]); ok {
+							result.baseOffset = offset
+						}
+					}
+					results[key] = result
+					continue
+				}
+			}
 
-			batch, err := s.parseRecords(connID, topicData.Topic, partData.Partition, partData.Records, remoteAddr)
+			batch, err := s.parseRecords(connID, topicData.Topic, partData.Partition, recordBatches, remoteAddr)
 			if err != nil {
 				s.logger.Errorf("[conn:%d] Failed to parse records for %s/%d: %v", connID, topicData.Topic, partData.Partition, err)
 				results[key] = partResult{errCode: kerr.CorruptMessage.Code}
 				continue
 			}
 
-			results[key] = partResult{}
+			result := partResult{first: len(allMsgs), count: len(batch),
+				accepted: recordBatches, baseOffset: -1}
+			if s.orderedFormatter != nil && txnProduceState != nil {
+				if offset, ok := txnBatchFirstOffset(partData.Records,
+					txnProduceState.sequences[txnSequenceKey(topicData.Topic, partData.Partition)]); ok {
+					result.baseOffset = offset
+				}
+			}
+			results[key] = result
+			if producerID>=0 && idempotentCandidate!=nil {
+				previous:=s.idempotentStates[producerID]
+				previous.Sequences=idempotentCandidate
+				proposedIdempotent[producerID]=previous
+				partProducers[key]=producerID
+				changedIdempotent=true
+			}
+			if txnProduceState != nil && candidate != nil {
+				proposedSequences = candidate
+				sequenceChanged = true
+			}
 			if txnID != "" {
 				for _, msg := range batch {
 					msg.TransactionalID = txnID
+					msg.TransactionInstance = txnInstance
 				}
 			}
 			allMsgs = append(allMsgs, batch...)
 		}
 	}
 
-	// Deliver batch via channel and wait for ack
+	// In ordered-output mode, the WAL itself is the durable sink. It must
+	// assign offsets BEFORE the formatter runs and must checkpoint producer
+	// sequences inside the SAME acceptance frame as the payloads.
 	var handlerErr error
 	if len(allMsgs) > 0 {
-		handlerErr = s.deliverEvent(ctx, &MessagesEvent{Messages: allMsgs})
+		if s.orderedFormatter != nil {
+			records := make([]WALTopicRecord, 0, len(allMsgs))
+			for _, msg := range allMsgs {
+				records = append(records, WALTopicRecord{
+					Topic: msg.Topic, TransactionID: msg.TransactionalID,
+					Instance: msg.TransactionInstance,
+				})
+			}
+			encode := func(i int, offset int64) ([]byte, error) {
+				allMsgs[i].Offset = offset
+				return s.orderedFormatter(allMsgs[i])
+			}
+			var offsets []int64
+			if txnProduceState != nil {
+				// Serialize state snapshot preparation with all producer
+				// generations while WAL assigns offsets and fsyncs.
+				s.txnMu.Lock()
+				if s.txnStoreErr != nil {
+					handlerErr = s.txnStoreErr
+				} else {
+					var updatedSequences map[string]txnPartitionSequence
+					offsets, handlerErr = s.txnLog.appendTopicBatchFormattedWithStateBuilder(
+						records, encode, func(assigned []int64) (txnStateSnapshot, error) {
+							updatedSequences = copyTxnSequences(proposedSequences)
+							for ti, topicData := range req.Topics {
+								for pi, partData := range topicData.Partitions {
+									result := results[partKey{ti, pi}]
+									if result.count == 0 { continue }
+									sequenceKey := txnSequenceKey(topicData.Topic, partData.Partition)
+									seq := updatedSequences[sequenceKey]
+									if err := assignTxnAcceptedOffsets(result.accepted,
+										result.first, assigned, &seq); err != nil {
+										return txnStateSnapshot{}, err
+									}
+									updatedSequences[sequenceKey] = seq
+								}
+							}
+							snapshot := s.txnSnapshotLocked()
+							current := snapshot.States[txnID]
+							current.Sequences = updatedSequences
+							snapshot.States[txnID] = current
+							return snapshot, nil
+						})
+					if handlerErr == nil {
+						txnProduceState.sequences = updatedSequences
+					}
+				}
+				s.txnMu.Unlock()
+			} else if changedIdempotent {
+				// txnMu is held by orderedNonTxn. Capture the original Kafka
+				// base offset and updated sequence signatures in the same
+				// acceptance delimiter as all newly appended data.
+				updated:=make(map[int64]storedIdempotentProducer)
+				offsets,handlerErr=s.txnLog.appendTopicBatchFormattedWithStateBuilder(
+					records,encode,func(assigned []int64)(txnStateSnapshot,error){
+						for id,st:=range proposedIdempotent {
+							updated[id]=storedIdempotentProducer{
+								Epoch:st.Epoch,LastActivityUnixNano:time.Now().UnixNano(),Sequences:copyTxnSequences(st.Sequences),
+							}
+						}
+						for ti,topicData:=range req.Topics {
+							for pi,partData:=range topicData.Partitions {
+								key:=partKey{ti,pi}
+								id,ok:=partProducers[key]
+								if !ok {continue}
+								result:=results[key]
+								st:=updated[id]
+								seqKey:=txnSequenceKey(topicData.Topic,partData.Partition)
+								seq:=st.Sequences[seqKey]
+								if err:=assignTxnAcceptedOffsets(result.accepted,
+									result.first,assigned,&seq);err!=nil {
+									return txnStateSnapshot{},err
+								}
+								st.Sequences[seqKey]=seq
+								updated[id]=st
+							}
+						}
+						snapshot:=s.txnSnapshotLocked()
+						for id,st:=range updated {snapshot.Idempotent[id]=st}
+						return snapshot,nil
+					})
+				if handlerErr==nil {
+					for id,st:=range updated {s.idempotentStates[id]=st}
+				}
+			} else {
+				offsets, handlerErr = s.txnLog.appendTopicBatchFormatted(records, encode)
+			}
+			if handlerErr == nil {
+				for key, result := range results {
+					if result.count != 0 && result.baseOffset < 0 {
+						result.baseOffset = offsets[result.first]
+						results[key] = result
+					}
+				}
+			}
+		} else {
+			handlerErr = s.deliverEvent(ctx, &MessagesEvent{Messages: allMsgs})
+		}
 		if handlerErr != nil {
 			s.logger.Errorf("[conn:%d] Batch processing error: %v", connID, handlerErr)
 		}
+	}
+
+	// Do not acknowledge a successful Produce until the accepted batch
+	// sequences are durably recorded. If the sink already accepted data but
+	// checkpointing fails, mark the transaction unresolved (it cannot commit
+	// or accept more data until an explicit abort / restart).
+	if txnProduceState != nil && s.orderedFormatter == nil {
+		s.txnMu.Lock()
+		if handlerErr == nil && sequenceChanged {
+			txnProduceState.sequences = proposedSequences
+		}
+		if handlerErr != nil {
+			txnProduceState.needsResolution = true
+		}
+		if (sequenceChanged && handlerErr == nil) || handlerErr != nil {
+			if err := s.persistTxnStateLocked(); err != nil {
+				handlerErr = err
+				txnProduceState.needsResolution = true
+			}
+		}
+		s.txnMu.Unlock()
+	} else if txnProduceState != nil && handlerErr != nil {
+		s.txnMu.Lock()
+		txnProduceState.needsResolution = true
+		s.txnMu.Unlock()
 	}
 
 	// Build response
@@ -217,6 +503,9 @@ func (s *Server) handleProduce(ctx context.Context, conn net.Conn, connID uint64
 			}
 
 			result := results[partKey{ti, pi}]
+			if s.orderedFormatter != nil {
+				partResp.BaseOffset = result.baseOffset
+			}
 			if result.errCode != 0 {
 				partResp.ErrorCode = result.errCode
 			} else if handlerErr != nil {
@@ -259,6 +548,39 @@ func (s *Server) deliverEvent(ctx context.Context, evt Event) error {
 	}
 }
 
+// orderedNonTxnBatchIdentity validates producer identity for nontransactional
+// v2 record batches. Legacy batches and producerID=-1 have no broker-side
+// deduplication identity, but are still durably appended by the shared WAL.
+func orderedNonTxnBatchIdentity(data []byte)(int64,int16,int16){
+	if len(data)<61 || data[16]!=2 {return -1,-1,0}
+	id:=int64(binary.BigEndian.Uint64(data[43:51]))
+	epoch:=int16(binary.BigEndian.Uint16(data[51:53]))
+	if id<0 {return -1,-1,0}
+	if epoch<0 {return id,epoch,kerr.ProducerFenced.Code}
+	return id,epoch,validateTxnBatchProducer(data,id,epoch)
+}
+
+// validateTxnBatchProducer checks every v2 record-batch header without
+// decoding its records. A stale producer must not write into the current
+// producer's transaction merely because it knows the same transactional.id.
+func validateTxnBatchProducer(records []byte, producerID int64, epoch int16) int16 {
+	for len(records) > 0 {
+		if len(records) < 61 {
+			return kerr.CorruptMessage.Code
+		}
+		batchLength := int64(int32(binary.BigEndian.Uint32(records[8:12])))
+		if batchLength < 49 || batchLength > int64(len(records)-12) || records[16] != 2 {
+			return kerr.CorruptMessage.Code
+		}
+		if int64(binary.BigEndian.Uint64(records[43:51])) != producerID ||
+			int16(binary.BigEndian.Uint16(records[51:53])) != epoch {
+			return kerr.ProducerFenced.Code
+		}
+		records = records[12+int(batchLength):]
+	}
+	return 0
+}
+
 func (s *Server) handleInitProducerId(ctx context.Context, conn net.Conn, connID uint64, correlationID int32, apiVersion int16, req *kmsg.InitProducerIDRequest, state *connState) error {
 	if s.saslEnabled && !state.authenticated {
 		s.logger.Warnf("[conn:%d] Rejecting InitProducerId: not authenticated", connID)
@@ -285,86 +607,189 @@ func (s *Server) handleInitProducerId(ctx context.Context, conn net.Conn, connID
 		txnID = *req.TransactionalID
 	}
 
-	// For transactional producers, track state and implement zombie fencing.
+	// Persist the producer assignment/epoch before returning it to Kafka.
+	// This prevents a process restart from silently reusing a producer ID.
 	if txnID != "" && s.cfg.TransactionalWrite {
 		s.txnMu.Lock()
+		if s.txnStoreErr != nil {
+			s.txnMu.Unlock()
+			return s.sendResponse(conn, connID, correlationID, &kmsg.InitProducerIDResponse{
+				Version: apiVersion, ErrorCode: kerr.UnknownServerError.Code, ProducerID: -1,
+			})
+		}
 		existing, ok := s.txnStates[txnID]
 		if ok {
-			// Zombie fencing: abort any in-flight transaction from the
-			// previous producer instance before bumping the epoch.
-			needsAbort := existing.active
-			if needsAbort {
-				s.logger.Infof("[conn:%d] InitProducerId: fencing zombie txnID=%s (aborting in-flight transaction, epoch %d→%d)",
-					connID, txnID, existing.epoch, existing.epoch+1)
+			if existing.ending {
+				s.txnMu.Unlock()
+				return s.sendResponse(conn, connID, correlationID, &kmsg.InitProducerIDResponse{
+					Version: apiVersion, ErrorCode: kerr.ConcurrentTransactions.Code, ProducerID: -1,
+				})
+			}
+			if existing.active {
+				if existing.pendingAction == "commit" {
+					s.txnMu.Unlock()
+					return s.sendResponse(conn, connID, correlationID, &kmsg.InitProducerIDResponse{
+						Version: apiVersion, ErrorCode: kerr.ConcurrentTransactions.Code, ProducerID: -1,
+					})
+				}
+				existing.ending = true
+				s.txnMu.Unlock()
+				existing.inFlight.Wait()
+				s.txnMu.Lock()
+				if existing.pendingAction == "" {
+					if s.orderedFormatter != nil {
+						if err := s.txnLog.AppendTopicTerminal(txnID, existing.instance, "abort"); err != nil {
+							existing.ending = false
+							s.txnStoreErr = fmt.Errorf("ordered WAL zombie abort: %w", err)
+							s.txnMu.Unlock()
+							return s.sendResponse(conn, connID, correlationID, &kmsg.InitProducerIDResponse{
+								Version: apiVersion, ErrorCode: kerr.UnknownServerError.Code, ProducerID: -1,
+							})
+						}
+					}
+					existing.pendingAction = "abort"
+					if err := s.persistTxnStateLocked(); err != nil {
+						existing.ending = false
+						s.txnMu.Unlock()
+						s.logger.Errorf("[conn:%d] InitProducerId: durable abort decision failed: %v", connID, err)
+						return s.sendResponse(conn, connID, correlationID, &kmsg.InitProducerIDResponse{
+							Version: apiVersion, ErrorCode: kerr.UnknownServerError.Code, ProducerID: -1,
+						})
+					}
+				}
+				instance := existing.instance
+				s.txnMu.Unlock()
+				var err error
+				if s.orderedFormatter == nil {
+					err = s.deliverEvent(ctx, &TxnAbortEvent{TransactionalID: txnID, TransactionInstance: instance})
+				}
+				// The ordered WAL's durable abort decision is sufficient
+				// for zombie fencing. File publication is asynchronous.
+				s.txnMu.Lock()
+				existing.ending = false
+				if err != nil {
+					existing.needsResolution = true
+					_ = s.persistTxnStateLocked()
+					s.txnMu.Unlock()
+					s.logger.Errorf("[conn:%d] InitProducerId: unable to abort old producer %s: %v", connID, txnID, err)
+					return s.sendResponse(conn, connID, correlationID, &kmsg.InitProducerIDResponse{
+						Version: apiVersion, ErrorCode: kerr.UnknownServerError.Code, ProducerID: -1,
+					})
+				}
 				existing.active = false
+				existing.needsResolution = false
+				existing.hasOutcome = false
+			}
+			// A restart may have restored an irreversible decision without a
+			// corresponding materializer outcome. Never fence it away and
+			// start a new transaction: require operator recovery instead.
+			if existing.pendingAction != "" && existing.restartRequired {
+				s.txnMu.Unlock()
+				return s.sendResponse(conn, connID, correlationID, &kmsg.InitProducerIDResponse{
+					Version: apiVersion, ErrorCode: kerr.ConcurrentTransactions.Code, ProducerID: -1,
+				})
 			}
 			if existing.epoch == math.MaxInt16 {
-				// int16 would overflow — rotate to a new producer ID
-				// and reset the epoch to avoid confusing clients.
-				newPID := s.producerIDCounter.Add(1)
-				existing.producerID = newPID
+				existing.producerID = s.producerIDCounter.Add(1)
 				existing.epoch = 0
-				s.logger.Warnf("[conn:%d] InitProducerId: epoch overflow for txnID=%s, rotated to new producerID=%d",
-					connID, txnID, newPID)
 			} else {
 				existing.epoch++
 			}
-			// Copy fields before releasing the lock to avoid a data race.
-			producerID := existing.producerID
-			epoch := existing.epoch
+			existing.active = false
+			existing.needsResolution = false
+			existing.pendingAction = ""
+			existing.hasOutcome = false
+			existing.restartRequired = false
+			existing.sequences = make(map[string]txnPartitionSequence)
+			existing.topics = nil
+			if err := s.persistTxnStateLocked(); err != nil {
+				s.txnMu.Unlock()
+				s.logger.Errorf("[conn:%d] InitProducerId: persist epoch change: %v", connID, err)
+				return s.sendResponse(conn, connID, correlationID, &kmsg.InitProducerIDResponse{
+					Version: apiVersion, ErrorCode: kerr.UnknownServerError.Code, ProducerID: -1,
+				})
+			}
+			producerID, epoch := existing.producerID, existing.epoch
 			s.txnMu.Unlock()
-
-			// Deliver the abort event outside the lock to avoid deadlocks.
-			if needsAbort {
-				if err := s.deliverEvent(ctx, &TxnAbortEvent{TransactionalID: txnID}); err != nil {
-					s.logger.Errorf("[conn:%d] InitProducerId: failed to deliver zombie abort event: %v", connID, err)
-				}
-			}
-
-			resp := &kmsg.InitProducerIDResponse{
-				Version:       apiVersion,
-				ProducerID:    producerID,
-				ProducerEpoch: epoch,
-			}
 			s.logger.Debugf("[conn:%d] InitProducerId: txnID=%s, producerID=%d, epoch=%d (existing)",
 				connID, txnID, producerID, epoch)
-			return s.sendResponse(conn, connID, correlationID, resp)
+			return s.sendResponse(conn, connID, correlationID, &kmsg.InitProducerIDResponse{
+				Version: apiVersion, ProducerID: producerID, ProducerEpoch: epoch,
+			})
 		}
-
-		// Cap the number of tracked transactional IDs to prevent unbounded
-		// memory growth from misbehaving or malicious clients.
 		if len(s.txnStates) >= maxTxnStates {
 			s.txnMu.Unlock()
 			s.logger.Warnf("[conn:%d] Rejecting InitProducerId: too many transactional IDs tracked (%d)", connID, maxTxnStates)
-			resp := &kmsg.InitProducerIDResponse{
-				Version:    apiVersion,
-				ErrorCode:  kerr.UnknownServerError.Code,
-				ProducerID: -1,
-			}
-			return s.sendResponse(conn, connID, correlationID, resp)
+			return s.sendResponse(conn, connID, correlationID, &kmsg.InitProducerIDResponse{
+				Version: apiVersion, ErrorCode: kerr.UnknownServerError.Code, ProducerID: -1,
+			})
 		}
-
-		// New transactional ID — assign a fresh producer ID.
 		producerID := s.producerIDCounter.Add(1)
 		s.txnStates[txnID] = &txnState{
-			producerID: producerID,
-			epoch:      0,
-			active:     false,
+			producerID: producerID, epoch: 0,
+			sequences: make(map[string]txnPartitionSequence),
+		}
+		if err := s.persistTxnStateLocked(); err != nil {
+			s.txnMu.Unlock()
+			s.logger.Errorf("[conn:%d] InitProducerId: persist new producer %s: %v", connID, txnID, err)
+			return s.sendResponse(conn, connID, correlationID, &kmsg.InitProducerIDResponse{
+				Version: apiVersion, ErrorCode: kerr.UnknownServerError.Code, ProducerID: -1,
+			})
 		}
 		s.txnMu.Unlock()
-
-		resp := &kmsg.InitProducerIDResponse{
-			Version:       apiVersion,
-			ProducerID:    producerID,
-			ProducerEpoch: 0,
-		}
-		s.logger.Debugf("[conn:%d] InitProducerId: txnID=%s, producerID=%d, epoch=0 (new)",
-			connID, txnID, producerID)
-		return s.sendResponse(conn, connID, correlationID, resp)
+		return s.sendResponse(conn, connID, correlationID, &kmsg.InitProducerIDResponse{
+			Version: apiVersion, ProducerID: producerID, ProducerEpoch: 0,
+		})
 	}
 
-	// Non-transactional idempotent producer — just assign an ID.
+	// Non-transactional idempotent producers also draw from the same
+	// monotonically increasing ID space. In ordered mode their producer
+	// epoch and dedup sequence history must be journaled alongside the ID,
+	// or a lost Produce response would silently duplicate final output.
+	s.txnMu.Lock()
+	if s.txnStoreErr != nil {
+		s.txnMu.Unlock()
+		return s.sendResponse(conn, connID, correlationID, &kmsg.InitProducerIDResponse{
+			Version: apiVersion, ErrorCode: kerr.UnknownServerError.Code, ProducerID: -1,
+		})
+	}
 	producerID := s.producerIDCounter.Add(1)
+	if s.orderedFormatter!=nil {
+		if len(s.idempotentStates)>=maxTxnStates {
+			// Reclaim only producers with a durable inactivity timestamp.
+			// The state checkpoint must become durable before we reuse the
+			// capacity; a failure poisons further coordinator mutations.
+			cutoff:=time.Now().Add(-idempotentProducerRetention).UnixNano()
+			snapshot:=s.txnSnapshotLocked()
+			reclaimExpiredIdempotent(&snapshot,cutoff)
+			if len(snapshot.Idempotent)<len(s.idempotentStates) {
+				if err:=s.txnLog.AppendState(snapshot);err!=nil {
+					s.txnStoreErr=fmt.Errorf("persist idempotent producer reclamation: %w",err)
+					s.txnMu.Unlock()
+					return s.sendResponse(conn,connID,correlationID,&kmsg.InitProducerIDResponse{
+						Version:apiVersion,ErrorCode:kerr.UnknownServerError.Code,ProducerID:-1,
+					})
+				}
+				s.idempotentStates=snapshot.Idempotent
+			}
+		}
+		if len(s.idempotentStates)>=maxTxnStates {
+			s.txnMu.Unlock()
+			return s.sendResponse(conn,connID,correlationID,&kmsg.InitProducerIDResponse{
+				Version:apiVersion,ErrorCode:kerr.UnknownServerError.Code,ProducerID:-1,
+			})
+		}
+		s.idempotentStates[producerID]=storedIdempotentProducer{
+			Epoch:0,LastActivityUnixNano:time.Now().UnixNano(),Sequences:make(map[string]txnPartitionSequence),
+		}
+	}
+	if err := s.persistTxnStateLocked(); err != nil {
+		s.txnMu.Unlock()
+		return s.sendResponse(conn, connID, correlationID, &kmsg.InitProducerIDResponse{
+			Version: apiVersion, ErrorCode: kerr.UnknownServerError.Code, ProducerID: -1,
+		})
+	}
+	s.txnMu.Unlock()
 
 	resp := &kmsg.InitProducerIDResponse{
 		Version:       apiVersion,
@@ -446,14 +871,21 @@ func (s *Server) handleAddPartitionsToTxn(conn net.Conn, connID uint64, correlat
 		Version: apiVersion,
 	}
 
+	hasSupportedPartition := false
 	for _, topic := range req.Topics {
 		topicResp := kmsg.AddPartitionsToTxnResponseTopic{
 			Topic: topic.Topic,
 		}
 		for _, partition := range topic.Partitions {
+			code := int16(0)
+			if partition != onlyPartition || !s.isTopicAllowed(topic.Topic) {
+				code = kerr.UnknownTopicOrPartition.Code
+			} else {
+				hasSupportedPartition = true
+			}
 			topicResp.Partitions = append(topicResp.Partitions, kmsg.AddPartitionsToTxnResponseTopicPartition{
 				Partition: partition,
-				ErrorCode: 0,
+				ErrorCode: code,
 			})
 		}
 		resp.Topics = append(resp.Topics, topicResp)
@@ -462,7 +894,7 @@ func (s *Server) handleAddPartitionsToTxn(conn net.Conn, connID uint64, correlat
 	// Validate producerID/epoch against txnState and mark the transaction as active.
 	s.txnMu.Lock()
 	st, stOK := s.txnStates[req.TransactionalID]
-	if !stOK || st.producerID != req.ProducerID || st.epoch != req.ProducerEpoch {
+	if !stOK || st.producerID != req.ProducerID || st.epoch != req.ProducerEpoch || st.restartRequired {
 		s.txnMu.Unlock()
 		// Return ProducerFenced for all partitions.
 		for ti := range resp.Topics {
@@ -474,7 +906,66 @@ func (s *Server) handleAddPartitionsToTxn(conn net.Conn, connID uint64, correlat
 			connID, req.TransactionalID, req.ProducerID, req.ProducerEpoch)
 		return s.sendResponse(conn, connID, correlationID, resp)
 	}
-	st.active = true
+	if st.ending || st.needsResolution || s.txnStoreErr != nil {
+		s.txnMu.Unlock()
+		for ti := range resp.Topics {
+			for pi := range resp.Topics[ti].Partitions {
+				resp.Topics[ti].Partitions[pi].ErrorCode = kerr.InvalidTxnState.Code
+			}
+		}
+		return s.sendResponse(conn, connID, correlationID, resp)
+	}
+	// An invalid-only request must not create an active transaction.
+	if !hasSupportedPartition {
+		s.txnMu.Unlock()
+		return s.sendResponse(conn, connID, correlationID, resp)
+	}
+	if !st.active {
+		instance, instanceErr := newTxnInstance(req.TransactionalID)
+		if instanceErr != nil {
+			s.txnMu.Unlock()
+			for ti := range resp.Topics {
+				for pi := range resp.Topics[ti].Partitions {
+					resp.Topics[ti].Partitions[pi].ErrorCode = kerr.UnknownServerError.Code
+				}
+			}
+			return s.sendResponse(conn, connID, correlationID, resp)
+		}
+		st.instance = instance
+		st.topics = nil
+		st.active = true
+		st.hasOutcome = false
+		st.pendingAction = ""
+	}
+	// All supported topic participants must be persisted, including topics
+	// enrolled AFTER the transaction was already active. Retried enrollment
+	// is idempotent, and rejected partitions never enter the participant set.
+	participants := make(map[string]bool, len(st.topics))
+	for _, topic := range st.topics { participants[topic] = true }
+	changed := false
+	for _, topic := range req.Topics {
+		if !s.isTopicAllowed(topic.Topic) { continue }
+		for _, partition := range topic.Partitions {
+			if partition == onlyPartition && !participants[topic.Topic] {
+				participants[topic.Topic] = true
+				st.topics = append(st.topics, topic.Topic)
+				changed = true
+			}
+		}
+	}
+	if changed { sort.Strings(st.topics) }
+	if changed || len(st.topics)==0 {
+		if err := s.persistTxnStateLocked(); err != nil {
+			s.txnMu.Unlock()
+			s.logger.Errorf("[conn:%d] AddPartitionsToTxn: persist active participant set: %v", connID, err)
+			for ti := range resp.Topics {
+				for pi := range resp.Topics[ti].Partitions {
+					resp.Topics[ti].Partitions[pi].ErrorCode = kerr.UnknownServerError.Code
+				}
+			}
+			return s.sendResponse(conn, connID, correlationID, resp)
+		}
+	}
 	s.txnMu.Unlock()
 
 	s.logger.Debugf("[conn:%d] AddPartitionsToTxn: txnID=%s, topics=%d", connID, req.TransactionalID, len(req.Topics))
@@ -509,36 +1000,108 @@ func (s *Server) handleEndTxn(ctx context.Context, conn net.Conn, connID uint64,
 		Version: apiVersion,
 	}
 
-	// Validate producerID/epoch against txnState before allowing the commit/abort.
-	fenced := false
+	// Never transition to inactive before the output writer has succeeded.
+	// A failed EndTxn leaves the transaction unresolved: a retry or abort is
+	// allowed, but new Produce/AddPartitions requests are blocked.
 	s.txnMu.Lock()
-	if st, ok := s.txnStates[req.TransactionalID]; ok {
-		if st.producerID != req.ProducerID || st.epoch != req.ProducerEpoch {
-			fenced = true
-		} else {
-			st.active = false
-		}
-	} else {
-		fenced = true
-	}
-	s.txnMu.Unlock()
-
-	if fenced {
+	st, ok := s.txnStates[req.TransactionalID]
+	switch {
+	case !ok || st.producerID != req.ProducerID || st.epoch != req.ProducerEpoch:
+		s.txnMu.Unlock()
 		resp.ErrorCode = kerr.ProducerFenced.Code
-		s.logger.Warnf("[conn:%d] EndTxn fenced: txnID=%s, producerID=%d, epoch=%d",
-			connID, req.TransactionalID, req.ProducerID, req.ProducerEpoch)
+		return s.sendResponse(conn, connID, correlationID, resp)
+	case st.ending:
+		s.txnMu.Unlock()
+		resp.ErrorCode = kerr.ConcurrentTransactions.Code
+		return s.sendResponse(conn, connID, correlationID, resp)
+	case s.txnStoreErr != nil:
+		s.txnMu.Unlock()
+		resp.ErrorCode = kerr.UnknownServerError.Code
+		return s.sendResponse(conn, connID, correlationID, resp)
+	case !st.active:
+		// A lost EndTxn response can be retried without duplicating commits.
+		repeated := st.hasOutcome && st.lastCommit == req.Commit
+		s.txnMu.Unlock()
+		if !repeated {
+			resp.ErrorCode = kerr.InvalidTxnState.Code
+		}
 		return s.sendResponse(conn, connID, correlationID, resp)
 	}
+	if st.pendingAction != "" && st.pendingAction != action {
+		s.txnMu.Unlock()
+		resp.ErrorCode = kerr.InvalidTxnState.Code
+		return s.sendResponse(conn, connID, correlationID, resp)
+	}
+	st.ending = true // fence new Produce before draining admitted requests
+	s.txnMu.Unlock()
+	st.inFlight.Wait()
 
-	// Deliver a transaction-end event through Read so the consumer
-	// can handle commit/abort as part of the pull-based flow.
+	s.txnMu.Lock()
+	// A failed Produce may have appended partial data to the WAL or staged
+	// files. Never commit it, even if the producer sends EndTxn(commit).
+	if req.Commit && st.needsResolution && st.pendingAction == "" {
+		st.ending = false
+		s.txnMu.Unlock()
+		resp.ErrorCode = kerr.InvalidTxnState.Code
+		return s.sendResponse(conn, connID, correlationID, resp)
+	}
+	if st.pendingAction == "" {
+		// One atomic WAL frame contains the outcome and every enrolled
+		// topic's control-marker offset. Commit success never depends on
+		// when the per-topic file materializer finishes publishing.
+		if s.orderedFormatter != nil {
+			if err := s.txnLog.AppendTopicTerminal(req.TransactionalID, st.instance, action); err != nil {
+				st.ending = false
+				s.txnStoreErr = fmt.Errorf("ordered WAL terminal decision: %w", err)
+				s.txnMu.Unlock()
+				resp.ErrorCode = kerr.UnknownServerError.Code
+				return s.sendResponse(conn, connID, correlationID, resp)
+			}
+		}
+		st.pendingAction = action
+		if err := s.persistTxnStateLocked(); err != nil {
+			st.ending = false
+			s.txnMu.Unlock()
+			s.logger.Errorf("[conn:%d] EndTxn: failed to persist decision: %v", connID, err)
+			resp.ErrorCode = kerr.UnknownServerError.Code
+			return s.sendResponse(conn, connID, correlationID, resp)
+		}
+	}
+	instance := st.instance
+	s.txnMu.Unlock()
+
 	var evt Event
 	if req.Commit {
-		evt = &TxnCommitEvent{TransactionalID: req.TransactionalID}
+		evt = &TxnCommitEvent{TransactionalID: req.TransactionalID, TransactionInstance: instance}
 	} else {
-		evt = &TxnAbortEvent{TransactionalID: req.TransactionalID}
+		evt = &TxnAbortEvent{TransactionalID: req.TransactionalID, TransactionInstance: instance}
 	}
-	if err := s.deliverEvent(ctx, evt); err != nil {
+	var err error
+	if s.orderedFormatter == nil {
+		err = s.deliverEvent(ctx, evt)
+	}
+	// With ordered output the durable coordinator decision is sufficient for
+	// EndTxn success. A separate materializer advances topic files later.
+
+	s.txnMu.Lock()
+	st.ending = false
+	if err != nil {
+		st.needsResolution = true
+	} else {
+		st.active = false
+		st.needsResolution = false
+		st.hasOutcome = true
+		st.lastCommit = req.Commit
+		st.pendingAction = ""
+	}
+	if persistErr := s.persistTxnStateLocked(); persistErr != nil {
+		if err == nil {
+			err = persistErr // external commit may have succeeded: never fake an ack
+		}
+		st.needsResolution = true
+	}
+	s.txnMu.Unlock()
+	if err != nil {
 		s.logger.Errorf("[conn:%d] EndTxn: failed to deliver txn event: %v", connID, err)
 		resp.ErrorCode = kerr.UnknownServerError.Code
 		return s.sendResponse(conn, connID, correlationID, resp)

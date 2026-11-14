@@ -101,55 +101,15 @@ func TestPatternFileWriterEmptyTopic(t *testing.T) {
 	require.FileExists(t, expected)
 }
 
-func TestTxnFileWriterWithTopicPlaceholder(t *testing.T) {
+// Partition-based routing is deliberately not offered: every topic has
+// exactly one partition, and unknown placeholders must not become file names.
+func TestPatternFileWriterRejectsPartitionPlaceholder(t *testing.T) {
 	dir := t.TempDir()
-	pattern := filepath.Join(dir, "{topic}-{txnID}.jsonl")
-
-	w, err := output.NewTxnFileWriter(pattern)
-	require.NoError(t, err)
-	t.Cleanup(func() { w.Close() }) //nolint:errcheck
-
-	// Write to two topics in the same transaction.
-	msg1 := &ksink.Message{TransactionalID: "txn-1", Topic: "orders"}
-	msg2 := &ksink.Message{TransactionalID: "txn-1", Topic: "events"}
-
-	require.NoError(t, w.Write([]byte("order\n"), msg1))
-	require.NoError(t, w.Write([]byte("event\n"), msg2))
-
-	// Both temp files should exist before commit.
-	require.FileExists(t, filepath.Join(dir, "orders-txn-1.jsonl.tmp"))
-	require.FileExists(t, filepath.Join(dir, "events-txn-1.jsonl.tmp"))
-
-	require.NoError(t, w.CommitTxn("txn-1"))
-
-	// After commit: both committed files should exist.
-	data1, err := os.ReadFile(filepath.Join(dir, "orders-txn-1.jsonl"))
-	require.NoError(t, err)
-	assert.Equal(t, "order\n", string(data1))
-
-	data2, err := os.ReadFile(filepath.Join(dir, "events-txn-1.jsonl"))
-	require.NoError(t, err)
-	assert.Equal(t, "event\n", string(data2))
-
-	// Temp files should be gone.
-	requireNoFile(t, filepath.Join(dir, "orders-txn-1.jsonl.tmp"))
-	requireNoFile(t, filepath.Join(dir, "events-txn-1.jsonl.tmp"))
-}
-
-func TestTxnFileWriterWithTopicAbort(t *testing.T) {
-	dir := t.TempDir()
-	pattern := filepath.Join(dir, "{topic}-{txnID}.jsonl")
-
-	w, err := output.NewTxnFileWriter(pattern)
-	require.NoError(t, err)
-	t.Cleanup(func() { w.Close() }) //nolint:errcheck
-
-	msg := &ksink.Message{TransactionalID: "txn-abort", Topic: "orders"}
-	require.NoError(t, w.Write([]byte("data\n"), msg))
-
-	require.NoError(t, w.AbortTxn("txn-abort"))
-
-	// After abort: temp and committed files should not exist.
-	requireNoFile(t, filepath.Join(dir, "orders-txn-abort.jsonl.tmp"))
-	requireNoFile(t, filepath.Join(dir, "orders-txn-abort.jsonl"))
+	for _, pattern := range []string{
+		"{topic}-{partition}.jsonl",
+		"part-{partition}.bin",
+	} {
+		_, err := output.Open(filepath.Join(dir, pattern), nil)
+		require.ErrorContains(t, err, "{partition} is unsupported")
+	}
 }
