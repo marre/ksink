@@ -66,6 +66,7 @@ type transactionWALRecord struct {
 	Output   *WALOutputRecord
 	TopicOutput *WALTopicRecord
 	Decision string
+	BatchCount int
 	TxnID    string
 	Instance string
 	HasOutput bool
@@ -277,6 +278,11 @@ func (l *TransactionLog) scanWALFile(key walFileKey, active bool) error {
 	defer f.Close() //nolint:errcheck
 	l.fileStats[key]=&walFileStats{}
 	var offset int64
+	var pending []struct {
+		rec transactionWALRecord
+		offset, bytes int64
+	}
+	var pendingStart int64
 	for {
 		var header [8]byte
 		n,err:=io.ReadFull(f,header[:])
@@ -300,13 +306,41 @@ func (l *TransactionLog) scanWALFile(key walFileKey, active bool) error {
 		}
 		rec,err:=decodeTxnWALRecord(payload)
 		if err!=nil{return fmt.Errorf("decode WAL record in %s at %d: %w",path,offset,err)}
-		if err=l.apply(rec,offset,int64(len(header))+int64(length),key);err!=nil{
-			return fmt.Errorf("invalid WAL record in %s at %d: %w",path,offset,err)
+		frameSize := int64(len(header))+int64(length)
+		if rec.Type == "topic-output" {
+			if len(pending) == 0 { pendingStart = offset }
+			pending = append(pending, struct {
+				rec transactionWALRecord
+				offset, bytes int64
+			}{rec: rec, offset: offset, bytes: frameSize})
+		} else {
+			if len(pending)>0 {
+				if rec.Type!="topic-accept" || rec.BatchCount!=len(pending) {
+					return fmt.Errorf("missing or mismatched topic WAL acceptance boundary in %s at %d", path, offset)
+				}
+				for _, item := range pending {
+					if err=l.apply(item.rec,item.offset,item.bytes,key);err!=nil {
+						return fmt.Errorf("invalid topic WAL record in %s at %d: %w", path,item.offset,err)
+					}
+				}
+				pending=nil
+			} else if rec.Type=="topic-accept" {
+				return fmt.Errorf("orphaned topic WAL acceptance boundary in %s at %d",path,offset)
+			}
+			if err=l.apply(rec,offset,frameSize,key);err!=nil {
+				return fmt.Errorf("invalid WAL record in %s at %d: %w",path,offset,err)
+			}
 		}
-		offset+=int64(len(header))+int64(length)
+		offset+=frameSize
 	}
 	info,err:=f.Stat()
 	if err!=nil{return err}
+	if len(pending)>0 {
+		if !active { return fmt.Errorf("uncommitted batch in sealed WAL file %s at %d",path,pendingStart) }
+		// A complete prefix of an unacknowledged multi-record batch is NOT
+		// accepted data. Discard it atomically on active-tail recovery.
+		offset=pendingStart
+	}
 	if info.Size()!=offset {
 		if !active{return fmt.Errorf("sealed WAL %s has incomplete tail",path)}
 		if err=l.logFile.Truncate(offset);err!=nil{return fmt.Errorf("truncate torn WAL tail: %w",err)}
@@ -384,6 +418,11 @@ func (l *TransactionLog) apply(rec transactionWALRecord, frameOffset, frameBytes
 		})
 		l.topicNext[topic]++
 		if metadata.Instance != "" { l.topicInstances[metadata.Instance] = true }
+	case "topic-accept":
+		if rec.BatchCount <= 0 { return fmt.Errorf("invalid topic WAL batch acceptance marker") }
+		// The completed batch is already indexed. This replay delimiter is
+		// obsolete in a checkpoint once its records have been copied.
+		l.markFrameDead(walFrameRef{key:source,size:frameBytes})
 	case "topic-decision":
 		if rec.TxnID == "" || !txnWALValidInstance(rec.Instance) ||
 			(rec.Decision != "commit" && rec.Decision != "abort") {
