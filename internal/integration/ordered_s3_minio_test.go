@@ -20,6 +20,7 @@ import (
     "github.com/ory/dockertest/v3"
     "github.com/ory/dockertest/v3/docker"
     "github.com/stretchr/testify/require"
+    "github.com/twmb/franz-go/pkg/kgo"
 )
 
 // This exercises real conditional PUT and conditional multipart completion
@@ -141,4 +142,70 @@ func TestOrderedS3MinIOPublicationAndRecovery(t *testing.T) {
     err=w.Flush(ctx)
     require.ErrorContains(t,err,"mismatch")
     require.Equal(t,int64(2),wal.TopicProgress("orders").Cursor)
+    // Run real Kafka multi-topic transactions into this same S3 backend.
+    // A committed object may contain multiple transactions, while aborted
+    // application records and all control markers must remain invisible.
+    txWal,err:=ksink.OpenTransactionLog(filepath.Join(t.TempDir(),"transactional-wal"))
+    require.NoError(t,err)
+    defer func(){require.NoError(t,txWal.Close())}()
+    txWriter,err:=output.NewS3OrderedTopicMaterializer(txWal,
+        "s3://"+bucket+"/data/transactions/{topic}/messages-{seq:08}.jsonl",
+        opts,128<<20,time.Minute)
+    require.NoError(t,err)
+    formatter:=func(msg *ksink.Message)([]byte,error){
+        return []byte(fmt.Sprintf("%s/%d:%s\\n",msg.Topic,msg.Offset,msg.Value)),nil
+    }
+    srv,err:=ksink.New(ksink.Config{
+        Address:fmt.Sprintf("127.0.0.1:%d",getFreePort(t)),
+        TransactionalWrite:true,Timeout:5*time.Second,
+    },ksink.WithTransactionLog(txWal),
+        ksink.WithOrderedTransactionalOutput(formatter),
+        ksink.WithLogger(&integrationLogger{t}))
+    require.NoError(t,err)
+    require.NoError(t,srv.Start(ctx))
+    txCtx,txCancel:=context.WithTimeout(ctx,30*time.Second)
+    defer txCancel()
+    txClient,err:=kgo.NewClient(
+        kgo.SeedBrokers(srv.Addr().String()),
+        kgo.RequestTimeoutOverhead(5*time.Second),
+        kgo.TransactionalID("s3-ordered-transactions"),
+    )
+    require.NoError(t,err)
+    require.NoError(t,txClient.BeginTransaction())
+    require.NoError(t,txClient.ProduceSync(txCtx,
+        &kgo.Record{Topic:"orders",Value:[]byte("first")},
+        &kgo.Record{Topic:"payments",Value:[]byte("paid")},
+    ).FirstErr())
+    require.NoError(t,txClient.EndTransaction(txCtx,kgo.TryCommit))
+    require.NoError(t,txClient.BeginTransaction())
+    require.NoError(t,txClient.ProduceSync(txCtx,
+        &kgo.Record{Topic:"orders",Value:[]byte("aborted")},
+        &kgo.Record{Topic:"payments",Value:[]byte("aborted")},
+    ).FirstErr())
+    require.NoError(t,txClient.EndTransaction(txCtx,kgo.TryAbort))
+    require.NoError(t,txClient.BeginTransaction())
+    require.NoError(t,txClient.ProduceSync(txCtx,
+        &kgo.Record{Topic:"orders",Value:[]byte("later")},
+    ).FirstErr())
+    require.NoError(t,txClient.EndTransaction(txCtx,kgo.TryCommit))
+    txClient.Close()
+    require.NoError(t,srv.Close(ctx))
+    require.NoError(t,txWriter.Flush(ctx))
+    for topic,want:=range map[string]string{
+        "orders":"orders/0:first\\norders/4:later\\n",
+        "payments":"payments/0:paid\\n",
+    } {
+        object,readErr:=client.GetObject(ctx,&s3.GetObjectInput{
+            Bucket:aws.String(bucket),
+            Key:aws.String("data/transactions/"+topic+"/messages-00000001.jsonl"),
+        })
+        require.NoError(t,readErr)
+        data,readErr:=io.ReadAll(object.Body)
+        require.NoError(t,readErr)
+        require.NoError(t,object.Body.Close())
+        require.Equal(t,want,string(data))
+        require.NotContains(t,string(data),"aborted")
+        require.Equal(t,uint64(2),txWal.TopicProgress(topic).NextFile)
+    }
+
 }
