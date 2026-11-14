@@ -33,7 +33,7 @@ func TestOrderedS3MinIOPublicationAndRecovery(t *testing.T) {
 
     pool:=newDockerPool(t)
     resource,err:=pool.RunWithOptions(&dockertest.RunOptions{
-        Repository:"minio/minio",Tag:"RELEASE.2025-09-07T16-13-09Z",
+        Repository:"ghcr.io/intikhab49/minio-from-source",Tag:"RELEASE.2025-09-07T16-13-09Z",
         Cmd:[]string{"server","/data","--address",":9000"},
         ExposedPorts:[]string{"9000/tcp"},
         Env:[]string{"MINIO_ROOT_USER=minioadmin","MINIO_ROOT_PASSWORD=minioadmin"},
