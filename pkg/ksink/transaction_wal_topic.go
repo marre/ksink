@@ -194,6 +194,9 @@ func (l *TransactionLog) appendTopicBatch(records []WALTopicRecord, snapshot *tx
 			if err != nil { return nil, fmt.Errorf("format topic record: %w", err) }
 			r.Data = encoded
 		}
+		if len(r.Data)==0 {
+			return nil, fmt.Errorf("ordered WAL record for %q at offset %d has no formatted bytes",r.Topic,offset)
+		}
 		r.Data = append([]byte(nil), r.Data...)
 		next[r.Topic] = offset + 1
 		offsets = append(offsets, offset)
