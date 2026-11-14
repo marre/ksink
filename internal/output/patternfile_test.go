@@ -101,36 +101,15 @@ func TestPatternFileWriterEmptyTopic(t *testing.T) {
 	require.FileExists(t, expected)
 }
 
-// Partition routing is opt-in: omitting {partition} preserves per-topic routing.
-func TestPatternFileWriterRoutesByPartition(t *testing.T) {
- dir := t.TempDir()
- w, err := output.Open(filepath.Join(dir, "{topic}-{partition}.jsonl"), nil)
- require.NoError(t, err)
- require.NoError(t, w.Write([]byte("a\n"), &ksink.Message{Topic:"orders", Partition:0}))
- require.NoError(t, w.Write([]byte("b\n"), &ksink.Message{Topic:"orders", Partition:1}))
- require.NoError(t, w.Write([]byte("c\n"), &ksink.Message{Topic:"orders", Partition:0}))
- require.NoError(t, w.Write([]byte("d\n"), &ksink.Message{Topic:"events", Partition:0}))
- require.NoError(t, w.Close())
- for path, want := range map[string]string{
-  "orders-0.jsonl":"a\nc\n",
-  "orders-1.jsonl":"b\n",
-  "events-0.jsonl":"d\n",
- } {
-  b, err := os.ReadFile(filepath.Join(dir,path))
-  require.NoError(t,err)
-  assert.Equal(t,want,string(b))
- }
+// Partition-based routing is deliberately not offered: every topic has
+// exactly one partition, and unknown placeholders must not become file names.
+func TestPatternFileWriterRejectsPartitionPlaceholder(t *testing.T) {
+	dir := t.TempDir()
+	for _, pattern := range []string{
+		"{topic}-{partition}.jsonl",
+		"part-{partition}.bin",
+	} {
+		_, err := output.Open(filepath.Join(dir, pattern), nil)
+		require.ErrorContains(t, err, "{partition} is unsupported")
+	}
 }
-
-func TestPatternFileWriterPartitionOnly(t *testing.T) {
- dir := t.TempDir()
- w, err := output.Open(filepath.Join(dir, "part-{partition}.bin"), nil)
- require.NoError(t, err)
- require.NoError(t,w.Write([]byte("first\n"), &ksink.Message{Topic:"a",Partition:2}))
- require.NoError(t,w.Write([]byte("second\n"), &ksink.Message{Topic:"b",Partition:2}))
- require.NoError(t,w.Close())
- b,err:=os.ReadFile(filepath.Join(dir,"part-2.bin"))
- require.NoError(t,err)
- assert.Equal(t,"first\nsecond\n",string(b))
-}
-
