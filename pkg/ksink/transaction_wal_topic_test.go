@@ -111,3 +111,78 @@ func TestSharedWALTopicOffsetOverflowFailsSafely(t *testing.T) {
 	_, err := wal.AppendTopicBatch([]WALTopicRecord{{Topic: "orders", Data: []byte("no")}})
 	require.ErrorContains(t, err, "exhausted")
 }
+
+func TestSharedWALReadCommittedStableOffsetAndGenerationReuse(t *testing.T) {
+	root := t.TempDir()
+	wal, err := OpenTransactionLog(filepath.Join(root, ".ksink-kafka-state"))
+	require.NoError(t, err)
+	require.NoError(t, wal.BindOutput(filepath.Join(root, "data", "{topic}", "messages-{seq:08}.jsonl")))
+
+	aInstance, err := newTxnInstance("A")
+	require.NoError(t, err)
+	bInstance, err := newTxnInstance("B")
+	require.NoError(t, err)
+	state := wal.CurrentState()
+	state.States["A"] = storedTxnState{ProducerID: state.Counter, Epoch: 0, Active: true, Instance: aInstance}
+	state.States["B"] = storedTxnState{ProducerID: state.Counter, Epoch: 0, Active: true, Instance: bInstance}
+	require.NoError(t, wal.AppendState(state))
+	app := func(topic, id, instance, value string) {
+		t.Helper()
+		_, appendErr := wal.AppendTopicBatch([]WALTopicRecord{{
+			Topic: topic, TransactionID: id, Instance: instance, Data: []byte(value),
+		}})
+		require.NoError(t, appendErr)
+	}
+	app("orders", "A", aInstance, "created")
+	app("orders", "B", bInstance, "paid")
+	app("orders", "A", aInstance, "updated")
+	_, err = wal.AppendTopicBatch([]WALTopicRecord{{Topic: "payments", Data: []byte("immediate")}})
+	require.NoError(t, err)
+	require.Equal(t, int64(0), wal.TopicStableOffset("orders"))
+	require.Equal(t, int64(1), wal.TopicStableOffset("payments"), "other topic remains unblocked")
+
+	state = wal.CurrentState()
+	b := state.States["B"]
+	b.Pending = "commit"
+	state.States["B"] = b
+	require.NoError(t, wal.AppendState(state))
+	require.Equal(t, "commit", wal.TopicTransactionDecision(bInstance))
+	require.Equal(t, int64(0), wal.TopicStableOffset("orders"), "committed B stays behind unresolved A")
+
+	state = wal.CurrentState()
+	a := state.States["A"]
+	a.Pending = "abort"
+	state.States["A"] = a
+	require.NoError(t, wal.AppendState(state))
+	require.Equal(t, int64(3), wal.TopicStableOffset("orders"))
+	require.Equal(t, "abort", wal.TopicTransactionDecision(aInstance))
+
+	// Producer A may now start a new generation before the old records have
+	// reached the eventual output materializer.
+	nextA, err := newTxnInstance("A")
+	require.NoError(t, err)
+	state = wal.CurrentState()
+	a = state.States["A"]
+	a.Instance = nextA
+	a.Pending = ""
+	a.Active = true
+	state.States["A"] = a
+	require.NoError(t, wal.AppendState(state))
+	require.Equal(t, "abort", wal.TopicTransactionDecision(aInstance))
+	require.NoError(t, wal.Compact())
+	require.NoError(t, wal.Close())
+
+	reopened, err := OpenTransactionLog(filepath.Join(root, ".ksink-kafka-state"))
+	require.NoError(t, err)
+	defer func() { _ = reopened.Close() }()
+	require.Equal(t, "abort", reopened.TopicTransactionDecision(aInstance))
+	require.Equal(t, "commit", reopened.TopicTransactionDecision(bInstance))
+	require.Equal(t, int64(3), reopened.TopicStableOffset("orders"))
+	require.Equal(t, int64(1), reopened.TopicStableOffset("payments"))
+	for i, want := range []string{"created", "paid", "updated"} {
+		rec, ok, readErr := reopened.ReadTopicRecord("orders", int64(i))
+		require.NoError(t, readErr)
+		require.True(t, ok)
+		require.Equal(t, want, string(rec.Data))
+	}
+}
