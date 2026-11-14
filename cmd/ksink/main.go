@@ -220,45 +220,21 @@ func runWithRotation(addr, dst, fmtName, fmtStr string, jsonB64Key, jsonB64Val b
 	}
 
 	var w output.Writer
-	isHTTP := strings.HasPrefix(dst, "http://") || strings.HasPrefix(dst, "https://")
-	var txnLog *ksink.TransactionLog
-	if transactional && dst != "-" && !isHTTP {
-		if stateDir == "" {
-			stateDir = output.KafkaTransactionStateDir(dst)
-		}
-		var logErr error
-		txnLog, logErr = ksink.OpenTransactionLog(stateDir)
-		if logErr != nil {
-			return fmt.Errorf("open shared transaction WAL: %w", logErr)
-		}
-		defer txnLog.Close() //nolint:errcheck
-	}
+	isHTTP := strings.HasPrefix(dst,"http://") || strings.HasPrefix(dst,"https://")
 	if isHTTP {
-		if transactional {
-			return fmt.Errorf("--transactional is not supported with HTTP output")
-		}
-		w, err = output.NewHTTPWriter(dst, httpOpts, tlsCfg)
-	} else if transactional && dst != "-" {
-		w, err = output.NewTxnFileWriter(dst, txnLog)
+		w,err=output.NewHTTPWriter(dst,httpOpts,tlsCfg)
 	} else {
-		if transactional && dst == "-" {
-			return fmt.Errorf("--transactional is not supported with stdout output")
-		}
-		w, err = output.Open(dst, tlsCfg)
+		w,err=output.Open(dst,tlsCfg)
 	}
 	if err != nil {
 		return err
 	}
 	defer w.Close() //nolint:errcheck
 
-	serverOpts := []ksink.Option{ksink.WithLogger(stdLogger{})}
-	if txnLog != nil {
-		serverOpts = append(serverOpts, ksink.WithTransactionLog(txnLog))
-	}
 	srv, err := ksink.New(ksink.Config{
-		Address:             addr,
-		TransactionalWrite:  transactional,
-	}, serverOpts...)
+		Address:addr,
+		TransactionalWrite:false,
+	}, ksink.WithLogger(stdLogger{}))
 	if err != nil {
 		return fmt.Errorf("failed to create server: %w", err)
 	}
@@ -277,7 +253,6 @@ func runWithRotation(addr, dst, fmtName, fmtStr string, jsonB64Key, jsonB64Val b
 	log.Printf("Kafka server listening on %s, output=%s", srv.Addr(), outputLabel)
 
 	// Start read loop
-	txnWriter, _ := w.(output.TransactionalWriter)
 	go func() {
 		for {
 			event, ack, readErr := srv.Read(ctx)
@@ -310,18 +285,6 @@ func runWithRotation(addr, dst, fmtName, fmtStr string, jsonB64Key, jsonB64Val b
 								break
 							}
 						}
-					}
-				}
-			case *ksink.TxnCommitEvent:
-				if txnWriter != nil {
-					if err := txnWriter.CommitTxn(e.TransactionalID); err != nil {
-						writeErr = fmt.Errorf("failed to commit txn %s: %w", e.TransactionalID, err)
-					}
-				}
-			case *ksink.TxnAbortEvent:
-				if txnWriter != nil {
-					if err := txnWriter.AbortTxn(e.TransactionalID); err != nil {
-						writeErr = fmt.Errorf("failed to abort txn %s: %w", e.TransactionalID, err)
 					}
 				}
 			}

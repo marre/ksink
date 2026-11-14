@@ -34,6 +34,18 @@ type OrderedTopicMaterializer struct {
 	since map[string]time.Time
 }
 
+// KafkaTransactionStateDir is the default shared WAL root for ordered
+// transactional file output. It is deliberately a sibling of topic
+// directories, not a transaction staging directory.
+func KafkaTransactionStateDir(pattern string) string {
+	clean:=filepath.Clean(pattern)
+	sep:=string(filepath.Separator)
+	if i:=strings.Index(clean,sep+"{topic}"+sep);i>=0 {
+		return filepath.Join(clean[:i],".ksink-kafka-state")
+	}
+	return filepath.Join(filepath.Dir(clean),".ksink-kafka-state")
+}
+
 // NewOrderedTopicMaterializer validates an absolute filesystem template.
 // The topic placeholder must be a complete directory component. This v1
 // grammar is deliberately narrow: {topic} and {seq:08}, nothing else.

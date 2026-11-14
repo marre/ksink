@@ -25,15 +25,6 @@ type Writer interface {
 	Write(data []byte, msg *ksink.Message) error
 }
 
-// TransactionalWriter extends [Writer] with transaction commit and abort
-// operations. Filesystem backends stage a transaction under a private
-// directory and can publish its complete contents with a single rename.
-type TransactionalWriter interface {
-	Writer
-	CommitTxn(txnID string) error
-	AbortTxn(txnID string) error
-}
-
 // TLSOpts holds TLS configuration options for output connections.
 type TLSOpts struct {
 	CertFile   string
