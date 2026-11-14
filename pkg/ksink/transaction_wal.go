@@ -1012,3 +1012,12 @@ func (l *TransactionLog) Close() error {
 	}
 	return first
 }
+
+// FatalError reports a permanent WAL write/sync/checkpoint failure.
+// The ordered server polls this to terminate instead of continuing to accept
+// requests after the shared durable log has become unusable.
+func (l *TransactionLog) FatalError() error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.broken
+}
