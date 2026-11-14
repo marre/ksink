@@ -1,6 +1,6 @@
 //go:build darwin || dragonfly || freebsd || linux || netbsd || openbsd
 
-package output
+package ksink
 
 import (
 	"os"
@@ -8,10 +8,10 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-func acquireTxnFileLock(file *os.File) error {
+func lockTxnStateFile(file *os.File) error {
 	return unix.Flock(int(file.Fd()), unix.LOCK_EX|unix.LOCK_NB)
 }
 
-func releaseTxnFileLock(file *os.File) error {
+func unlockTxnStateFile(file *os.File) error {
 	return unix.Flock(int(file.Fd()), unix.LOCK_UN)
 }
