@@ -80,6 +80,11 @@ func (l *TransactionLog) AppendTopicBatch(records []WALTopicRecord) ([]int64, er
 		offsets = append(offsets, offset)
 		changes = append(changes, transactionWALRecord{Type: "topic-output", TopicOutput: &r})
 	}
+	// The acceptance delimiter is replayed only after all complete record
+	// frames have arrived. A crash before it discards the entire batch.
+	changes = append(changes, transactionWALRecord{
+		Type: "topic-accept", BatchCount: len(records),
+	})
 	if err := l.appendBatchLocked(changes); err != nil {
 		return nil, err
 	}
