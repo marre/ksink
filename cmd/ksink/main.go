@@ -46,6 +46,8 @@ func main() {
 		noSeparator   bool
 		transactional bool
 		stateDir      string
+		rotateSizeText string
+		rotateInterval time.Duration
 		tOpts         output.TLSOpts
 		httpOpts      output.HTTPOpts
 	)
@@ -95,23 +97,34 @@ kcat format specifiers (--output-format-string):
 					return fmt.Errorf("--output-separator, --output-separator-hex, and --no-separator are only supported with --output-format=binary")
 				}
 			}
-			return run(addr, dst, fmtName, fmtStr, jsonB64Key, jsonB64Val, separator, sepHex, noSeparator, transactional, stateDir, tOpts, httpOpts)
+			if !transactional && (cmd.Flags().Changed("rotate-size") || cmd.Flags().Changed("rotate-interval")) {
+				return fmt.Errorf("--rotate-size and --rotate-interval require --transactional")
+			}
+			size,err:=parseRotationSize(rotateSizeText)
+			if err!=nil{return err}
+			return runWithRotation(addr, dst, fmtName, fmtStr, jsonB64Key, jsonB64Val, separator, sepHex, noSeparator, transactional, stateDir, tOpts, httpOpts, size, rotateInterval)
 		},
 	}
 
 	rootCmd.Flags().StringVar(&addr, "addr", ":9092", "Address to listen on")
 	rootCmd.Flags().BoolVar(&transactional, "transactional", false,
-		"Enable transactional produce with durable Kafka producer state and atomic filesystem commits. Requires {txnID} in --output.")
+		"Durable Kafka transactions with per-topic ordered committed-only files. Requires {topic} and {seq:08} in --output.")
 	rootCmd.Flags().StringVar(&stateDir, "transaction-state-dir", "",
-		"Durable Kafka transaction state directory (default: .ksink-kafka-state under the transactional output root)")
+		"Shared durable Kafka transaction WAL directory (default: .ksink-kafka-state under the ordered output root)")
+	rootCmd.Flags().StringVar(&rotateSizeText, "rotate-size", "128MiB",
+		"Committed file rotation size target (e.g. 128MiB, 1GiB; 0 disables)")
+	rootCmd.Flags().DurationVar(&rotateInterval, "rotate-interval", time.Minute,
+		"Maximum nonempty committed-file age before rotation (e.g. 1m, 10s; 0 disables)")
 	rootCmd.Flags().StringVar(&dst, "output", "-",
 		`Output destination: "-" for stdout (default), file path, or http(s):// URL.
 The path may contain {topic} to route messages to per-topic files
 (e.g. "{topic}.jsonl" produces "orders.jsonl", "events.jsonl", etc.).
 Only partition 0 exists for each topic; {partition} is not supported.
-With --transactional, must also contain {txnID}
-(e.g. "{topic}-{txnID}.jsonl" produces "orders-my-txn.jsonl").
-Topic names are sanitised to prevent path traversal.`)
+With --transactional, use ROOT/{topic}/messages-{seq:08}.jsonl.
+Each topic has an independent monotonically numbered committed-only file
+sequence, rotated by --rotate-size or --rotate-interval. There are no
+transaction directories and {txnID} is not supported in ordered output.
+Topic names are encoded to prevent collisions and path traversal.`)
 	rootCmd.Flags().StringVar(&fmtName, "output-format", "binary",
 		"Message format: binary, jsonl, kcat")
 	rootCmd.Flags().StringVar(&fmtStr, "output-format-string", "",
@@ -158,6 +171,10 @@ Topic names are sanitised to prevent path traversal.`)
 }
 
 func run(addr, dst, fmtName, fmtStr string, jsonB64Key, jsonB64Val bool, separator, sepHex string, noSeparator, transactional bool, stateDir string, tOpts output.TLSOpts, httpOpts output.HTTPOpts) error {
+	return runWithRotation(addr,dst,fmtName,fmtStr,jsonB64Key,jsonB64Val,separator,sepHex,noSeparator,transactional,stateDir,tOpts,httpOpts,128<<20,time.Minute)
+}
+
+func runWithRotation(addr, dst, fmtName, fmtStr string, jsonB64Key, jsonB64Val bool, separator, sepHex string, noSeparator, transactional bool, stateDir string, tOpts output.TLSOpts, httpOpts output.HTTPOpts, rotateSize int64, rotateInterval time.Duration) error {
 	var sep []byte
 	if fmtName == "binary" {
 		var err error
@@ -191,6 +208,9 @@ func run(addr, dst, fmtName, fmtStr string, jsonB64Key, jsonB64Val bool, separat
 	fmtr, err := format.New(fmtName, sep, options...)
 	if err != nil {
 		return err
+	}
+	if transactional {
+		return runOrdered(addr,dst,stateDir,fmtr,rotateSize,rotateInterval)
 	}
 
 	tlsCfg, err := tOpts.BuildTLSConfig()
