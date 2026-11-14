@@ -2,6 +2,10 @@ package ksink
 
 import (
  "path/filepath"
+ "context"
+ "net"
+ "github.com/twmb/franz-go/pkg/kmsg"
+ "github.com/twmb/franz-go/pkg/kerr"
  "testing"
  "time"
 
@@ -71,4 +75,53 @@ func TestIdempotentProducerExpiryFailedWALAppendDoesNotReclaimDurableState(t *te
  retained,ok:=recovered.CurrentState().Idempotent[1]
  require.True(t,ok)
  require.Equal(t,int32(7),retained.Sequences["orders/0"].Next)
+}
+
+func produceIdempotentRetentionCode(t *testing.T,conn net.Conn,id int32,pid int64) int16 {
+ t.Helper()
+ req:=kmsg.NewProduceRequest()
+ req.Version=3
+ req.Acks=1
+ req.TimeoutMillis=1000
+ topic:=kmsg.NewProduceRequestTopic()
+ topic.Topic="orders"
+ part:=kmsg.NewProduceRequestTopicPartition()
+ part.Partition=0
+ part.Records=recordBatchForSequence(pid,0,0,1,1)
+ topic.Partitions=append(topic.Partitions,part)
+ req.Topics=append(req.Topics,topic)
+ reply:=sendRawRequest(t,conn,int16(kmsg.Produce),3,id,req.AppendTo(nil))
+ resp:=&kmsg.ProduceResponse{Version:3}
+ require.NoError(t,resp.ReadFrom(reply))
+ require.Len(t,resp.Topics,1)
+ require.Len(t,resp.Topics[0].Partitions,1)
+ return resp.Topics[0].Partitions[0].ErrorCode
+}
+
+func TestIdempotentProducerExpiryEndToEndInitAndFencing(t *testing.T) {
+ root:=t.TempDir()
+ wal,err:=OpenTransactionLog(filepath.Join(root,"state"))
+ require.NoError(t,err)
+ require.NoError(t,wal.BindOutput(filepath.Join(root,"data","{topic}","messages-{seq:08}.jsonl")))
+ state:=wal.CurrentState()
+ oldID:=state.Counter
+ state.Idempotent=make(map[int64]storedIdempotentProducer,maxTxnStates)
+ expired:=time.Now().Add(-idempotentProducerRetention-time.Hour).UnixNano()
+ for i:=0;i<maxTxnStates;i++ {
+  state.Idempotent[oldID-int64(i)]=storedIdempotentProducer{Epoch:0,LastActivityUnixNano:expired}
+ }
+ require.NoError(t,wal.AppendState(state))
+ srv,err:=New(Config{Address:"127.0.0.1:0",TransactionalWrite:true,IdempotentWrite:true},
+  WithTransactionLog(wal),WithOrderedTransactionalOutput(func(m *Message)([]byte,error){return []byte(m.Value),nil}))
+ require.NoError(t,err)
+ require.NoError(t,srv.Start(context.Background()))
+ conn:=newTxnStateTestConn(t,srv)
+ defer func(){_ = conn.Close();_ = srv.Close(context.Background());_ = wal.Close()}()
+ init:=sendInitProducerID(t,conn,1,nil,30000)
+ require.Zero(t,init.ErrorCode)
+ require.Greater(t,init.ProducerID,oldID)
+ require.Len(t,wal.CurrentState().Idempotent,1)
+ require.Equal(t,kerr.ProducerFenced.Code,produceIdempotentRetentionCode(t,conn,2,oldID))
+ // A newly allocated producer must not be fenced by the reclamation.
+ require.NotEqual(t,kerr.ProducerFenced.Code,produceIdempotentRetentionCode(t,conn,3,init.ProducerID))
 }
