@@ -66,6 +66,7 @@ func (l *TransactionLog) compactLocked() error {
 	topics := make([]string, 0, len(l.topicRecords))
 	for topic := range l.topicRecords { topics = append(topics, topic) }
 	sort.Strings(topics)
+	topicCount := 0
 	for _, topic := range topics {
 		for _, ref := range l.topicRecords[topic] {
 			source, openErr := os.Open(l.walPath(ref.key))
@@ -80,12 +81,18 @@ func (l *TransactionLog) compactLocked() error {
 				return failed(fmt.Errorf("invalid topic WAL frame at offset %d", ref.offset))
 			}
 			if err := write(record); err != nil { return failed(err) }
+			topicCount++
+			// Keep the replay buffer bounded even for checkpoints that
+			// contain millions of records from multiple topics.
+			if topicCount == 512 {
+				if err := write(transactionWALRecord{
+					Type: "topic-accept", BatchCount: topicCount,
+				}); err != nil { return failed(err) }
+				topicCount = 0
+			}
 		}
 	}
-	// Emit one acceptance delimiter after the replayed topic records. Replay
-	// cannot treat an interrupted checkpoint as a completed logical batch.
-	topicCount := 0
-	for _, refs := range l.topicRecords { topicCount += len(refs) }
+	// Emit a final acceptance delimiter for a non-full checkpoint batch.
 	if topicCount > 0 {
 		if err := write(transactionWALRecord{
 			Type: "topic-accept", BatchCount: topicCount,

@@ -309,6 +309,12 @@ func (l *TransactionLog) scanWALFile(key walFileKey, active bool) error {
 		frameSize := int64(len(header))+int64(length)
 		if rec.Type == "topic-output" {
 			if len(pending) == 0 { pendingStart = offset }
+			if len(pending) >= maxTopicAcceptanceBatchRecords {
+				return fmt.Errorf("topic WAL acceptance batch too large in %s at %d", path, offset)
+			}
+			// The CRC and codec have already been checked. Pending replay
+			// needs only metadata and frame locations, never payload bytes.
+			rec.TopicOutput.Data = nil
 			pending = append(pending, struct {
 				rec transactionWALRecord
 				offset, bytes int64
@@ -389,6 +395,17 @@ func (l *TransactionLog) apply(rec transactionWALRecord, frameOffset, frameBytes
 				(st.Instance != "" && !txnWALValidInstance(st.Instance)) {
 				return fmt.Errorf("invalid persisted transaction %q", id)
 			}
+			// The coordinator state itself is a fully checksummed atomic
+			// frame. It is already a durable COMMIT/ABORT decision if the
+			// separate history marker was interrupted before it was written.
+			if st.Pending != "" && l.topicInstances[st.Instance] {
+				if old, exists := l.topicDecisions[st.Instance]; exists &&
+					(old != st.Pending || l.topicDecisionOwners[st.Instance] != id) {
+					return fmt.Errorf("conflicting durable decision for %s", st.Instance)
+				}
+				l.topicDecisions[st.Instance] = st.Pending
+				l.topicDecisionOwners[st.Instance] = id
+			}
 		}
 	case "output":
 		if rec.Output == nil || rec.Output.TransactionID == "" ||
@@ -419,10 +436,22 @@ func (l *TransactionLog) apply(rec transactionWALRecord, frameOffset, frameBytes
 		l.topicNext[topic]++
 		if metadata.Instance != "" { l.topicInstances[metadata.Instance] = true }
 	case "topic-accept":
-		if rec.BatchCount <= 0 { return fmt.Errorf("invalid topic WAL batch acceptance marker") }
-		// The completed batch is already indexed. This replay delimiter is
-		// obsolete in a checkpoint once its records have been copied.
-		l.markFrameDead(walFrameRef{key:source,size:frameBytes})
+		if rec.BatchCount <= 0 || rec.BatchCount > maxTopicAcceptanceBatchRecords {
+			return fmt.Errorf("invalid topic WAL batch acceptance marker")
+		}
+		// If an accepted batch also updates producer deduplication state,
+		// that state lives in the same acceptance frame. Replay either
+		// applies BOTH payload and dedup checkpoint or neither.
+		if rec.State != nil {
+			if err := l.apply(transactionWALRecord{
+				Version: transactionWALVersion, Type: "state", State: rec.State,
+			}, frameOffset, frameBytes, source); err != nil {
+				return fmt.Errorf("invalid accepted producer state: %w", err)
+			}
+		} else {
+			// Delimiter with no producer state is obsolete after replay.
+			l.markFrameDead(walFrameRef{key:source,size:frameBytes})
+		}
 	case "topic-decision":
 		if rec.TxnID == "" || !txnWALValidInstance(rec.Instance) ||
 			(rec.Decision != "commit" && rec.Decision != "abort") {
