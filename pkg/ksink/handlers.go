@@ -166,6 +166,14 @@ func (s *Server) handleProduce(ctx context.Context, conn net.Conn, connID uint64
 		txnID = *req.TransactionID
 	}
 
+	// Kafka producers without a transactional.id may still use idempotence.
+	// Serialize their validation, WAL append and producer-sequence snapshot
+	// so concurrent retries cannot append the same batch twice.
+	orderedNonTxn:=s.orderedFormatter!=nil && txnID==""
+	if orderedNonTxn { s.txnMu.Lock(); defer s.txnMu.Unlock() }
+	proposedIdempotent:=make(map[int64]storedIdempotentProducer)
+	changedIdempotent:=false
+
 	// For transactional produce, verify the active transaction and producer
 	// epoch. The epoch lives in each record-batch header, not in ProduceRequest.
 	var txnProduceErr int16
@@ -217,6 +225,7 @@ func (s *Server) handleProduce(ctx context.Context, conn net.Conn, connID uint64
 		topicIdx, partIdx int
 	}
 	results := make(map[partKey]partResult)
+	partProducers:=make(map[partKey]int64)
 	var allMsgs []*Message
 
 	for ti, topicData := range req.Topics {
@@ -247,6 +256,41 @@ func (s *Server) handleProduce(ctx context.Context, conn net.Conn, connID uint64
 			}
 			recordBatches := partData.Records
 			var candidate map[string]txnPartitionSequence
+			var idempotentCandidate map[string]txnPartitionSequence
+			var producerID int64=-1
+			if orderedNonTxn {
+				id,epoch,code:=orderedNonTxnBatchIdentity(recordBatches)
+				if code!=0 {
+					results[key]=partResult{errCode:code,baseOffset:-1}
+					continue
+				}
+				producerID=id
+				if id>=0 {
+					st,found:=s.idempotentStates[id]
+					if !found || st.Epoch!=epoch || s.txnStoreErr!=nil {
+						results[key]=partResult{errCode:kerr.ProducerFenced.Code,baseOffset:-1}
+						continue
+					}
+					if proposed,ok:=proposedIdempotent[id];ok {st=proposed}
+					idempotentCandidate=copyTxnSequences(st.Sequences)
+					var code int16
+					recordBatches,code=acceptTxnBatches(recordBatches,
+						txnSequenceKey(topicData.Topic,partData.Partition),idempotentCandidate)
+					if code!=0 {
+						results[key]=partResult{errCode:code,baseOffset:-1}
+						continue
+					}
+					if len(recordBatches)==0 {
+						result:=partResult{baseOffset:-1}
+						if offset,ok:=txnBatchFirstOffset(partData.Records,
+							st.Sequences[txnSequenceKey(topicData.Topic,partData.Partition)]);ok {
+							result.baseOffset=offset
+						}
+						results[key]=result
+						continue
+					}
+				}
+			}
 			if txnID != "" && s.cfg.TransactionalWrite {
 				if code := validateTxnBatchProducer(recordBatches, txnProducerID, txnProducerEpoch); code != 0 {
 					results[key] = partResult{errCode: code}
@@ -292,6 +336,13 @@ func (s *Server) handleProduce(ctx context.Context, conn net.Conn, connID uint64
 				}
 			}
 			results[key] = result
+			if producerID>=0 && idempotentCandidate!=nil {
+				previous:=s.idempotentStates[producerID]
+				previous.Sequences=idempotentCandidate
+				proposedIdempotent[producerID]=previous
+				partProducers[key]=producerID
+				changedIdempotent=true
+			}
 			if txnProduceState != nil && candidate != nil {
 				proposedSequences = candidate
 				sequenceChanged = true
@@ -359,6 +410,42 @@ func (s *Server) handleProduce(ctx context.Context, conn net.Conn, connID uint64
 					}
 				}
 				s.txnMu.Unlock()
+			} else if changedIdempotent {
+				// txnMu is held by orderedNonTxn. Capture the original Kafka
+				// base offset and updated sequence signatures in the same
+				// acceptance delimiter as all newly appended data.
+				updated:=make(map[int64]storedIdempotentProducer)
+				offsets,handlerErr=s.txnLog.appendTopicBatchFormattedWithStateBuilder(
+					records,encode,func(assigned []int64)(txnStateSnapshot,error){
+						for id,st:=range proposedIdempotent {
+							updated[id]=storedIdempotentProducer{
+								Epoch:st.Epoch,Sequences:copyTxnSequences(st.Sequences),
+							}
+						}
+						for ti,topicData:=range req.Topics {
+							for pi,partData:=range topicData.Partitions {
+								key:=partKey{ti,pi}
+								id,ok:=partProducers[key]
+								if !ok {continue}
+								result:=results[key]
+								st:=updated[id]
+								seqKey:=txnSequenceKey(topicData.Topic,partData.Partition)
+								seq:=st.Sequences[seqKey]
+								if err:=assignTxnAcceptedOffsets(result.accepted,
+									result.first,assigned,&seq);err!=nil {
+									return txnStateSnapshot{},err
+								}
+								st.Sequences[seqKey]=seq
+								updated[id]=st
+							}
+						}
+						snapshot:=s.txnSnapshotLocked()
+						for id,st:=range updated {snapshot.Idempotent[id]=st}
+						return snapshot,nil
+					})
+				if handlerErr==nil {
+					for id,st:=range updated {s.idempotentStates[id]=st}
+				}
 			} else {
 				offsets, handlerErr = s.txnLog.appendTopicBatchFormatted(records, encode)
 			}
@@ -458,6 +545,18 @@ func (s *Server) deliverEvent(ctx context.Context, evt Event) error {
 	case <-s.shutdownCh:
 		return ErrServerClosed
 	}
+}
+
+// orderedNonTxnBatchIdentity validates producer identity for nontransactional
+// v2 record batches. Legacy batches and producerID=-1 have no broker-side
+// deduplication identity, but are still durably appended by the shared WAL.
+func orderedNonTxnBatchIdentity(data []byte)(int64,int16,int16){
+	if len(data)<61 || data[16]!=2 {return -1,-1,0}
+	id:=int64(binary.BigEndian.Uint64(data[43:51]))
+	epoch:=int16(binary.BigEndian.Uint16(data[51:53]))
+	if id<0 {return -1,-1,0}
+	if epoch<0 {return id,epoch,kerr.ProducerFenced.Code}
+	return id,epoch,validateTxnBatchProducer(data,id,epoch)
 }
 
 // validateTxnBatchProducer checks every v2 record-batch header without
