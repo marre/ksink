@@ -264,6 +264,7 @@ func TestTransactionWALFatalErrorAfterPostFsyncFailure(t *testing.T) {
 	wal,err:=OpenTransactionLog(filepath.Join(t.TempDir(),"wal"))
 	require.NoError(t,err)
 	defer func(){_ = wal.Close()}()
+	require.NoError(t,wal.BindOutput(filepath.Join(t.TempDir(),"output")))
 	wal.faultHook=func(point string) error {
 		if point=="append:fsynced" {return errors.New("injected sync ambiguity")}
 		return nil
