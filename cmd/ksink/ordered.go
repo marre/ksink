@@ -94,10 +94,12 @@ func runOrdered(addr,dst,stateDir string, fmtr format.Formatter, serialization s
 	if !workerDone {
 		if err:=<-errCh;err!=nil && writerErr==nil {writerErr=fmt.Errorf("ordered output worker: %w",err)}
 	}
-	// The materializer goroutine can still hold its output lock until its
-	// last publish call returns. Flush serializes behind it.
-	if err:=writer.Flush(context.Background());err!=nil && writerErr==nil {
-		writerErr=fmt.Errorf("flush ordered output: %w",err)
+	// On a fatal publication/WAL failure, do not attempt further writes.
+	// The next process will reconcile durable WAL records and final files.
+	if writerErr==nil {
+		if err:=writer.Flush(context.Background());err!=nil {
+			writerErr=fmt.Errorf("flush ordered output: %w",err)
+		}
 	}
 	return writerErr
 }
