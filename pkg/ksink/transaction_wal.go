@@ -414,6 +414,10 @@ func (l *TransactionLog) apply(rec transactionWALRecord, frameOffset, frameBytes
 		l.markFrameDead(l.stateRef)
 		l.stateRef = walFrameRef{key:source,size:frameBytes}
 		l.state = *rec.State
+		// The previous generation may have been fully published before this
+		// state transition. Revisit its decision now that its coordinator
+		// reference has disappeared, even if no further topic cursor moves.
+		l.reclaimUnreferencedTopicDecisionsLocked()
 		if l.state.States == nil {
 			l.state.States = make(map[string]storedTxnState)
 		}
