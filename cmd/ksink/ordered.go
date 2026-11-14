@@ -45,7 +45,7 @@ func parseRotationSize(value string) (int64,error) {
 // runOrdered starts a single shared transactional WAL and a single filesystem
 // materializer that independently publishes completed files for each topic.
 // Kafka successes are based on WAL durability, not asynchronous publication.
-func runOrdered(addr,dst,stateDir string, fmtr format.Formatter,
+func runOrdered(addr,dst,stateDir string, fmtr format.Formatter, serialization string,
 	rotateSize int64,rotateInterval time.Duration) error {
 	if dst=="-" || strings.Contains(dst,"://") {
 		return errors.New("--transactional requires a filesystem path with {topic} and {seq:NN}")
@@ -57,6 +57,9 @@ func runOrdered(addr,dst,stateDir string, fmtr format.Formatter,
 
 	writer,err:=output.NewOrderedTopicMaterializer(wal,dst,rotateSize,rotateInterval)
 	if err!=nil{return fmt.Errorf("configure ordered output writer: %w",err)}
+	if err:=wal.BindFormatter(serialization);err!=nil {
+		return fmt.Errorf("verify ordered output serialization configuration: %w",err)
+	}
 	srv,err:=ksink.New(ksink.Config{
 		Address:addr,TransactionalWrite:true,
 	},ksink.WithLogger(stdLogger{}),ksink.WithTransactionLog(wal),

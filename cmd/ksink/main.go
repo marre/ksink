@@ -211,7 +211,11 @@ func runWithRotation(addr, dst, fmtName, fmtStr string, jsonB64Key, jsonB64Val b
 		return err
 	}
 	if transactional {
-		return runOrdered(addr,dst,stateDir,fmtr,rotateSize,rotateInterval)
+		// Bytes were formatted before being durably accepted into the WAL.
+		// A restart must not silently mix encodings within one file series.
+		serialization:=fmt.Sprintf("ordered-v1|%q|%q|%t|%t|%x",
+			fmtName,fmtStr,jsonB64Key,jsonB64Val,sep)
+		return runOrdered(addr,dst,stateDir,fmtr,serialization,rotateSize,rotateInterval)
 	}
 
 	tlsCfg, err := tOpts.BuildTLSConfig()

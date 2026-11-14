@@ -17,7 +17,7 @@ import (
 )
 
 const (
-	transactionWALVersion = 3
+	transactionWALVersion = 4
 	transactionWALMaxFrame = 64 << 20
 	// Compact only when enough WAL bytes are obsolete AND reclaiming
 	// them would remove a meaningful fraction of the file. A 1 GiB
@@ -63,6 +63,7 @@ type transactionWALRecord struct {
 	Version  int
 	Type     string
 	Binding  string
+	FormatBinding string
 	State    *txnStateSnapshot
 	Output   *WALOutputRecord
 	TopicOutput *WALTopicRecord
@@ -92,6 +93,7 @@ type TransactionLog struct {
 	lockFile  *os.File
 	broken    error
 	binding   string
+	formatBinding string
 	state     txnStateSnapshot
 	data      map[string][]walOutputLocation
 	// Logical topic/partition-0 streams share physical WAL segments but have
@@ -121,6 +123,7 @@ type TransactionLog struct {
 	fileStats map[walFileKey]*walFileStats
 	stateRef walFrameRef
 	bindingRef walFrameRef
+	formatBindingRef walFrameRef
 	markerRefs map[string]walFrameRef
 	faultHook func(string) error // test-only, called while holding mu
 	segmentLimit int64 // tests may reduce rotation threshold; defaults to 64 MiB
@@ -232,7 +235,7 @@ func OpenTransactionLog(path string) (*TransactionLog, error) {
 			_ = log.Close()
 			return nil, fmt.Errorf("create WAL bootstrap marker: %w", err)
 		}
-		_, err = marker.Write([]byte("ksink-wal-v3\n"))
+		_, err = marker.Write([]byte("ksink-wal-v4\n"))
 		if err == nil {
 			err = marker.Sync()
 		}
@@ -252,6 +255,7 @@ func OpenTransactionLog(path string) (*TransactionLog, error) {
 
 func (l *TransactionLog) resetReplay() {
 	l.binding=""
+	l.formatBinding=""
 	l.state=txnStateSnapshot{Version:durableTxnStateVersion,States:make(map[string]storedTxnState)}
 	l.data=make(map[string][]walOutputLocation)
 	l.topicRecords=make(map[string][]walTopicLocation)
@@ -270,6 +274,7 @@ func (l *TransactionLog) resetReplay() {
 	l.markerRefs=make(map[string]walFrameRef)
 	l.stateRef=walFrameRef{}
 	l.bindingRef=walFrameRef{}
+	l.formatBindingRef=walFrameRef{}
 	l.size=0
 	l.reclaimable=0
 }
@@ -385,6 +390,13 @@ func (l *TransactionLog) apply(rec transactionWALRecord, frameOffset, frameBytes
 		l.markFrameDead(l.bindingRef)
 		l.bindingRef = walFrameRef{key:source,size:frameBytes}
 		l.binding = rec.Binding
+	case "format-binding":
+		if rec.FormatBinding=="" || (l.formatBinding!="" && l.formatBinding!=rec.FormatBinding) {
+			return fmt.Errorf("conflicting WAL output serialization binding")
+		}
+		l.markFrameDead(l.formatBindingRef)
+		l.formatBindingRef=walFrameRef{key:source,size:frameBytes}
+		l.formatBinding=rec.FormatBinding
 	case "state":
 		if rec.State == nil || rec.State.Version != durableTxnStateVersion ||
 			rec.State.Counter <= 0 || len(rec.State.States) > maxTxnStates {
@@ -780,6 +792,22 @@ func (l *TransactionLog) BindOutput(pattern string) error {
 		return fmt.Errorf("transaction WAL output binding changed: %q != %q", l.binding, abs)
 	}
 	return l.appendLocked(transactionWALRecord{Type: "binding", Binding: abs})
+}
+
+// BindFormatter ensures that a restarted ordered writer uses the exact same
+// serialization configuration as the writer that accepted the WAL records.
+// Rotation settings may change; changing record bytes requires fresh state.
+func (l *TransactionLog) BindFormatter(identity string) error {
+	if identity=="" {return fmt.Errorf("empty output serialization identity")}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.formatBinding==identity{return nil}
+	if l.formatBinding!="" {
+		return fmt.Errorf("WAL output format changed; use a new --transaction-state-dir")
+	}
+	return l.appendLocked(transactionWALRecord{
+		Type:"format-binding",FormatBinding:identity,
+	})
 }
 
 // AppendOutput persists a message as the exact formatted bytes and relative

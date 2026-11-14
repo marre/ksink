@@ -10,7 +10,7 @@ import (
 )
 
 const (
-	walManifestVersion = 2
+	walManifestVersion = 3
 	transactionWALSegmentBytes = 64 << 20
 )
 

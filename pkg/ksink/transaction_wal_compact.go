@@ -27,6 +27,9 @@ func (l *TransactionLog) compactLocked() error {
 	if l.binding!=""{
 		if err:=write(transactionWALRecord{Type:"binding",Binding:l.binding});err!=nil{return failed(err)}
 	}
+	if l.formatBinding!="" {
+		if err:=write(transactionWALRecord{Type:"format-binding",FormatBinding:l.formatBinding});err!=nil{return failed(err)}
+	}
 	if err:=write(transactionWALRecord{Type:"state",State:&l.state});err!=nil{return failed(err)}
 	for _,txn:=range l.RecoveryTransactionsLocked(){
 		switch {
