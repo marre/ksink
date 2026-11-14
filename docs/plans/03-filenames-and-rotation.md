@@ -45,7 +45,7 @@ Each topic has **its own independently increasing file number**, while its recor
 - Graceful shutdown finalizes a nonempty active file. Force-stop/crash must not expose partial files.
 - Completed files are immutable and unique; never replace another file. If a crash leaves a final name before receipt is checkpointed, validate it against the WAL's intended range/size/checksum before recording success.
 - Topic file sequences start at 1 (or an explicitly versioned start), persist independently and are never reused across restarts. Define behavior when the selected width no longer fits: **fail safely** rather than wrap or break lexicographic sorting.
-- The output root and template are bound to durable WAL identity. Changing template, size, formatter or interval on restart must have documented policy; prefer allowing rotation thresholds to change **only at a clean file boundary**, while rejecting formatter/path changes unless explicit migration is supported.
+- The output root and template are bound to the **shared WAL** identity, while each logical topic retains an independent file sequence and rotation state. Changing template, size, formatter or interval on restart must have documented policy; prefer allowing rotation thresholds to change **only at a clean file boundary**, while rejecting formatter/path changes unless explicit migration is supported.
 - Validate path template early: no traversal, collisions, duplicate `{seq}`, platform-reserved names, or symlink escape from the output root. Enforce output and state cannot accidentally overlap.
 
 ## Reader contract
