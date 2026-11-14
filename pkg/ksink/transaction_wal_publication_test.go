@@ -113,3 +113,74 @@ func TestSharedWALPublicationRejectsMalformedOrFutureReceipts(t *testing.T) {
 	require.Equal(t,uint64(1),wal.TopicProgress("payments").NextFile)
 	require.Zero(t,wal.TopicProgress("payments").Cursor)
 }
+
+func TestSharedWALGCReclaimsFinishedTopicWithoutResettingOffsets(t *testing.T) {
+	root:=t.TempDir()
+	wal,err:=OpenTransactionLog(filepath.Join(root,"state"))
+	require.NoError(t,err)
+	require.NoError(t,wal.BindOutput(filepath.Join(root,"{topic}","messages-{seq:08}.jsonl")))
+	const count=600
+	records:=make([]WALTopicRecord,count)
+	for i:=range records {
+		records[i]=WALTopicRecord{Topic:"orders",Data:make([]byte,2048)}
+	}
+	assigned,err:=wal.AppendTopicBatch(records)
+	require.NoError(t,err)
+	require.Equal(t,int64(count-1),assigned[count-1])
+	file:=walTestFile(1,0,count)
+	require.NoError(t,wal.RecordTopicFile("orders",file))
+	require.Equal(t,0,len(wal.topicRecords["orders"]),"published payload indexes must be reclaimed")
+	require.Equal(t,int64(count),wal.NextTopicOffset("orders"))
+	require.NoError(t,wal.Compact())
+	require.NoError(t,wal.Close())
+
+	recovered,err:=OpenTransactionLog(filepath.Join(root,"state"))
+	require.NoError(t,err)
+	defer func(){_=recovered.Close()}()
+	require.Equal(t,int64(count),recovered.NextTopicOffset("orders"))
+	require.Equal(t,int64(count),recovered.TopicProgress("orders").Cursor)
+	require.Empty(t,recovered.topicRecords["orders"])
+	_,ok,err:=recovered.ReadTopicRecord("orders",0)
+	require.NoError(t,err)
+	require.False(t,ok,"GCed records are available only in their finalized files")
+	offsets,err:=recovered.AppendTopicBatch([]WALTopicRecord{{Topic:"orders",Data:[]byte("later")}})
+	require.NoError(t,err)
+	require.Equal(t,[]int64{count},offsets)
+	rec,ok,err:=recovered.ReadTopicRecord("orders",count)
+	require.NoError(t,err)
+	require.True(t,ok)
+	require.Equal(t,"later",string(rec.Data))
+}
+
+func TestSharedWALGCIndependentTopicProgressKeepsBlockedSuffix(t *testing.T) {
+	root:=t.TempDir()
+	wal,instance:=testOpenWALWithActiveTransaction(t,root)
+	state:=wal.CurrentState()
+	st:=state.States["orders-producer"]
+	st.Topics=[]string{"payments"}
+	state.States["orders-producer"]=st
+	require.NoError(t,wal.AppendState(state))
+	_,err:=wal.AppendTopicBatch([]WALTopicRecord{
+		{Topic:"orders",Data:[]byte("published")},
+		{Topic:"payments",TransactionID:"orders-producer",Instance:instance,Data:[]byte("unresolved")},
+	})
+	require.NoError(t,err)
+	require.NoError(t,wal.RecordTopicFile("orders",walTestFile(1,0,1)))
+	require.Equal(t,int64(0),wal.TopicStableOffset("payments"))
+	require.NoError(t,wal.Compact())
+	require.NoError(t,wal.Close())
+	reopened,err:=OpenTransactionLog(filepath.Join(root,".ksink-kafka-state"))
+	require.NoError(t,err)
+	defer func(){_=reopened.Close()}()
+	require.Equal(t,int64(1),reopened.NextTopicOffset("orders"))
+	require.Equal(t,int64(1),reopened.NextTopicOffset("payments"))
+	require.Equal(t,int64(1),reopened.TopicProgress("orders").Cursor)
+	require.Zero(t,reopened.TopicStableOffset("payments"))
+	rec,ok,err:=reopened.ReadTopicRecord("payments",0)
+	require.NoError(t,err)
+	require.True(t,ok)
+	require.Equal(t,"unresolved",string(rec.Data))
+	_,ok,err=reopened.ReadTopicRecord("orders",0)
+	require.NoError(t,err)
+	require.False(t,ok)
+}
