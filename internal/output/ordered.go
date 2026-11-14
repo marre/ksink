@@ -243,12 +243,17 @@ func (w *OrderedTopicMaterializer) publishTopic(ctx context.Context,topic string
 		// Files always contain a whole-number prefix of committed records.
 		if err:=w.createFinal(ctx,topic,p.Cursor,end,final);err!=nil{return 0,err}
 	}
-	bytesOnDisk,err:=os.ReadFile(final)
+	// Hash the finalized file as a stream; rotation sizes may be GiB, so
+	// never load the entire published file into process memory.
+	opened,err:=os.Open(final)
 	if err!=nil{return 0,err}
-	digest:=sha256.Sum256(bytesOnDisk)
+	digest:=sha256.New()
+	bytesOnDisk,hashErr:=io.Copy(digest,opened)
+	if closeErr:=opened.Close();hashErr==nil{hashErr=closeErr}
+	if hashErr!=nil{return 0,hashErr}
 	receipt:=ksink.WALTopicFile{
 		Sequence:p.NextFile,Start:p.Cursor,End:end,Path:rel,
-		Size:int64(len(bytesOnDisk)),SHA256:hex.EncodeToString(digest[:]),
+		Size:bytesOnDisk,SHA256:hex.EncodeToString(digest.Sum(nil)),
 	}
 	if err:=w.wal.RecordTopicFile(topic,receipt);err!=nil{return 0,err}
 	delete(w.since,topic)
