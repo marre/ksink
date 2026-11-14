@@ -297,7 +297,7 @@ func TestOrderedMaterializerCrashAfterFinalizationBeforeReceiptReconcilesOnResta
 	pattern:=filepath.Join(root,"{topic}","part-{seq:08}.jsonl")
 	wal,err:=ksink.OpenTransactionLog(walPath)
 	require.NoError(t,err)
-	w,err:=NewOrderedTopicMaterializer(wal,pattern,1,time.Minute)
+	_,err=NewOrderedTopicMaterializer(wal,pattern,1,time.Minute)
 	require.NoError(t,err)
 	_,err=wal.AppendTopicBatch([]ksink.WALTopicRecord{
 		{Topic:"orders",Data:[]byte("first\n")},
@@ -314,7 +314,7 @@ func TestOrderedMaterializerCrashAfterFinalizationBeforeReceiptReconcilesOnResta
 	wal,err=ksink.OpenTransactionLog(walPath)
 	require.NoError(t,err)
 	defer func(){_ = wal.Close()}()
-	w,err=NewOrderedTopicMaterializer(wal,pattern,1,time.Minute)
+	w,err:=NewOrderedTopicMaterializer(wal,pattern,1,time.Minute)
 	require.NoError(t,err)
 	require.NoError(t,w.Flush(context.Background()))
 	raw,err:=os.ReadFile(first)
