@@ -39,7 +39,7 @@ Each topic has **its own independently increasing file number**, while its recor
 ### Rotation semantics
 
 - First trigger wins. Size checks occur at a complete record boundary; one large record can make a file exceed the size target.
-- Time checks use wall-clock time for user behavior, but rotation timing is best effort; record an absolute persistent deadline/creation timestamp for a nonempty active file. The worker must rotate even when no further messages arrive. After restart the same timer policy applies.
+- Time checks use wall-clock time and are best effort. Rotate nonempty files even without new messages. A crash or restart may reset the in-memory rotation timer; persisting its previous deadline is not required. Durable file sequence and publication progress still survive restart.
 - **No empty final files.** Once a nonempty file is ready, sync, close and atomic rename it, fsync the parent directory, then checkpoint per-topic publication cursor and next file number. An active file is not visible as finalized and may be rebuilt from WAL after a crash.
 - Application records may be from several committed transactions; a transaction can span rotation boundaries. Never rotate solely because a transaction committed.
 - Graceful shutdown finalizes a nonempty active file. Force-stop/crash must not expose partial files.
@@ -65,7 +65,7 @@ Preserve existing CLI semantics for nontransactional `--output` file/stdout/HTTP
 - Single topic: ascending file names, immutable completed contents, independent rotating file numbers after restart.
 - Multiple topics: independent counters/timeouts and no cross-topic head-of-line blocking.
 - Size rotation at exactly threshold, just below, one record larger than threshold, multi-record batches, binary delimiters, UTF-8 JSONL.
-- Time rotation with sparse input and no new records, no empty files, restart just before/after deadline.
+- Time rotation with sparse input and no new records, no empty files, restart with a fresh in-memory deadline.
 - Atomic publish failure/crash before rename, after rename, before/after directory fsync and cursor checkpoint; no duplicates or missing records.
 - Reject invalid patterns, collisions/unsafe topics, unsupported `{partition}` / `{txnID}`, overflow, changed binding and unsupported rotation option combinations.
 - Full EndTxn and per-topic stable-prefix tests demonstrate rotation does not expose uncommitted records.
@@ -74,3 +74,10 @@ Preserve existing CLI semantics for nontransactional `--output` file/stdout/HTTP
 ## Exit gate
 
 A downstream reader needs only a topic directory and its zero-padded sequence files to consume committed ordered records, with documented safety on restart and rotation.
+
+
+## Revised operating policy (November 2026)
+
+- **Fatal I/O:** any WAL or output write/sync/finalization failure must cause nonzero process termination; never acknowledge undurable data. Restart replays durable WAL and reconciles immutable output receipts. This policy is a requirement, not proof that all current code paths already enforce it.
+- **No metrics or backpressure feature:** no metrics endpoint, per-topic health metrics, configured disk budget or bounded-backlog admission control is required. Disk exhaustion is a fatal I/O failure.
+- **Rotation restart:** a process crash or restart may reset a pending in-memory time-rotation interval. Durable topic offsets, output cursors and file sequence numbers must not reset.
