@@ -211,13 +211,20 @@ func (w *OrderedTopicMaterializer) Publish(ctx context.Context, force bool) (int
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	published:=0
+	var topicErrors []error
 	for _,topic:=range w.wal.TopicNames() {
-		if err:=ctx.Err();err!=nil{return published,err}
+		if err:=ctx.Err();err!=nil{return published,errors.Join(append(topicErrors,err)...)}
 		count,err:=w.publishTopic(ctx,topic,force)
-		if err!=nil{return published,fmt.Errorf("publish topic %q: %w",topic,err)}
+		if err!=nil {
+			// A failed topic must not prevent other committed topic streams
+			// from publishing during this pass. Preserve every failure for
+			// the caller instead of silently reporting a partial success.
+			topicErrors=append(topicErrors,fmt.Errorf("publish topic %q: %w",topic,err))
+			continue
+		}
 		published+=count
 	}
-	return published,nil
+	return published,errors.Join(topicErrors...)
 }
 
 func (w *OrderedTopicMaterializer) publishTopic(ctx context.Context,topic string,force bool) (int,error) {
