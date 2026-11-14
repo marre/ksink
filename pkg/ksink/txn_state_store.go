@@ -62,6 +62,20 @@ type txnStateSnapshot struct {
 	Idempotent map[int64]storedIdempotentProducer
 }
 
+// reclaimExpiredIdempotent removes only producers whose last accepted
+// activity is durably known to predate the retention window. A zero timestamp
+// denotes legacy state and must never be guessed to be expired.
+func reclaimExpiredIdempotent(snapshot *txnStateSnapshot, cutoff int64) int {
+	removed:=0
+	for id,st:=range snapshot.Idempotent {
+		if st.LastActivityUnixNano>0 && st.LastActivityUnixNano<cutoff {
+			delete(snapshot.Idempotent,id)
+			removed++
+		}
+	}
+	return removed
+}
+
 func txnSyncDirectory(dir string) error {
 	f, err := os.Open(dir)
 	if err != nil {
