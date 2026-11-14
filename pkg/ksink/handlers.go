@@ -9,6 +9,7 @@ import (
 	"net"
 	"sort"
 	"strconv"
+	"time"
 
 	"github.com/twmb/franz-go/pkg/kerr"
 	"github.com/twmb/franz-go/pkg/kgo"
@@ -419,7 +420,7 @@ func (s *Server) handleProduce(ctx context.Context, conn net.Conn, connID uint64
 					records,encode,func(assigned []int64)(txnStateSnapshot,error){
 						for id,st:=range proposedIdempotent {
 							updated[id]=storedIdempotentProducer{
-								Epoch:st.Epoch,Sequences:copyTxnSequences(st.Sequences),
+								Epoch:st.Epoch,LastActivityUnixNano:time.Now().UnixNano(),Sequences:copyTxnSequences(st.Sequences),
 							}
 						}
 						for ti,topicData:=range req.Topics {
@@ -761,7 +762,7 @@ func (s *Server) handleInitProducerId(ctx context.Context, conn net.Conn, connID
 			})
 		}
 		s.idempotentStates[producerID]=storedIdempotentProducer{
-			Epoch:0,Sequences:make(map[string]txnPartitionSequence),
+			Epoch:0,LastActivityUnixNano:time.Now().UnixNano(),Sequences:make(map[string]txnPartitionSequence),
 		}
 	}
 	if err := s.persistTxnStateLocked(); err != nil {
