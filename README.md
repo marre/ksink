@@ -42,9 +42,67 @@ go run ./cmd/ksink --addr :9092 --transactional \
 # data/orders/messages-00000001.jsonl, data/payments/messages-00000001.jsonl, ...
 # Each topic has independent Kafka offsets, file numbers and rotation.
 
+# Durable transactional S3 output: same WAL and ordered per-topic file contract
+# A durable local WAL directory must be explicitly configured for S3.
+go run ./cmd/ksink --addr :9092 --transactional \
+  --transaction-state-dir /var/lib/ksink/wal \
+  --output 's3://my-bucket/data/{topic}/messages-{seq:08}.jsonl' \
+  --output-s3-region eu-north-1 \
+  --rotate-size 128MiB --rotate-interval 1m
+# Object keys: data/orders/messages-00000001.jsonl, ...
+# For MinIO, also configure --output-s3-endpoint and --output-s3-force-path-style.
+
 # Nontransactional flat-file routing (no WAL/rotation)
 go run ./cmd/ksink --addr :9092 --output '{topic}.jsonl' --output-format jsonl
 ```
+
+### Transactional S3 publication
+
+S3 is an alternative **ordered-file publication backend**, not a separate Kafka
+transaction implementation. Use `--transactional` and a destination of the
+form `s3://bucket/prefix/{topic}/messages-{seq:08}.jsonl`. The same
+`{topic}` and `{seq:NN}` grammar applies to both filesystem and S3.
+`{txnID}`, `{partition}`, and per-transaction objects are unsupported.
+Nontransactional `s3://` output is not supported.
+
+`--transaction-state-dir` is **required** for S3. Keep this directory on
+durable local storage with the locking and fsync behavior required by the
+unified WAL. Never delete it or let separate ksink instances share an
+uncoordinated WAL; the WAL is the authority for Kafka acknowledgements,
+transaction outcomes, topic offsets, object sequences and publication
+receipts. Restarting with another bucket, key pattern or endpoint is rejected.
+
+Kafka Produce/EndTxn acknowledgements mean the corresponding state is
+**durable in the WAL**, not that S3 uploads have completed. A background
+materializer selects the stable committed prefix of each topic, applies
+size/time rotation, and publishes immutable S3 objects. Aborted records and
+Kafka control markers are omitted. Objects are ordered independently per
+topic, and there is no simultaneous visibility guarantee across topics.
+
+An object is published with conditional `If-None-Match: *` (including
+multipart completion) and its SHA-256 is stored in S3 user metadata.
+After a crash between object publication and the WAL receipt, ksink compares
+the object's length and digest metadata against the reconstructed committed
+WAL prefix before recording the receipt. Conflicts fail closed: ksink never
+intentionally overwrites an existing object key. Publication failures
+exhausting SDK retries stop the process, and a restart retries from WAL.
+Object spooling uses temporary disk files, not unbounded transaction buffers.
+
+S3 settings: `--output-s3-region`, `--output-s3-endpoint`,
+`--output-s3-force-path-style`, `--output-s3-retries` (SDK attempts),
+`--output-s3-request-timeout`, and `--output-s3-multipart-part-size`
+(bytes, minimum 5 MiB, default 8 MiB). Standard AWS credential discovery
+(environment, profile, role) is used; credentials are not embedded in
+`s3://` destinations. Give the role permission to PUT/HEAD objects and
+create/upload/complete/abort multipart uploads, including conditional writes.
+For S3-compatible services, verify conditional PUT and multipart completion
+semantics with your exact server version.
+
+Size/interval rotation and the per-topic file sequence behave like local
+ordered output; no independent S3 batching/transaction parameters exist.
+A downstream consumer must checkpoint `(topic, sequence)`: a crash plus a
+consumer deletion before the receipt was durable can still recreate the
+same sequence. S3 does not provide exactly-once downstream side effects.
 
 ### Message Formats
 

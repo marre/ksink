@@ -47,15 +47,32 @@ func parseRotationSize(value string) (int64,error) {
 // Kafka successes are based on WAL durability, not asynchronous publication.
 func runOrdered(addr,dst,stateDir string, fmtr format.Formatter, serialization string,
 	rotateSize int64,rotateInterval time.Duration) error {
-	if dst=="-" || strings.Contains(dst,"://") {
-		return errors.New("--transactional requires a filesystem path with {topic} and {seq:NN}")
+	return runOrderedWithS3(addr,dst,stateDir,fmtr,serialization,rotateSize,rotateInterval,output.S3OrderedOpts{})
+}
+
+// runOrderedWithS3 shares the same WAL and Kafka acknowledgement boundary for
+// filesystem and S3 destinations. S3 is a publication backend, not a Kafka
+// transactional writer.
+func runOrderedWithS3(addr,dst,stateDir string, fmtr format.Formatter, serialization string,
+	rotateSize int64,rotateInterval time.Duration,s3Opts output.S3OrderedOpts) error {
+	isS3:=strings.HasPrefix(dst,"s3://")
+	if dst=="-" || (!isS3 && strings.Contains(dst,"://")) {
+		return errors.New("--transactional requires a filesystem path or s3://bucket/prefix/{topic}/file-{seq:NN}")
+	}
+	if isS3 && stateDir=="" {
+		return errors.New("S3 ordered output requires explicit --transaction-state-dir for its authoritative local WAL")
 	}
 	if stateDir=="" {stateDir=output.KafkaTransactionStateDir(dst)}
 	wal,err:=ksink.OpenTransactionLog(stateDir)
 	if err!=nil{return fmt.Errorf("open ordered transaction WAL: %w",err)}
 	defer wal.Close() //nolint:errcheck
 
-	writer,err:=output.NewOrderedTopicMaterializer(wal,dst,rotateSize,rotateInterval)
+	var writer *output.OrderedTopicMaterializer
+	if isS3 {
+		writer,err=output.NewS3OrderedTopicMaterializer(wal,dst,s3Opts,rotateSize,rotateInterval)
+	} else {
+		writer,err=output.NewOrderedTopicMaterializer(wal,dst,rotateSize,rotateInterval)
+	}
 	if err!=nil{return fmt.Errorf("configure ordered output writer: %w",err)}
 	if err:=wal.BindFormatter(serialization);err!=nil {
 		return fmt.Errorf("verify ordered output serialization configuration: %w",err)

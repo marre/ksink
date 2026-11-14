@@ -17,6 +17,7 @@ import (
 	"github.com/marre/ksink/internal/output"
 	"github.com/marre/ksink/pkg/ksink"
 	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
 )
 
 // Set via ldflags at build time by goreleaser.
@@ -50,6 +51,7 @@ func main() {
 		rotateInterval time.Duration
 		tOpts         output.TLSOpts
 		httpOpts      output.HTTPOpts
+		s3Opts        output.S3OrderedOpts
 	)
 
 	rootCmd := &cobra.Command{
@@ -64,6 +66,7 @@ Output destinations (--output):
   messages.jsonl                    Write to a file
   http://host:port/path             POST messages via HTTP
   https://host:port/path            POST messages via HTTPS
+  s3://bucket/prefix/{topic}/messages-{seq:08}.jsonl  Transactional WAL-backed ordered S3 objects
 
 Use --output-tls-* flags to configure client certificates (mTLS) and
 CA certificates for server verification on https outputs.
@@ -107,7 +110,17 @@ kcat format specifiers (--output-format-string):
 			}
 			size,err:=parseRotationSize(rotateSizeText)
 			if err!=nil{return err}
-			return runWithRotation(addr, dst, fmtName, fmtStr, jsonB64Key, jsonB64Val, separator, sepHex, noSeparator, transactional, stateDir, tOpts, httpOpts, size, rotateInterval)
+			if strings.HasPrefix(dst,"s3://") && !transactional {
+				return fmt.Errorf("s3:// output requires --transactional and a shared WAL")
+			}
+			var changedS3 bool
+			cmd.Flags().Visit(func(f *pflag.Flag) {
+				if strings.HasPrefix(f.Name,"output-s3-") {changedS3=true}
+			})
+			if changedS3 && (!transactional || !strings.HasPrefix(dst,"s3://")) {
+				return fmt.Errorf("S3 flags require --transactional with an s3:// output destination")
+			}
+			return runWithRotationS3(addr, dst, fmtName, fmtStr, jsonB64Key, jsonB64Val, separator, sepHex, noSeparator, transactional, stateDir, tOpts, httpOpts, size, rotateInterval, s3Opts)
 		},
 	}
 
@@ -125,11 +138,17 @@ kcat format specifiers (--output-format-string):
 The path may contain {topic} to route messages to per-topic files
 (e.g. "{topic}.jsonl" produces "orders.jsonl", "events.jsonl", etc.).
 Only partition 0 exists for each topic; {partition} is not supported.
-With --transactional, use ROOT/{topic}/messages-{seq:08}.jsonl.
+With --transactional, use ROOT/{topic}/messages-{seq:08}.jsonl\n or s3://bucket/prefix/{topic}/messages-{seq:08}.jsonl (requires --transaction-state-dir).
 Each topic has an independent monotonically numbered committed-only file
 sequence, rotated by --rotate-size or --rotate-interval. There are no
 transaction directories and {txnID} is not supported in ordered output.
 Topic names are encoded to prevent collisions and path traversal.`)
+	rootCmd.Flags().StringVar(&s3Opts.Region,"output-s3-region","","AWS region (from SDK environment/config when unset)")
+	rootCmd.Flags().StringVar(&s3Opts.Endpoint,"output-s3-endpoint","","Custom S3-compatible endpoint (for example MinIO)")
+	rootCmd.Flags().BoolVar(&s3Opts.ForcePathStyle,"output-s3-force-path-style",false,"Use path-style S3 URLs (often required by MinIO)")
+	rootCmd.Flags().IntVar(&s3Opts.RetryMaxAttempts,"output-s3-retries",3,"Maximum SDK attempts per S3 request")
+	rootCmd.Flags().DurationVar(&s3Opts.RequestTimeout,"output-s3-request-timeout",30*time.Second,"Timeout per S3 request")
+	rootCmd.Flags().Int64Var(&s3Opts.MultipartPartSize,"output-s3-multipart-part-size",8<<20,"S3 multipart part size in bytes (at least 5 MiB)")
 	rootCmd.Flags().StringVar(&fmtName, "output-format", "binary",
 		"Message format: binary, jsonl, kcat")
 	rootCmd.Flags().StringVar(&fmtStr, "output-format-string", "",
@@ -175,7 +194,7 @@ Topic names are encoded to prevent collisions and path traversal.`)
 	}
 }
 
-func runWithRotation(addr, dst, fmtName, fmtStr string, jsonB64Key, jsonB64Val bool, separator, sepHex string, noSeparator, transactional bool, stateDir string, tOpts output.TLSOpts, httpOpts output.HTTPOpts, rotateSize int64, rotateInterval time.Duration) error {
+func runWithRotationS3(addr, dst, fmtName, fmtStr string, jsonB64Key, jsonB64Val bool, separator, sepHex string, noSeparator, transactional bool, stateDir string, tOpts output.TLSOpts, httpOpts output.HTTPOpts, rotateSize int64, rotateInterval time.Duration,s3Opts output.S3OrderedOpts) error {
 	var sep []byte
 	if fmtName == "binary" {
 		var err error
@@ -215,7 +234,7 @@ func runWithRotation(addr, dst, fmtName, fmtStr string, jsonB64Key, jsonB64Val b
 		// A restart must not silently mix encodings within one file series.
 		serialization:=fmt.Sprintf("ordered-v1|%q|%q|%t|%t|%x",
 			fmtName,fmtStr,jsonB64Key,jsonB64Val,sep)
-		return runOrdered(addr,dst,stateDir,fmtr,serialization,rotateSize,rotateInterval)
+		return runOrderedWithS3(addr,dst,stateDir,fmtr,serialization,rotateSize,rotateInterval,s3Opts)
 	}
 
 	tlsCfg, err := tOpts.BuildTLSConfig()

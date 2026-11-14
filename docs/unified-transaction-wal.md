@@ -1,8 +1,8 @@
 # Unified WAL and ordered committed-file output
 
-Status: implementation architecture for PR #52. The single-WAL design and
-ordered filesystem writer are implemented; outstanding reliability gates are
-listed at the end. There is **no backwards compatibility requirement** for
+Status: unified WAL and ordered filesystem publication are implemented. The
+S3 ordered publication backend extends the same architecture; validate the
+S3-specific failure matrix and CI before enabling it in production. There is **no backwards compatibility requirement** for
 the unmerged WAL or transaction-directory layouts.
 
 ## Chosen model
@@ -52,6 +52,43 @@ With transactional CLI output, JSONL is the default format. The output
 pattern requires one entire `{topic}` directory and a
 `{seq:NN}` filename placeholder, width 6–20; there is no
 `{txnID}`, `{partition}` or transaction directory.
+
+## S3 publication backend
+
+The same ordered materializer supports immutable S3 objects at
+`s3://bucket/prefix/{topic}/messages-{seq:08}.jsonl` using AWS SDK v2.
+Unlike the former PR #36 approach, S3 does **not** implement `CommitTxn`,
+`AbortTxn`, transaction buffering, or per-transaction paths. The shared
+WAL continues to own stable offsets and all Kafka transaction semantics.
+
+S3 requires an explicit `--transaction-state-dir` (durable local WAL).
+The WAL binds the effective SDK endpoint (including AWS environment/shared-config overrides), resolved region, bucket and key pattern as an opaque identity. Changing any of these on restart fails closed rather than silently publishing subsequent sequences to another S3 service.
+The existing filesystem absolute-path binding is unchanged, and formatter
+binding remains separate. Retries and transport timeouts are not binding
+fields.
+
+Before each publication the S3 publisher checks whether the deterministic
+key already exists. Completed objects are written with `If-None-Match: *`;
+multipart uses conditional `CompleteMultipartUpload`. Contents are
+built from committed WAL bytes in an ephemeral disk spool, with bounded
+memory. The final S3 object is visible only after a successful PUT or
+multipart completion. Then the same `WALTopicFile` receipt is fsynced;
+its `Path` is relative to the configured S3 key prefix.
+
+If a completed object exists without a receipt, HEAD must return both
+a positive length and the `ksink-sha256` metadata digest matching a
+complete committed WAL record prefix. Otherwise recovery fails closed and
+does not overwrite the object. An ambiguous upload response is similarly
+reconciled with HEAD before reporting failure. Orphan multipart uploads
+after abrupt process death need an S3 lifecycle cleanup rule.
+
+Failures are fatal after bounded SDK retries: stop Kafka input, preserve
+the WAL, and recover on restart. WAL disk and temporary spool capacity
+must be sized for unavailable/slow S3 publication. There is no new
+admission control policy or synchronous S3 Kafka acknowledgement.
+Completed objects are immutable per-topic sequences; multi-topic
+visibility is independent, and consumers must checkpoint sequences
+for exactly-once downstream side effects.
 
 ## Durability protocol
 

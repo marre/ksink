@@ -24,6 +24,7 @@ import (
 // It never creates transaction-specific directories.
 type OrderedTopicMaterializer struct {
 	wal *ksink.TransactionLog
+	s3 *S3OrderedPublisher
 	pattern string
 	root string
 	width int
@@ -231,6 +232,7 @@ func (w *OrderedTopicMaterializer) Publish(ctx context.Context, force bool) (int
 }
 
 func (w *OrderedTopicMaterializer) publishTopic(ctx context.Context,topic string,force bool) (int,error) {
+	if w.s3!=nil {return w.publishTopicS3(ctx,topic,force)}
 	p:=w.wal.TopicProgress(topic)
 	stable:=w.wal.TopicStableOffset(topic)
 	if p.Cursor>=stable {
