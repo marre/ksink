@@ -64,11 +64,21 @@ func (l *TransactionLog) compactLocked() error {
 	// Control markers share the same offset space but have no output payload.
 	// The manifest's atomic switch makes multi-frame checkpoints all-or-none.
 	topicsSet := make(map[string]bool)
+	for topic := range l.topicNext { topicsSet[topic]=true }
 	for topic := range l.topicRecords { topicsSet[topic]=true }
 	for topic := range l.topicMarkers { topicsSet[topic]=true }
 	topics := make([]string,0,len(topicsSet))
 	for topic := range topicsSet {topics=append(topics,topic)}
 	sort.Strings(topics)
+	// Old published payload frames may be gone from this checkpoint. A
+	// retained topic floor makes every later application/control offset
+	// replayable without inventing or reusing any deleted offsets.
+	for _, topic := range topics {
+		floor:=l.topicProgress[topic].Cursor
+		if err:=write(transactionWALRecord{Type:"topic-base",
+			TopicBase:&walTopicBase{Topic:topic,Offset:floor},
+		});err!=nil{return failed(err)}
+	}
 	pendingCount := 0
 	flushPending := func() error {
 		if pendingCount==0 {return nil}

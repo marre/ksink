@@ -4,6 +4,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"math"
+	"sort"
 )
 
 // WALTopicFile is one immutable, durably finalized file of committed records.
@@ -144,6 +145,10 @@ func (l *TransactionLog) applyTopicProgress(p *WALTopicProgress, size int64, sou
 	copied:=*p
 	if p.LastFile!=nil {file:=*p.LastFile;copied.LastFile=&file}
 	l.topicProgress[p.Topic]=copied
+	// The durable receipt is already fsynced when this index is applied.
+	// Reclaim only payloads BELOW the committed cursor; unresolved later
+	// records remain live even when another topic publishes independently.
+	l.prunePublishedTopicLocked(p.Topic,copied.Cursor)
 	return nil
 }
 
@@ -174,5 +179,27 @@ func (l *TransactionLog) applyTopicProgressCheckpoint(p *WALTopicProgress,
 	if p.LastFile!=nil {file:=*p.LastFile;copied.LastFile=&file}
 	l.topicProgress[p.Topic]=copied
 	l.topicProgressRefs[p.Topic]=walFrameRef{key:source,size:size}
+	l.prunePublishedTopicLocked(p.Topic,copied.Cursor)
 	return nil
+}
+
+// prunePublishedTopicLocked reclaims only record-frame references whose
+// completed-file or skip receipts are already durable. Control markers from
+// shared terminal frames cannot be individually marked dead: only their
+// in-memory indexes are dropped. The shared WAL checkpoint later rewrites
+// the surviving suffix and the absolute next-offset counter.
+func (l *TransactionLog) prunePublishedTopicLocked(topic string,cursor int64) {
+	records:=l.topicRecords[topic]
+	i:=sort.Search(len(records),func(i int)bool{return records[i].meta.Offset>=cursor})
+	for _,record:=range records[:i] {
+		l.markFrameDead(walFrameRef{key:record.key,size:record.size})
+	}
+	if i>0 {
+		l.topicRecords[topic]=append([]walTopicLocation(nil),records[i:]...)
+	}
+	markers:=l.topicMarkers[topic]
+	j:=sort.Search(len(markers),func(j int)bool{return markers[j].Offset>=cursor})
+	if j>0 {
+		l.topicMarkers[topic]=append([]walTopicMarker(nil),markers[j:]...)
+	}
 }

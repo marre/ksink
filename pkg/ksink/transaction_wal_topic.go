@@ -35,6 +35,11 @@ type walTopicLocation struct {
 // application record. One terminal WAL frame atomically assigns markers to
 // every enrolled topic of a transaction. A checkpoint expands them into
 // per-topic marker frames in offset order.
+type walTopicBase struct {
+	Topic string
+	Offset int64
+}
+
 type walTopicMarker struct {
 	Topic string
 	Offset int64
@@ -277,6 +282,12 @@ func (l *TransactionLog) ReadTopicRecord(topic string, offset int64) (WALTopicRe
 	refs := l.topicRecords[topic]
 	if offset < 0 || offset >= l.topicNext[topic] {
 		return WALTopicRecord{}, false, nil
+	}
+	if progress:=l.topicProgress[topic];offset<progress.Cursor {
+		// Historical completed records have been safely reclaimed from
+		// the WAL. Their immutable output files (or consumer checkpoints)
+		// are the only remaining delivery record.
+		return WALTopicRecord{},false,nil
 	}
 	// Kafka control markers occupy topic offsets, but do not appear in the
 	// application payload index. A reader must skip those known positions.

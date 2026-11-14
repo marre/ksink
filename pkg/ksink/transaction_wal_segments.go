@@ -187,6 +187,14 @@ func (l *TransactionLog) markFrameDead(ref walFrameRef) {
 // An atomic manifest write precedes unlink, so interrupted deletion cannot
 // lose the last surviving copy of an acknowledged record.
 func (l *TransactionLog) deleteFullyDeadSegmentsLocked() error {
+	// Before the first checkpoint no retained topic-base frames exist.
+	// Reclaiming a complete historical segment could remove the offset
+	// prefix needed to interpret later record/control positions on replay.
+	if l.manifest.Snapshot==0 {
+		for _,p:=range l.topicProgress {
+			if p.Cursor>0 {return nil}
+		}
+	}
 	if len(l.manifest.Segments)<=1 {return nil}
 	m:=l.manifest
 	m.Segments=make([]uint64,0,len(l.manifest.Segments))

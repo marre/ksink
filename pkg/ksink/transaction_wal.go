@@ -70,6 +70,7 @@ type transactionWALRecord struct {
 	// marker offsets; no crash may observe only some participants.
 	TopicTerminal *walTopicTerminal
 	TopicMarker *walTopicMarker // checkpoint-only representation
+	TopicBase *walTopicBase // checkpoint-only retained topic offset floor
 	TopicProgress *WALTopicProgress
 	Decision string
 	BatchCount int
@@ -508,6 +509,14 @@ func (l *TransactionLog) apply(rec transactionWALRecord, frameOffset, frameBytes
 			l.topicMarkers[marker.Topic] = append(l.topicMarkers[marker.Topic], marker)
 			l.topicNext[marker.Topic]++
 		}
+	case "topic-base":
+		base:=rec.TopicBase
+		if base==nil || base.Topic=="" || len(base.Topic)>249 ||
+			base.Offset<0 || l.topicNext[base.Topic]!=0 ||
+			len(l.topicRecords[base.Topic])!=0 || len(l.topicMarkers[base.Topic])!=0 {
+			return fmt.Errorf("invalid retained topic offset checkpoint")
+		}
+		l.topicNext[base.Topic]=base.Offset
 	case "topic-marker":
 		marker := rec.TopicMarker
 		if marker == nil || marker.Topic == "" ||
