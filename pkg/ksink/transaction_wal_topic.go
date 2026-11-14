@@ -40,7 +40,7 @@ const maxTopicAcceptanceBatchRecords = 65536
 // Callers performing idempotent Kafka Produce must instead use
 // AppendTopicBatchWithState to atomically persist producer sequence history.
 func (l *TransactionLog) AppendTopicBatch(records []WALTopicRecord) ([]int64, error) {
-	return l.appendTopicBatch(records, nil)
+	return l.appendTopicBatch(records, nil, nil)
 }
 
 // AppendTopicBatchWithState couples topic records and their producer dedup /
@@ -49,10 +49,24 @@ func (l *TransactionLog) AppendTopicBatch(records []WALTopicRecord) ([]int64, er
 // The caller must still validate producer epoch and batch signatures.
 func (l *TransactionLog) AppendTopicBatchWithState(records []WALTopicRecord, snapshot txnStateSnapshot) ([]int64, error) {
 	copied := cloneTxnStateSnapshot(snapshot)
-	return l.appendTopicBatch(records, &copied)
+	return l.appendTopicBatch(records, &copied, nil)
 }
 
-func (l *TransactionLog) appendTopicBatch(records []WALTopicRecord, snapshot *txnStateSnapshot) ([]int64, error) {
+// appendTopicBatchFormattedWithState formats serialized output only AFTER
+// assigning authoritative per-topic offsets, but BEFORE WAL persistence.
+// The formatter must be deterministic, bounded and must not call this WAL.
+// A format error cannot consume offsets or change producer dedup state.
+func (l *TransactionLog) appendTopicBatchFormattedWithState(records []WALTopicRecord,
+	snapshot txnStateSnapshot, format func(int, int64) ([]byte, error)) ([]int64, error) {
+	if format == nil {
+		return nil, fmt.Errorf("missing topic output formatter")
+	}
+	copied := cloneTxnStateSnapshot(snapshot)
+	return l.appendTopicBatch(records, &copied, format)
+}
+
+func (l *TransactionLog) appendTopicBatch(records []WALTopicRecord, snapshot *txnStateSnapshot,
+	format func(int, int64) ([]byte, error)) ([]int64, error) {
 	if len(records) == 0 {
 		return nil, nil
 	}
@@ -84,7 +98,7 @@ func (l *TransactionLog) appendTopicBatch(records []WALTopicRecord, snapshot *tx
 	next := make(map[string]int64)
 	changes := make([]transactionWALRecord, 0, len(records))
 	offsets := make([]int64, 0, len(records))
-	for _, r := range records {
+	for i, r := range records {
 		if r.Topic == "" || len(r.Topic) > 249 {
 			return nil, fmt.Errorf("invalid WAL topic name")
 		}
@@ -114,6 +128,11 @@ func (l *TransactionLog) appendTopicBatch(records []WALTopicRecord, snapshot *tx
 			return nil, fmt.Errorf("WAL topic offset exhausted for %q", r.Topic)
 		}
 		r.Offset = offset
+		if format != nil {
+			encoded, err := format(i, offset)
+			if err != nil { return nil, fmt.Errorf("format topic record: %w", err) }
+			r.Data = encoded
+		}
 		r.Data = append([]byte(nil), r.Data...)
 		next[r.Topic] = offset + 1
 		offsets = append(offsets, offset)
