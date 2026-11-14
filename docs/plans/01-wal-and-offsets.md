@@ -1,6 +1,6 @@
 # Phases 1–2: close WAL gaps and establish per-topic offsets
 
-Status: **plan with partial implementation underway**, not a completed storage redesign. Chosen architecture: **one shared physical WAL** containing independent logical streams for **partition 0 of each topic**, plus coordinator and transaction-decision frames in that **same WAL**. See [roadmap](00-ordered-output-roadmap.md).
+Status: **implemented WAL architecture, with final failure/recovery verification outstanding**. Chosen architecture: **one shared physical WAL** containing independent logical streams for **partition 0 of each topic**, plus coordinator and transaction-decision frames in that **same WAL**. See [roadmap](00-ordered-output-roadmap.md).
 
 ## Current code facts and risks in PR #52
 
@@ -56,7 +56,7 @@ A process crash between record append and the shared WAL commit decision leaves 
 3. **Participant fencing and decision barrier:** transaction coordination serialized with producer writes and topic enrollment; COMMIT follows one shared WAL's existing durable record fsyncs. A decision must not depend on file output.
 4. **Replay and retention:** rebuild all outstanding generations and topic-offset ordered indexes; retain data through producer reuse; reject missing acknowledged data; safe shared-segment GC respecting **every topic** publisher cursor.
 5. **Reader API / lock design:** bounded offset-ordered WAL iterators with safe segment lifetimes; keep slow materializer disk writes outside producer/WAL mutexes; measure fairness and blocked startup cases. A deterministic in-memory formatter callback during batch acceptance is allowed but may not do network/file I/O or re-enter the WAL.
-6. **Backpressure and observability:** per-topic oldest unstable offset, end offset, emitted offset, blocked transaction, retained bytes and GC backlog, plus shared WAL free disk budget and health/errors. Define disk-full policy and bounds.
+6. **Fatal write errors:** WAL write, fsync, checkpoint and rotation errors must cause nonzero process termination without acknowledging undurable data. Metrics, free-disk-budget admission control and bounded-backlog backpressure are out of scope.
 7. **Checkpoint optimization:** avoid copying unrelated large producer snapshots on every message if benchmarks show cost. Validate CRC, maximum-frame rules, snapshots and generation handling.
 
 ## Acceptance tests
@@ -80,3 +80,10 @@ Move on only when the shared WAL can replay a fully accepted multi-topic transac
 The new shared-WAL record version is **3**, with manifest version **2**; older unmerged WAL state is explicitly rejected. `AddPartitionsToTxn` persists sorted topic participants, and EndTxn allocates their Kafka control-marker offsets with the durable outcome in one WAL record. A read-committed per-topic cursor must skip marker offsets and aborted records, yet preserve their offsets as gaps. Snapshot compaction reconstructs payloads and markers in each topic's offset order. The new publication receipt API is independent per topic but **does not yet reclaim historical payloads**; keep it that way until the immutable file materializer, safe compaction and replay tests establish that all data needed by a blocked topic remains live.
 
 **Outstanding correctness review:** idempotent nontransactional producers still need deduplication equivalent to the transactional producer path, and WAL compaction must eventually encode durable next-offset counters even when older published payload frames are discarded. Neither is a prerequisite for testing an isolated writer, but both are required before the final merge.
+
+
+## Revised operating policy (November 2026)
+
+- **Fatal I/O:** any WAL or output write/sync/finalization failure must cause nonzero process termination; never acknowledge undurable data. Restart replays durable WAL and reconciles immutable output receipts. This policy is a requirement, not proof that all current code paths already enforce it.
+- **No metrics or backpressure feature:** no metrics endpoint, per-topic health metrics, configured disk budget or bounded-backlog admission control is required. Disk exhaustion is a fatal I/O failure.
+- **Rotation restart:** a process crash or restart may reset a pending in-memory time-rotation interval. Durable topic offsets, output cursors and file sequence numbers must not reset.
