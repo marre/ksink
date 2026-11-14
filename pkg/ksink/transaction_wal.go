@@ -736,7 +736,7 @@ func cloneTxnStateSnapshot(src txnStateSnapshot) txnStateSnapshot {
 	}
 	for id,st:=range src.Idempotent {
 		out.Idempotent[id]=storedIdempotentProducer{
-			Epoch:st.Epoch,Sequences:copyTxnSequences(st.Sequences),
+			Epoch:st.Epoch,LastActivityUnixNano:st.LastActivityUnixNano,Sequences:copyTxnSequences(st.Sequences),
 		}
 	}
 	return out

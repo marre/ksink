@@ -71,3 +71,8 @@ The shared WAL now stores per-topic `WALTopicProgress` cursors and receipt metad
 - **Fatal I/O:** any WAL or output write/sync/finalization failure must cause nonzero process termination; never acknowledge undurable data. Restart replays durable WAL and reconciles immutable output receipts. This policy is a requirement, not proof that all current code paths already enforce it.
 - **No metrics or backpressure feature:** no metrics endpoint, per-topic health metrics, configured disk budget or bounded-backlog admission control is required. Disk exhaustion is a fatal I/O failure.
 - **Rotation restart:** a process crash or restart may reset a pending in-memory time-rotation interval. Durable topic offsets, output cursors and file sequence numbers must not reset.
+
+
+### Nontransactional idempotent producer retention
+
+The ordered coordinator stores each nontransactional producer's epoch and deduplication history in the shared WAL. Successful new Produce batches atomically refresh a durable last-activity timestamp. When the 10,000-entry cap is reached, producers inactive for **more than seven days** can be reclaimed, but only after a replacement coordinator snapshot has been durably appended. Producer IDs are never reused. A Produce request using a reclaimed producer ID is fenced; clients must initialize a new producer ID. Exact retries within the retention window continue to deduplicate. State predating activity timestamps is conservatively retained until its next accepted batch. This is an inactivity-based bounded-retention guarantee, not unlimited historical deduplication.

@@ -9,6 +9,7 @@ import (
 	"net"
 	"sort"
 	"strconv"
+	"time"
 
 	"github.com/twmb/franz-go/pkg/kerr"
 	"github.com/twmb/franz-go/pkg/kgo"
@@ -419,7 +420,7 @@ func (s *Server) handleProduce(ctx context.Context, conn net.Conn, connID uint64
 					records,encode,func(assigned []int64)(txnStateSnapshot,error){
 						for id,st:=range proposedIdempotent {
 							updated[id]=storedIdempotentProducer{
-								Epoch:st.Epoch,Sequences:copyTxnSequences(st.Sequences),
+								Epoch:st.Epoch,LastActivityUnixNano:time.Now().UnixNano(),Sequences:copyTxnSequences(st.Sequences),
 							}
 						}
 						for ti,topicData:=range req.Topics {
@@ -755,13 +756,31 @@ func (s *Server) handleInitProducerId(ctx context.Context, conn net.Conn, connID
 	producerID := s.producerIDCounter.Add(1)
 	if s.orderedFormatter!=nil {
 		if len(s.idempotentStates)>=maxTxnStates {
+			// Reclaim only producers with a durable inactivity timestamp.
+			// The state checkpoint must become durable before we reuse the
+			// capacity; a failure poisons further coordinator mutations.
+			cutoff:=time.Now().Add(-idempotentProducerRetention).UnixNano()
+			snapshot:=s.txnSnapshotLocked()
+			reclaimExpiredIdempotent(&snapshot,cutoff)
+			if len(snapshot.Idempotent)<len(s.idempotentStates) {
+				if err:=s.txnLog.AppendState(snapshot);err!=nil {
+					s.txnStoreErr=fmt.Errorf("persist idempotent producer reclamation: %w",err)
+					s.txnMu.Unlock()
+					return s.sendResponse(conn,connID,correlationID,&kmsg.InitProducerIDResponse{
+						Version:apiVersion,ErrorCode:kerr.UnknownServerError.Code,ProducerID:-1,
+					})
+				}
+				s.idempotentStates=snapshot.Idempotent
+			}
+		}
+		if len(s.idempotentStates)>=maxTxnStates {
 			s.txnMu.Unlock()
 			return s.sendResponse(conn,connID,correlationID,&kmsg.InitProducerIDResponse{
 				Version:apiVersion,ErrorCode:kerr.UnknownServerError.Code,ProducerID:-1,
 			})
 		}
 		s.idempotentStates[producerID]=storedIdempotentProducer{
-			Epoch:0,Sequences:make(map[string]txnPartitionSequence),
+			Epoch:0,LastActivityUnixNano:time.Now().UnixNano(),Sequences:make(map[string]txnPartitionSequence),
 		}
 	}
 	if err := s.persistTxnStateLocked(); err != nil {

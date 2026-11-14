@@ -6,9 +6,15 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"time"
 )
 
 const durableTxnStateVersion = 1
+
+// Retain inactive idempotent producer epochs for at least seven days.
+// Older WAL checkpoints without activity timestamps are retained until the
+// producer next writes; they cannot be safely expired by inference.
+const idempotentProducerRetention = 7 * 24 * time.Hour
 
 // The coordinator snapshots are logical records INSIDE the shared WAL. There
 // is no independent state.json or second durable transaction authority.
@@ -44,6 +50,7 @@ type storedTxnState struct {
 // needs durable batch-sequence history to deduplicate retries and preserve the
 // originally acknowledged Kafka base offsets.
 type storedIdempotentProducer struct {
+	LastActivityUnixNano int64
 	Epoch int16
 	Sequences map[string]txnPartitionSequence
 }
@@ -53,6 +60,20 @@ type txnStateSnapshot struct {
 	Counter int64
 	States  map[string]storedTxnState
 	Idempotent map[int64]storedIdempotentProducer
+}
+
+// reclaimExpiredIdempotent removes only producers whose last accepted
+// activity is durably known to predate the retention window. A zero timestamp
+// denotes legacy state and must never be guessed to be expired.
+func reclaimExpiredIdempotent(snapshot *txnStateSnapshot, cutoff int64) int {
+	removed:=0
+	for id,st:=range snapshot.Idempotent {
+		if st.LastActivityUnixNano>0 && st.LastActivityUnixNano<cutoff {
+			delete(snapshot.Idempotent,id)
+			removed++
+		}
+	}
+	return removed
 }
 
 func txnSyncDirectory(dir string) error {
@@ -137,7 +158,7 @@ func (s *Server) txnSnapshotLocked() txnStateSnapshot {
 	}
 	for id,st:=range s.idempotentStates {
 		snapshot.Idempotent[id]=storedIdempotentProducer{
-			Epoch:st.Epoch,Sequences:copyTxnSequences(st.Sequences),
+			Epoch:st.Epoch,LastActivityUnixNano:st.LastActivityUnixNano,Sequences:copyTxnSequences(st.Sequences),
 		}
 	}
 	return snapshot
@@ -198,7 +219,7 @@ func (s *Server) initializeTxnState() error {
 	s.idempotentStates=make(map[int64]storedIdempotentProducer,len(snapshot.Idempotent))
 	for id,st:=range snapshot.Idempotent {
 		s.idempotentStates[id]=storedIdempotentProducer{
-			Epoch:st.Epoch,Sequences:copyTxnSequences(st.Sequences),
+			Epoch:st.Epoch,LastActivityUnixNano:st.LastActivityUnixNano,Sequences:copyTxnSequences(st.Sequences),
 		}
 	}
 	dirty := false
