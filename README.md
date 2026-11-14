@@ -10,7 +10,7 @@ A lightweight Kafka-protocol-compatible server library and tool for Go. It accep
 - TLS and mutual TLS (mTLS)
 - Topic filtering
 - Idempotent producer support
-- Transactional producer support with filesystem-backed commit/abort semantics
+- Durable transactional produce and ordered, committed-only immutable files per topic
 
 ## ksink Tool
 
@@ -35,33 +35,15 @@ go run ./cmd/ksink --addr :9092 --output https://example.com/ingest --output-for
 # Print the JSON schema for the jsonl output format
 go run ./cmd/ksink json-schema
 
-# Enable transactional produce support
-go run ./cmd/ksink --addr :9092 --transactional --output 'messages-{txnID}.jsonl'
+# Durable transactional output: one immutable, sortable file series per topic
+go run ./cmd/ksink --addr :9092 --transactional \
+  --output 'data/{topic}/messages-{seq:08}.jsonl' \
+  --rotate-size 128MiB --rotate-interval 1m
+# data/orders/messages-00000001.jsonl, data/payments/messages-00000001.jsonl, ...
+# Each topic has independent Kafka offsets, file numbers and rotation.
 
-# Route messages to per-topic files using the {topic} placeholder
-go run ./cmd/ksink --addr :9092 --output '{topic}.jsonl'
-# produces orders.jsonl, events.jsonl, etc. — one file per topic
-
-# Route to separate files per partition (or combine topic and partition)
-go run ./cmd/ksink --addr :9092 --output '{topic}-{partition}.jsonl'
-# produces orders-0.jsonl, orders-1.jsonl, etc.
-
-# Combine {topic} with transactional output
-go run ./cmd/ksink --addr :9092 --transactional --output '{topic}-{txnID}.jsonl'
-# produces committed/my-txn-<unique-id>/orders-my-txn.jsonl
-#          committed/my-txn-<unique-id>/events-my-txn.jsonl
-
-# Transactional files may also be split by partition:
-# go run ./cmd/ksink --transactional --output '{topic}-{partition}-{txnID}.jsonl'
-
-# Transactional file output — the --output pattern must contain {txnID}.
-# All files in a transaction live in ONE directory beneath the first static
-# path prefix. A single same-filesystem directory rename publishes the whole
-# transaction. Readers should only scan committed/, never .ksink-pending/.
-#   During transaction: .ksink-pending/<txnID>-<nonce>/messages-<txnID>.jsonl
-#   After commit:       committed/<txnID>-<nonce>/messages-<txnID>.jsonl
-#   After abort:        the private staging directory is deleted
-go run ./cmd/ksink --addr :9092 --transactional --output 'messages-{txnID}.jsonl'
+# Nontransactional flat-file routing (no WAL/rotation)
+go run ./cmd/ksink --addr :9092 --output '{topic}.jsonl' --output-format jsonl
 ```
 
 ### Message Formats
@@ -195,39 +177,41 @@ cfg := ksink.Config{
 }
 ```
 
+### Designed limitation: one partition per topic
+
+ksink intentionally supports **exactly one partition (partition 0) per topic**.
+Kafka metadata advertises only partition 0, and direct `Produce` or
+`AddPartitionsToTxn` requests for other partition numbers are rejected with
+`UNKNOWN_TOPIC_OR_PARTITION`. This is a design choice to keep ksink a small
+single-process sink rather than a general-purpose multi-partition Kafka broker.
+
+Multiple topics and transactions spanning multiple topics are supported, each
+with partition 0. A single durable transaction decision determines whether
+records from **all** participating topics are committed or aborted. Each topic
+has its own Kafka offsets and output-file sequence; there is no total
+cross-topic order or simultaneous publication of all its output files.
+The `{partition}` and `{txnID}` output placeholders are deliberately
+unsupported in transactional filesystem mode.
+
+Transactions can overlap and commit in different order from record arrival.
+A `read_committed`-style file writer waits behind the earliest unresolved
+transaction **within that topic**, then emits only committed records in offset
+order. Aborted records and internal Kafka control markers consume offsets but
+are not written into output files.
+
 ### Transactional Producer Support
 
-When `TransactionalWrite` is enabled, ksink accepts the Kafka transactional
-protocol requests (`InitProducerID`, `AddPartitionsToTxn`, `EndTxn`) and
-tracks which transaction each message belongs to via the `TransactionalID`
-field on `Message`.
+The CLI's `--transactional` mode uses the durable shared WAL directly:
+accepted Produce records and producer retry state are fsynced together, and
+EndTxn success means its COMMIT/ABORT decision and per-topic control-marker
+positions are durable. Publication is **asynchronous**: a successful EndTxn
+does not mean a file has been rotated and made visible yet.
 
-Transaction lifecycle events are delivered through `Read` as distinct event
-types (`*TxnCommitEvent`, `*TxnAbortEvent`). This ensures that all data
-messages for a transaction have been processed before the commit/abort event
-is handled:
-
-```go
-for {
-    event, ack, err := srv.Read(ctx)
-    if err != nil {
-        break
-    }
-    switch e := event.(type) {
-    case *ksink.MessagesEvent:
-        for _, msg := range e.Messages {
-            // write message to output
-        }
-    case *ksink.TxnCommitEvent:
-        // e.g. rename temp file to final name
-        commitTxn(e.TransactionalID)
-    case *ksink.TxnAbortEvent:
-        // e.g. delete temp file
-        abortTxn(e.TransactionalID)
-    }
-    ack(nil)
-}
-```
+The embedded `pkg/ksink` API also supports a `Read`/`AckFunc` event
+model; when using that API, application code is responsible for its own
+transaction-aware side effects. `ksink.WithOrderedTransactionalOutput`
+instead uses an offset-aware formatter and journals payloads directly to
+the shared WAL; this is what the transactional CLI uses.
 
 #### How Kafka Transactions Work (Background)
 
@@ -250,70 +234,103 @@ The broker uses the `transactional.id` for **zombie fencing**: when a
 producer restarts with the same ID, the broker aborts any in-flight
 transaction from the previous instance to prevent duplicates.
 
-#### Limitations of ksink's Transaction Support
+#### Filesystem and consumer contract
 
-ksink is **not** a full Kafka broker. Its transactional support is
-intentionally simplified:
+```bash
+ksink --transactional \
+  --output 'data/{topic}/messages-{seq:08}.jsonl' \
+  --rotate-size 128MiB \
+  --rotate-interval 1m
+```
 
-| Real Kafka behaviour | ksink API behaviour | ksink tool behaviour |
-|---|---|---|
-| Records written inside a transaction are invisible to `read_committed` consumers until commit. | Records are delivered to `Read` as `*MessagesEvent` immediately when produced. The `TransactionalID` field is populated so the consumer can buffer them. When the transaction ends, a `*TxnCommitEvent` or `*TxnAbortEvent` is delivered so the consumer can decide what to do. | Messages are staged in a private transaction directory. On commit the entire directory is renamed into `committed/` in one atomic filesystem operation; abort removes staging. Consumers must read only from `committed/`. |
-| The transaction coordinator tracks transaction state across broker restarts. | No persistent producer ID, epoch, deduplication or transaction state; a Kafka producer must reinitialize after a server restart. | On writer startup, staged transactions **without** a durable commit intent are aborted, and transactions **with** an intent are finished idempotently before accepting new messages. Committed directories survive process restarts. |
-| `sendOffsetsToTransaction` atomically commits consumer offsets with the transaction. | Not supported. ksink is a sink, not a full broker with consumer groups. | Not supported. |
-| Zombie fencing: restarting a producer with the same `transactional.id` aborts the old instance's pending transaction. | **Supported in-process.** When `InitProducerID` is called with an existing `transactional.id` that has an in-flight transaction, the old transaction is aborted through `Read` before the epoch is bumped. | The old transaction's private staging directory is deleted on abort. |
-| Transactions can span multiple topic-partitions atomically. | All events for the same `transactional.id` share a transaction context while active, but there is no durable coordinator. | All files within one transaction directory are made visible together via one same-filesystem directory rename. The atomicity guarantee applies only to consumers reading complete directories under `committed/`, not to consumers scanning staging or to process crashes. |
-| Aborted records are never visible to `read_committed` consumers. | Aborted records were already delivered to `Read`. The `*TxnAbortEvent` signals the consumer to clean up, but application-level processing that happened before the abort is not rolled back. | The private staging directory is deleted on abort, so it never appears under `committed/`. |
-| `isolation.level` consumer configuration. | Not applicable — ksink does not implement the consumer protocol. | Not applicable. |
+With no explicit `--output-format`, transactional CLI output uses **JSONL**
+(nontransactional output still defaults to binary). The required `{topic}`
+placeholder occupies one directory component, and `{seq:08}` supplies a
+zero-padded **per-topic file number**, not the Kafka offset. Supported sequence
+widths are 6–20. Topic names are encoded injectively, so distinct names never
+share an output directory.
 
-**In summary:** ksink atomically publishes every file of a transaction as
-one directory under `committed/<transactional.id>-<nonce>/`. The output
-layout is **breaking** compared with the prior flat-file layout: output
-patterns now name files *inside* transaction directories, and downstream
-readers must scan only `committed/`. The fixed directory prefix of the
-pattern determines the output root. A rename requires staging and committed
-directories on the **same filesystem**, with filesystem semantics supporting
-atomic directory moves (test network-mounted filesystems separately).
+The first rotation condition wins. `--rotate-size` is a target size; a
+single record can exceed it, but a record is never split. A nonempty,
+low-volume file becomes visible after the configured interval; elapsed
+time is best-effort and can restart after a crash. Setting one trigger to
+`0` disables it, but at least one must remain enabled. Transaction
+boundaries do **not** trigger file rotation.
 
-### Filesystem recovery and durability
+Example:
 
-The transactional filesystem writer maintains a **durable commit-intent
-journal** inside each staging directory. It synchronizes each accepted
-message to disk before acknowledging its write. On commit, it closes and
-synchronizes the payloads and subdirectories, writes and synchronizes
-`.ksink-commit-intent`, and publishes the complete directory using one
-same-filesystem rename. It synchronizes the affected parent directories
-before reporting commit success.
+```text
+data/
+  orders/
+    messages-00000001.jsonl
+    messages-00000002.jsonl
+  payments/
+    messages-00000001.jsonl
+  .ksink-kafka-state/
+    manifest.json
+    segments/
+    snapshots/
+```
 
-On startup, ksink takes an exclusive OS-level lock on the output root and
-reconciles pending directories **before accepting new messages**:
+Completed files contain only committed application records, in topic-offset
+order. Files can mix committed transactions, and one transaction can span
+multiple files. The publisher uses a same-directory temporary file,
+`fsync`, a **no-replace** hard-link publish, and directory `fsync` before
+durably recording its topic's publication cursor and next file number.
+Readers ignore `.ksink-ordered-*.tmp` files and read finished sequence
+filenames in lexical order **within each topic**. There is no global
+cross-topic order.
 
-- No commit-intent marker: discard the uncommitted staging directory.
-- Valid commit-intent marker: finish publishing the transaction.
-- Corrupt marker or irreconcilable filesystem error: fail startup rather than
-  silently discard data.
+**Readers should checkpoint their last processed `(topic, file sequence)`
+before deleting or moving completed files.** ksink will never reuse a
+filename after a durable publication receipt. If a process crashes in the
+small window *after* publishing a file but *before* recording its receipt,
+recovery checks an existing final file against WAL payload bytes before
+accepting it. If the consumer already processed and removed that file,
+ksink cannot distinguish that from never publishing it and might re-create
+it. End-to-end exactly-once side effects require reader cooperation.
 
-**A commit intent is irreversible.** Once recorded, an aborted/failed
-directory publication must be retried or recovered, not rolled back. A
-successful directory rename is never rolled back. On graceful shutdown,
-uncommitted staging is cleaned; pending committed intents are preserved
-for recovery. One active writer process per output root is enforced by
-the lock file `.ksink-lock`. The marker is metadata, not a message file,
-and readers must ignore it.
+#### Shared WAL, recovery and retention
 
-This filesystem journal does **not** persist Kafka producer IDs, epochs,
-record sequence/deduplication state or EndTxn outcomes in the broker.
-Thus it cannot resume active producer transactions after a server restart
-and does not provide cross-restart exactly-once Kafka delivery. A crash
-before durable commit intent means an active transaction is aborted even
-if some Produce requests were acknowledged. A crash after intent means the
-entire transaction is eventually published on next successful startup.
-Consumers must inspect only `committed/`. Durable behavior requires a
-filesystem honoring file/parent-directory fsync and same-filesystem
-atomic directory rename; unsupported filesystems fail instead of silently
-claiming durability. Filesystem failure or lost power during unacknowledged
-commit may leave an ambiguous outcome until startup recovery runs.
+One checksummed physical WAL owns all producer identities, epochs, dedup
+history, topic/partition-0 offsets, enrolled transaction participants,
+durable multi-topic COMMIT/ABORT outcomes, and per-topic file publication
+receipts. It has segmented log files, an atomic manifest, and a compacted
+checkpoint. Topic log offsets advance for transactional control markers
+and aborted messages, even though neither appears in final files.
 
-**Performance note:** each transactional write performs a file fsync and
-synchronizes its directory path. This favors correctness and crash safety
-over maximum ingest throughput; batching/durability policy controls can
-be considered separately.
+A restart replays only authoritative WAL segments and snapshots, fences old
+producer epochs, preserves durably decided commits and aborts undecided
+transactions. Acks for Produce and EndTxn depend on WAL durability, not on
+file rotation. Output publication can lag when a transaction remains
+unresolved in that topic, but an unrelated topic may continue publishing.
+
+Published payloads and processed control-marker indexes can be reclaimed
+once the topic's publication cursor is durably recorded. Compaction retains
+absolute per-topic next-offset counters so an old completed file cannot
+cause offset or filename reuse after recovery. Pending records remain live
+in the WAL, including when another topic is blocked.
+
+The current transaction WAL format is **v3** with manifest **v2**. **No
+migration or backwards compatibility is provided** for older/unmerged
+transaction WALs or old `committed/<txnID>` directories. Start a new
+state/output directory when switching to this layout. An unsupported WAL
+manifest fails startup rather than resetting acknowledged history.
+
+#### Intentional limitations
+
+ksink remains a producer-facing sink, not a complete Kafka broker: it does
+not offer Kafka Fetch/consumer groups, `sendOffsetsToTransaction`, a
+global topic ordering, or an `isolation.level` toggle for filesystem
+output. Filesystem output always follows committed-only visibility.
+
+The ordered writer requires a local filesystem supporting atomic hard-link
+creation and durable file/directory `fsync`. Some network filesystems do not
+provide these guarantees. Disk exhaustion or corruption is an error, not
+an invitation to discard acknowledged WAL records. Output readers control
+their own retention of finished files. The WAL must be sized for the largest
+unresolved transaction and for publication backlog.
+
+An ordered formatted record that produces zero bytes is unsupported: an
+empty record cannot create a visible immutable file while preserving its
+file-sequence receipt.

@@ -1,0 +1,117 @@
+package ksink_test
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"path/filepath"
+	"testing"
+	"time"
+
+	"github.com/marre/ksink/internal/output"
+	"github.com/marre/ksink/pkg/ksink"
+	"github.com/stretchr/testify/require"
+	"github.com/twmb/franz-go/pkg/kgo"
+)
+
+func TestOrderedWALKafkaProducerWritesTopicOffsetsAndCommitsWithoutFileOutput(t *testing.T) {
+	root := t.TempDir()
+	stateDir := filepath.Join(root, "state")
+	wal, err := ksink.OpenTransactionLog(stateDir)
+	require.NoError(t, err)
+	pattern := filepath.Join(root, "{topic}", "messages-{seq:08}.jsonl")
+	require.NoError(t, wal.BindOutput(pattern))
+
+	formatter := func(msg *ksink.Message) ([]byte, error) {
+		return []byte(fmt.Sprintf("%s/%d: %s\n", msg.Topic, msg.Offset, msg.Value)), nil
+	}
+	srv, err := ksink.New(ksink.Config{
+		Address: fmt.Sprintf("127.0.0.1:%d", getFreePort(t)),
+		TransactionalWrite: true, Timeout: 5 * time.Second,
+	}, ksink.WithTransactionLog(wal), ksink.WithOrderedTransactionalOutput(formatter),
+		ksink.WithLogger(&integrationLogger{t}))
+	require.NoError(t, err)
+	require.NoError(t, srv.Start(context.Background()))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	client, err := kgo.NewClient(
+		kgo.SeedBrokers(srv.Addr().String()),
+		kgo.RequestTimeoutOverhead(5*time.Second),
+		kgo.TransactionalID("multi-topic-ordered"),
+	)
+	require.NoError(t, err)
+	require.NoError(t, client.BeginTransaction())
+	results := client.ProduceSync(ctx,
+		&kgo.Record{Topic: "orders", Value: []byte("order-1")},
+		&kgo.Record{Topic: "payments", Value: []byte("payment-1")},
+	)
+	require.NoError(t, results.FirstErr())
+	require.NoError(t, client.EndTransaction(ctx, kgo.TryCommit))
+	client.Close()
+
+	// The COMMIT marker itself consumes offset 1 in each topic, while
+	// the consumer-facing file materializer will skip marker records.
+	require.Equal(t, int64(2), wal.NextTopicOffset("orders"))
+	require.Equal(t, int64(2), wal.NextTopicOffset("payments"))
+	require.Equal(t, int64(2), wal.TopicStableOffset("orders"))
+	require.Equal(t, int64(2), wal.TopicStableOffset("payments"))
+	for topic, want := range map[string]string{
+		"orders": "orders/0: order-1\n",
+		"payments": "payments/0: payment-1\n",
+	} {
+		record, exists, readErr := wal.ReadTopicRecord(topic, 0)
+		require.NoError(t, readErr)
+		require.True(t, exists)
+		require.Equal(t, want, string(record.Data))
+		require.Equal(t, int64(0), record.Offset)
+		require.NotEmpty(t, record.Instance)
+		require.Equal(t, "commit", wal.TopicTransactionDecision(record.Instance))
+	}
+
+	require.NoError(t, srv.Close(context.Background()))
+	require.NoError(t, wal.Close())
+	reopened, err := ksink.OpenTransactionLog(stateDir)
+	require.NoError(t, err)
+	defer func() { _ = reopened.Close() }()
+	// A durable Kafka EndTxn has succeeded even though no output files have
+	// been materialized; recovery cannot mistake it for an open transaction.
+	restarted, err := ksink.New(ksink.Config{
+		Address: fmt.Sprintf("127.0.0.1:%d", getFreePort(t)),
+		TransactionalWrite: true,
+	}, ksink.WithTransactionLog(reopened), ksink.WithOrderedTransactionalOutput(formatter),
+		ksink.WithLogger(&integrationLogger{t}))
+	require.NoError(t, err)
+	require.NoError(t, restarted.Start(context.Background()))
+	defer func() { _ = restarted.Close(context.Background()) }()
+	require.Equal(t, int64(2), reopened.TopicStableOffset("orders"))
+	require.Equal(t, int64(2), reopened.TopicStableOffset("payments"))
+	for _, topic := range []string{"orders", "payments"} {
+		record, exists, readErr := reopened.ReadTopicRecord(topic, 0)
+		require.NoError(t, readErr)
+		require.True(t, exists)
+		require.Equal(t, "commit", reopened.TopicTransactionDecision(record.Instance))
+	}
+	// End-to-end: after replay, asynchronously publish the independently
+	// ordered files. Control markers must not appear as payloads.
+	writer, err := output.NewOrderedTopicMaterializer(reopened, pattern, 128<<20, time.Minute)
+	require.NoError(t, err)
+	require.NoError(t, writer.Flush(ctx))
+	for topic, want := range map[string]string{
+		"orders": "orders/0: order-1\n",
+		"payments": "payments/0: payment-1\n",
+	} {
+		path := filepath.Join(root, topic, "messages-00000001.jsonl")
+		data, readErr := os.ReadFile(path)
+		require.NoError(t, readErr)
+		require.Equal(t, want, string(data))
+		require.Equal(t, int64(2), reopened.TopicProgress(topic).Cursor,
+			"file receipt includes transaction control marker offset")
+		require.Equal(t, uint64(2), reopened.TopicProgress(topic).NextFile)
+	}
+	require.NoError(t, writer.Flush(ctx))
+	for _, topic := range []string{"orders", "payments"} {
+		require.Equal(t, uint64(2), reopened.TopicProgress(topic).NextFile,
+			"a second publish cannot duplicate an immutable output file")
+	}
+}

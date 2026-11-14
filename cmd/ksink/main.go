@@ -45,6 +45,9 @@ func main() {
 		sepHex        string
 		noSeparator   bool
 		transactional bool
+		stateDir      string
+		rotateSizeText string
+		rotateInterval time.Duration
 		tOpts         output.TLSOpts
 		httpOpts      output.HTTPOpts
 	)
@@ -89,25 +92,44 @@ kcat format specifiers (--output-format-string):
   %K  key length  %S  value length
   %%  literal %%   \n  newline     \t  tab     \\  backslash`,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			// Ordered output defaults to structured, self-describing JSONL.
+			// The existing nontransactional default remains raw binary.
+			if transactional && !cmd.Flags().Changed("output-format") {
+				fmtName = "jsonl"
+			}
 			if fmtName != "binary" {
 				if cmd.Flags().Changed("output-separator") || cmd.Flags().Changed("output-separator-hex") || cmd.Flags().Changed("no-separator") {
 					return fmt.Errorf("--output-separator, --output-separator-hex, and --no-separator are only supported with --output-format=binary")
 				}
 			}
-			return run(addr, dst, fmtName, fmtStr, jsonB64Key, jsonB64Val, separator, sepHex, noSeparator, transactional, tOpts, httpOpts)
+			if !transactional && (cmd.Flags().Changed("rotate-size") || cmd.Flags().Changed("rotate-interval")) {
+				return fmt.Errorf("--rotate-size and --rotate-interval require --transactional")
+			}
+			size,err:=parseRotationSize(rotateSizeText)
+			if err!=nil{return err}
+			return runWithRotation(addr, dst, fmtName, fmtStr, jsonB64Key, jsonB64Val, separator, sepHex, noSeparator, transactional, stateDir, tOpts, httpOpts, size, rotateInterval)
 		},
 	}
 
 	rootCmd.Flags().StringVar(&addr, "addr", ":9092", "Address to listen on")
 	rootCmd.Flags().BoolVar(&transactional, "transactional", false,
-		"Enable transactional produce support (per-transaction files with rename-as-commit/delete-as-abort). Requires {txnID} in --output.")
+		"Durable Kafka transactions with per-topic ordered committed-only files. Requires {topic} and {seq:08} in --output.")
+	rootCmd.Flags().StringVar(&stateDir, "transaction-state-dir", "",
+		"Shared durable Kafka transaction WAL directory (default: .ksink-kafka-state under the ordered output root)")
+	rootCmd.Flags().StringVar(&rotateSizeText, "rotate-size", "128MiB",
+		"Committed file rotation size target (e.g. 128MiB, 1GiB; 0 disables)")
+	rootCmd.Flags().DurationVar(&rotateInterval, "rotate-interval", time.Minute,
+		"Maximum nonempty committed-file age before rotation (e.g. 1m, 10s; 0 disables)")
 	rootCmd.Flags().StringVar(&dst, "output", "-",
 		`Output destination: "-" for stdout (default), file path, or http(s):// URL.
-The path may contain {topic} and/or {partition} to route messages to per-topic and/or per-partition files
+The path may contain {topic} to route messages to per-topic files
 (e.g. "{topic}.jsonl" produces "orders.jsonl", "events.jsonl", etc.).
-With --transactional, must also contain {txnID}
-(e.g. "{topic}-{txnID}.jsonl" produces "orders-my-txn.jsonl").
-Topic names are sanitised to prevent path traversal.`)
+Only partition 0 exists for each topic; {partition} is not supported.
+With --transactional, use ROOT/{topic}/messages-{seq:08}.jsonl.
+Each topic has an independent monotonically numbered committed-only file
+sequence, rotated by --rotate-size or --rotate-interval. There are no
+transaction directories and {txnID} is not supported in ordered output.
+Topic names are encoded to prevent collisions and path traversal.`)
 	rootCmd.Flags().StringVar(&fmtName, "output-format", "binary",
 		"Message format: binary, jsonl, kcat")
 	rootCmd.Flags().StringVar(&fmtStr, "output-format-string", "",
@@ -153,7 +175,7 @@ Topic names are sanitised to prevent path traversal.`)
 	}
 }
 
-func run(addr, dst, fmtName, fmtStr string, jsonB64Key, jsonB64Val bool, separator, sepHex string, noSeparator, transactional bool, tOpts output.TLSOpts, httpOpts output.HTTPOpts) error {
+func runWithRotation(addr, dst, fmtName, fmtStr string, jsonB64Key, jsonB64Val bool, separator, sepHex string, noSeparator, transactional bool, stateDir string, tOpts output.TLSOpts, httpOpts output.HTTPOpts, rotateSize int64, rotateInterval time.Duration) error {
 	var sep []byte
 	if fmtName == "binary" {
 		var err error
@@ -163,6 +185,9 @@ func run(addr, dst, fmtName, fmtStr string, jsonB64Key, jsonB64Val bool, separat
 		}
 	}
 
+	if !transactional && stateDir != "" {
+		return fmt.Errorf("--transaction-state-dir requires --transactional")
+	}
 	// Validate format-specific flag combinations before constructing anything.
 	if fmtStr != "" && fmtName != "kcat" {
 		return fmt.Errorf("--output-format-string is only supported with --output-format=kcat")
@@ -185,6 +210,9 @@ func run(addr, dst, fmtName, fmtStr string, jsonB64Key, jsonB64Val bool, separat
 	if err != nil {
 		return err
 	}
+	if transactional {
+		return runOrdered(addr,dst,stateDir,fmtr,rotateSize,rotateInterval)
+	}
 
 	tlsCfg, err := tOpts.BuildTLSConfig()
 	if err != nil {
@@ -192,31 +220,21 @@ func run(addr, dst, fmtName, fmtStr string, jsonB64Key, jsonB64Val bool, separat
 	}
 
 	var w output.Writer
-	isHTTP := strings.HasPrefix(dst, "http://") || strings.HasPrefix(dst, "https://")
+	isHTTP := strings.HasPrefix(dst,"http://") || strings.HasPrefix(dst,"https://")
 	if isHTTP {
-		if transactional {
-			return fmt.Errorf("--transactional is not supported with HTTP output")
-		}
-		w, err = output.NewHTTPWriter(dst, httpOpts, tlsCfg)
-	} else if transactional && dst != "-" {
-		w, err = output.NewTxnFileWriter(dst)
+		w,err=output.NewHTTPWriter(dst,httpOpts,tlsCfg)
 	} else {
-		if transactional && dst == "-" {
-			return fmt.Errorf("--transactional is not supported with stdout output")
-		}
-		w, err = output.Open(dst, tlsCfg)
+		w,err=output.Open(dst,tlsCfg)
 	}
 	if err != nil {
 		return err
 	}
 	defer w.Close() //nolint:errcheck
 
-	serverOpts := []ksink.Option{ksink.WithLogger(stdLogger{})}
-
 	srv, err := ksink.New(ksink.Config{
-		Address:            addr,
-		TransactionalWrite: transactional,
-	}, serverOpts...)
+		Address:addr,
+		TransactionalWrite:false,
+	}, ksink.WithLogger(stdLogger{}))
 	if err != nil {
 		return fmt.Errorf("failed to create server: %w", err)
 	}
@@ -235,7 +253,6 @@ func run(addr, dst, fmtName, fmtStr string, jsonB64Key, jsonB64Val bool, separat
 	log.Printf("Kafka server listening on %s, output=%s", srv.Addr(), outputLabel)
 
 	// Start read loop
-	txnWriter, _ := w.(output.TransactionalWriter)
 	go func() {
 		for {
 			event, ack, readErr := srv.Read(ctx)
@@ -246,28 +263,28 @@ func run(addr, dst, fmtName, fmtStr string, jsonB64Key, jsonB64Val bool, separat
 			var writeErr error
 			switch e := event.(type) {
 			case *ksink.MessagesEvent:
+				formatted := make([][]byte, 0, len(e.Messages))
 				for _, msg := range e.Messages {
 					data, err := fmtr.Format(msg)
 					if err != nil {
 						writeErr = fmt.Errorf("failed to format message: %w", err)
 						break
 					}
-
-					if err := w.Write(data, msg); err != nil {
-						writeErr = fmt.Errorf("failed to write message: %w", err)
-						break
-					}
+					formatted = append(formatted, data)
 				}
-			case *ksink.TxnCommitEvent:
-				if txnWriter != nil {
-					if err := txnWriter.CommitTxn(e.TransactionalID); err != nil {
-						writeErr = fmt.Errorf("failed to commit txn %s: %w", e.TransactionalID, err)
-					}
-				}
-			case *ksink.TxnAbortEvent:
-				if txnWriter != nil {
-					if err := txnWriter.AbortTxn(e.TransactionalID); err != nil {
-						writeErr = fmt.Errorf("failed to abort txn %s: %w", e.TransactionalID, err)
+				if writeErr == nil {
+					if batchWriter, ok := w.(interface {
+						WriteBatch([][]byte, []*ksink.Message) error
+					}); ok {
+						// One WAL fsync for all records in this Produce event.
+						writeErr = batchWriter.WriteBatch(formatted, e.Messages)
+					} else {
+						for i, msg := range e.Messages {
+							if err := w.Write(formatted[i], msg); err != nil {
+								writeErr = fmt.Errorf("failed to write message: %w", err)
+								break
+							}
+						}
 					}
 				}
 			}

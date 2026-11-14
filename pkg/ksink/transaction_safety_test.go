@@ -43,7 +43,7 @@ func sendEndTxnForSafetyTest(t *testing.T, conn net.Conn, requestID int32, txnID
 }
 
 func TestFailedEndTxnRetainsActiveStateUntilRetry(t *testing.T) {
-	srv, err := New(Config{Address: "127.0.0.1:0", TransactionalWrite: true})
+	srv, err := New(Config{Address: "127.0.0.1:0", TransactionalWrite: true, TransactionStateDir: t.TempDir()})
 	require.NoError(t, err)
 	require.NoError(t, srv.Start(context.Background()))
 	t.Cleanup(func() { _ = srv.Close(context.Background()) })
@@ -100,7 +100,7 @@ func TestFailedEndTxnRetainsActiveStateUntilRetry(t *testing.T) {
 }
 
 func TestFailedZombieAbortDoesNotFenceOrForgetTransaction(t *testing.T) {
-	srv, err := New(Config{Address: "127.0.0.1:0", TransactionalWrite: true})
+	srv, err := New(Config{Address: "127.0.0.1:0", TransactionalWrite: true, TransactionStateDir: t.TempDir()})
 	require.NoError(t, err)
 	require.NoError(t, srv.Start(context.Background()))
 	t.Cleanup(func() { _ = srv.Close(context.Background()) })
