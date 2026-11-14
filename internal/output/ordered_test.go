@@ -229,3 +229,73 @@ func TestOrderedMaterializerFailedTopicDoesNotSkipHealthyTopic(t *testing.T) {
 	require.Equal(t,int64(0),wal.TopicProgress("a-failed").Cursor)
 	require.Equal(t,int64(1),wal.TopicProgress("z-healthy").Cursor)
 }
+
+func TestOrderedMaterializerRunRetriesFailedTopicWithoutLosingHealthyTopic(t *testing.T) {
+	root:=t.TempDir()
+	wal:=orderedTestLog(t)
+	w,err:=NewOrderedTopicMaterializer(wal,
+		filepath.Join(root,"{topic}","messages-{seq:08}.jsonl"),1,time.Minute)
+	require.NoError(t,err)
+	_,err=wal.AppendTopicBatch([]ksink.WALTopicRecord{
+		{Topic:"a-blocked",Data:[]byte("recover\n")},
+		{Topic:"z-healthy",Data:[]byte("healthy\n")},
+	})
+	require.NoError(t,err)
+	blocked:=filepath.Join(root,"a-blocked","messages-00000001.jsonl")
+	require.NoError(t,os.MkdirAll(filepath.Dir(blocked),0700))
+	require.NoError(t,os.WriteFile(blocked,[]byte("conflict\n"),0600))
+	ctx,cancel:=context.WithCancel(context.Background())
+	done:=make(chan error,1)
+	go func(){done<-w.Run(ctx)}()
+	t.Cleanup(func(){cancel();require.NoError(t,<-done)})
+	require.Eventually(t,func()bool{
+		return wal.TopicProgress("z-healthy").Cursor==1 &&
+			w.TopicFailures()["a-blocked"]!=nil
+	},3*time.Second,20*time.Millisecond)
+	select {
+	case runErr:=<-done:
+		t.Fatalf("worker exited on a single topic failure: %v",runErr)
+	default:
+	}
+	require.Equal(t,int64(0),wal.TopicProgress("a-blocked").Cursor)
+	require.NoError(t,os.Remove(blocked))
+	require.Eventually(t,func()bool{
+		return wal.TopicProgress("a-blocked").Cursor==1 &&
+			len(w.TopicFailures())==0
+	},5*time.Second,20*time.Millisecond)
+	raw,err:=os.ReadFile(blocked)
+	require.NoError(t,err)
+	require.Equal(t,"recover\n",string(raw))
+}
+
+func TestOrderedMaterializerOversizedRecordAndRestartSequence(t *testing.T) {
+	root:=t.TempDir()
+	path:=filepath.Join(root,"wal")
+	wal,err:=ksink.OpenTransactionLog(path)
+	require.NoError(t,err)
+	pattern:=filepath.Join(root,"{topic}","part-{seq:08}.jsonl")
+	w,err:=NewOrderedTopicMaterializer(wal,pattern,3,time.Minute)
+	require.NoError(t,err)
+	_,err=wal.AppendTopicBatch([]ksink.WALTopicRecord{
+		{Topic:"orders",Data:[]byte("oversized\n")},
+		{Topic:"orders",Data:[]byte("ok\n")},
+	})
+	require.NoError(t,err)
+	n,err:=w.Publish(context.Background(),false)
+	require.NoError(t,err)
+	require.Equal(t,1,n)
+	first,err:=os.ReadFile(filepath.Join(root,"orders","part-00000001.jsonl"))
+	require.NoError(t,err)
+	require.Equal(t,"oversized\n",string(first))
+	require.NoError(t,wal.Close())
+	wal,err=ksink.OpenTransactionLog(path)
+	require.NoError(t,err)
+	defer func(){_ = wal.Close()}()
+	w,err=NewOrderedTopicMaterializer(wal,pattern,3,time.Minute)
+	require.NoError(t,err)
+	require.NoError(t,w.Flush(context.Background()))
+	second,err:=os.ReadFile(filepath.Join(root,"orders","part-00000002.jsonl"))
+	require.NoError(t,err)
+	require.Equal(t,"ok\n",string(second))
+	require.Equal(t,uint64(3),wal.TopicProgress("orders").NextFile)
+}
