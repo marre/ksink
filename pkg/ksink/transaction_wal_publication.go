@@ -205,29 +205,33 @@ func (l *TransactionLog) prunePublishedTopicLocked(topic string,cursor int64) {
 		for _,marker:=range markers[:j] {candidates[marker.Instance]=struct{}{}}
 		l.topicMarkers[topic]=append([]walTopicMarker(nil),markers[j:]...)
 	}
-	// A decision is needed only while some unpublished record/control
-	// marker or current coordinator generation can still refer to it.
-	// Reclaim it once every participating topic has advanced past it.
-	for instance:=range candidates {
-		retained:=false
-		for _,state:=range l.state.States {
-			if state.Instance==instance {retained=true;break}
+	// Publication can remove the last topic reference to an old decision.
+	// Also run this after coordinator generation rollover: the last receipt
+	// may have happened while the old generation was still current.
+	if len(candidates)>0 {l.reclaimUnreferencedTopicDecisionsLocked()}
+}
+
+// reclaimUnreferencedTopicDecisionsLocked builds the live set once rather
+// than rescanning all retained topic records for each published transaction.
+// This keeps publication GC linear in retained indexes, not quadratic.
+func (l *TransactionLog) reclaimUnreferencedTopicDecisionsLocked() {
+	if len(l.topicDecisions)==0 {return}
+	live:=make(map[string]struct{})
+	for _,state:=range l.state.States {
+		if state.Instance!="" {live[state.Instance]=struct{}{}}
+	}
+	for _,records:=range l.topicRecords {
+		for _,record:=range records {
+			if record.meta.Instance!="" {live[record.meta.Instance]=struct{}{}}
 		}
-		if retained {continue}
-		for _,refs:=range l.topicRecords {
-			for _,ref:=range refs {
-				if ref.meta.Instance==instance {retained=true;break}
-			}
-			if retained {break}
+	}
+	for _,markers:=range l.topicMarkers {
+		for _,marker:=range markers {
+			if marker.Instance!="" {live[marker.Instance]=struct{}{}}
 		}
-		if retained {continue}
-		for _,marks:=range l.topicMarkers {
-			for _,mark:=range marks {
-				if mark.Instance==instance {retained=true;break}
-			}
-			if retained {break}
-		}
-		if retained {continue}
+	}
+	for instance:=range l.topicDecisions {
+		if _,ok:=live[instance];ok {continue}
 		l.markFrameDead(l.topicDecisionRefs[instance])
 		delete(l.topicDecisionRefs,instance)
 		delete(l.topicDecisions,instance)
