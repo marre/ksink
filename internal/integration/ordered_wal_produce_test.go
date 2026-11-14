@@ -3,10 +3,12 @@ package ksink_test
 import (
 	"context"
 	"fmt"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
+	"github.com/marre/ksink/internal/output"
 	"github.com/marre/ksink/pkg/ksink"
 	"github.com/stretchr/testify/require"
 	"github.com/twmb/franz-go/pkg/kgo"
@@ -89,5 +91,27 @@ func TestOrderedWALKafkaProducerWritesTopicOffsetsAndCommitsWithoutFileOutput(t 
 		require.NoError(t, readErr)
 		require.True(t, exists)
 		require.Equal(t, "commit", reopened.TopicTransactionDecision(record.Instance))
+	}
+	// End-to-end: after replay, asynchronously publish the independently
+	// ordered files. Control markers must not appear as payloads.
+	writer, err := output.NewOrderedTopicMaterializer(reopened, pattern, 128<<20, time.Minute)
+	require.NoError(t, err)
+	require.NoError(t, writer.Flush(ctx))
+	for topic, want := range map[string]string{
+		"orders": "orders/0: order-1\n",
+		"payments": "payments/0: payment-1\n",
+	} {
+		path := filepath.Join(root, topic, "messages-00000001.jsonl")
+		data, readErr := os.ReadFile(path)
+		require.NoError(t, readErr)
+		require.Equal(t, want, string(data))
+		require.Equal(t, int64(2), reopened.TopicProgress(topic).Cursor,
+			"file receipt includes transaction control marker offset")
+		require.Equal(t, uint64(2), reopened.TopicProgress(topic).NextFile)
+	}
+	require.NoError(t, writer.Flush(ctx))
+	for _, topic := range []string{"orders", "payments"} {
+		require.Equal(t, uint64(2), reopened.TopicProgress(topic).NextFile,
+			"a second publish cannot duplicate an immutable output file")
 	}
 }
