@@ -40,7 +40,7 @@ func (w *txnFileWriter) WriteBatch(data [][]byte, messages []*ksink.Message) err
 		if txn!=nil && (txn.committing || txn.poisoned || filepath.Base(txn.stagingDir)!=msg.TransactionInstance){
 			return fmt.Errorf("transaction %q cannot accept more output",msg.TransactionalID)
 		}
-		resolved:=w.resolvePath(msg.TransactionalID,msg.Topic,msg.Partition)
+		resolved:=w.resolvePath(msg.TransactionalID,msg.Topic)
 		relative,err:=filepath.Rel(w.root,resolved)
 		if err!=nil || relative==".." || filepath.IsAbs(relative) ||
 			strings.HasPrefix(relative,".."+string(filepath.Separator)){
