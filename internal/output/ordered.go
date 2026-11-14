@@ -120,7 +120,12 @@ func orderedTopicName(topic string) string {
 			b.WriteByte('%');b.WriteByte(digits[c>>4]);b.WriteByte(digits[c&15])
 		}
 	}
-	return b.String()
+	encoded:=b.String()
+	if len(encoded)<=240 {return encoded}
+	// Keep the component below common 255-byte filesystem limits while
+	// retaining a collision-resistant identity for long Kafka topic names.
+	sum:=sha256.Sum256([]byte(topic))
+	return encoded[:175]+"-"+hex.EncodeToString(sum[:])
 }
 
 func (w *OrderedTopicMaterializer) filename(topic string, seq uint64) (string,string,error) {
@@ -256,7 +261,7 @@ func (w *OrderedTopicMaterializer) publishTopic(ctx context.Context,topic string
 	if !recoverExisting && !force && (w.size==0 || total<w.size) {
 		since,ok:=w.since[topic]
 		if !ok {w.since[topic]=w.now();return 0,nil}
-		if w.interval>0 && w.now().Sub(since)<w.interval {return 0,nil}
+		if w.interval==0 || w.now().Sub(since)<w.interval {return 0,nil}
 	}
 
 	// A file observed after a crash but before WAL receipt can be reconciled:
