@@ -1,6 +1,6 @@
 # Phase 5: filename controls and ordered output-file rotation
 
-Status: **proposal**. Only start after [transaction/materializer correctness](02-transactions-and-materializer.md) is green.
+Status: **implemented in PR #52; rotation and crash recovery tests are ongoing**.
 
 ## Target user experience
 
