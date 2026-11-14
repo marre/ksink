@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"log"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -32,6 +33,7 @@ type OrderedTopicMaterializer struct {
 	now func() time.Time
 	mu sync.Mutex // only one poll/flush may publish at once
 	since map[string]time.Time
+	failures map[string]error // guarded by mu; last failure per topic
 }
 
 // KafkaTransactionStateDir is the default shared WAL root for ordered
@@ -100,7 +102,7 @@ func NewOrderedTopicMaterializer(wal *ksink.TransactionLog, pattern string,
 	if err:=wal.BindOutput(abs);err!=nil{return nil,err}
 	return &OrderedTopicMaterializer{
 		wal:wal,pattern:abs,root:root,width:width,size:maxBytes,interval:maxAge,
-		now:time.Now,since:make(map[string]time.Time),
+		now:time.Now,since:make(map[string]time.Time),failures:make(map[string]error),
 	},nil
 }
 
@@ -219,9 +221,11 @@ func (w *OrderedTopicMaterializer) Publish(ctx context.Context, force bool) (int
 			// A failed topic must not prevent other committed topic streams
 			// from publishing during this pass. Preserve every failure for
 			// the caller instead of silently reporting a partial success.
+			w.failures[topic]=err
 			topicErrors=append(topicErrors,fmt.Errorf("publish topic %q: %w",topic,err))
 			continue
 		}
+		delete(w.failures,topic)
 		published+=count
 	}
 	return published,errors.Join(topicErrors...)
@@ -351,14 +355,39 @@ func syncOrderedDir(dir string) error {
 	return f.Sync()
 }
 
-// Run polls independent topic streams, including low-volume timeout
-// rotation. Any error stops the worker and is returned to its caller.
+// TopicFailures returns a snapshot of currently failing topics. Errors are
+// retained until that topic successfully publishes or is found up to date.
+func (w *OrderedTopicMaterializer) TopicFailures() map[string]error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	out:=make(map[string]error,len(w.failures))
+	for topic,err:=range w.failures {out[topic]=err}
+	return out
+}
+
+// Run supervises all topics independently. A filesystem error for one topic
+// must not stop unrelated topics. Failures are logged on transition and then
+// retried with bounded backoff; no WAL cursor advances on failed publication.
+// The caller can also inspect TopicFailures for health reporting.
 func (w *OrderedTopicMaterializer) Run(ctx context.Context) error {
-	tick:=200*time.Millisecond
-	ticker:=time.NewTicker(tick)
+	ticker:=time.NewTicker(200*time.Millisecond)
 	defer ticker.Stop()
+	var retryAt time.Time
+	backoff:=time.Second
 	for {
-		if _,err:=w.Publish(ctx,false);err!=nil{return err}
+		if err:=ctx.Err();err!=nil{return nil}
+		if retryAt.IsZero() || !time.Now().Before(retryAt) {
+			_,err:=w.Publish(ctx,false)
+			if err!=nil {
+				if ctx.Err()!=nil{return nil}
+				log.Printf("ordered output publication error (will retry): %v",err)
+				retryAt=time.Now().Add(backoff)
+				if backoff<30*time.Second {backoff*=2;if backoff>30*time.Second {backoff=30*time.Second}}
+			} else {
+				retryAt=time.Time{}
+				backoff=time.Second
+			}
+		}
 		select {
 		case <-ctx.Done():return nil
 		case <-ticker.C:
