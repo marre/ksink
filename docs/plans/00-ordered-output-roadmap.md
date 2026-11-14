@@ -4,13 +4,13 @@ Status: **proposal / implementation planning** for `marre/ksink` PR #52. No impl
 
 ## Architecture chosen for planning
 
-Use **one physical data WAL per topic** (with exactly **partition 0**), a **small shared transaction-coordinator WAL** for producer identity/epochs and cross-topic COMMIT/ABORT decisions, and **one ordered immutable output-file sequence per topic**. There is **one materializer service**, which tracks independent stable positions for each topic. This models a single Kafka read-committed consumer subscribed to topics, but **does not** implement Kafka Fetch/consumer-group protocols.
+Use **one shared physical segmented WAL** as the sole durable authority for producer identity/epochs, accepted payloads, topic offsets, transaction participants/decisions and publication receipts. Within it, maintain **independent logical topic streams**, one **partition 0** per topic, with **one ordered immutable output-file sequence per topic**. There is **one materializer service**, which tracks independent stable positions and rotation state for each topic. This models a single Kafka read-committed consumer subscribed to topics, but **does not** implement Kafka Fetch/consumer-group protocols.
 
 ```text
 state/
-  coordinator/manifest.json, segments/*.wal, snapshots/*.wal
-  topics/orders/manifest.json, segments/*.wal, snapshots/*.wal
-  topics/payments/manifest.json, segments/*.wal, snapshots/*.wal
+  manifest.json
+  segments/*.wal
+  snapshots/*.wal
 
 output/
   orders/messages-00000001.jsonl
@@ -20,7 +20,7 @@ output/
 
 **Reasoning:** Kafka record ordering is per topic-partition; no global cross-topic ordering is promised. A blocked transaction in `orders` should not delay `payments` unless the **same multi-topic transaction** is unresolved for both. File sequences, publication cursors, rotation and data retention are independent per topic.
 
-**Complexity warning:** One WAL per topic **alone** cannot guarantee atomic multi-topic transaction decisions across crashes. The shared coordinator is required unless we intentionally ban multi-topic transactions. The current PR #52 already has one combined coordinator/data WAL; physically splitting it is more complex, not an automatic simplification. The benefit is independent topic state and publication. An alternative would keep **one physical WAL with per-topic logical streams**, providing simpler write/commit durability but less physical isolation. Decide this trade-off before Phase 1 implementation.
+**Chosen trade-off:** One physical WAL avoids atomic cross-log coordination and permits a single crash-replay order for transaction decisions and payloads. Offsets, read-committed stable boundaries, file sequences and rotation are **logical per-topic state**; WAL disk retention/compaction are shared. A stuck topic may retain physical WAL segments that also contain other topics' data, but must not block their output publication.
 
 ## Behavior and limitations
 
@@ -36,10 +36,10 @@ output/
 
 | Order | Plan | Why first / exit criterion |
 |---|---|---|
-| **0. Architecture and contracts** | This roadmap | Decide physical per-topic WAL vs logical streams in one WAL, preserve cross-topic transactions, agree EndTxn and output visibility semantics |
-| **1. Coordinator correctness / WAL lifecycle** | [01-wal-and-offsets.md](01-wal-and-offsets.md) | Durability contract, transaction generations retained through delayed publication, producer fencing and checksum/fail-closed tests |
-| **2. Per-topic WAL and append offsets** | [01-wal-and-offsets.md](01-wal-and-offsets.md) | Exactly one authoritative data log per topic, durable base offsets and idempotent accepted batches, atomic cross-log barriers |
-| **3. Transaction resolution and stable-prefix reader** | [02-transactions-and-materializer.md](02-transactions-and-materializer.md) | Commit independent of file materialization, multi-topic decision replay and per-topic read-committed gating |
+| **0. Architecture and contracts** | This roadmap | **Chosen:** one shared physical WAL with independent logical topic streams; multi-topic transactions, durable EndTxn acknowledgements and per-topic output visibility |
+| **1. WAL correctness / lifecycle** | [01-wal-and-offsets.md](01-wal-and-offsets.md) | Durable record positions and outcomes in the shared WAL, generation retention through delayed publication, producer fencing and fail-closed tests |
+| **2. Logical topic streams and append offsets** | [01-wal-and-offsets.md](01-wal-and-offsets.md) | Independent topic offsets and producer dedup state indexed in one WAL; atomic WAL fsync barrier for multi-topic batches |
+| **3. Transaction resolution and stable-prefix reader** | [02-transactions-and-materializer.md](02-transactions-and-materializer.md) | One durable transaction decision, no cross-log protocol, per-topic read-committed gating |
 | **4. Ordered file materializer, remove transaction directories** | [02-transactions-and-materializer.md](02-transactions-and-materializer.md) | Per-topic publication cursor, immutable files and replay without duplication; old staging/commit directory code removed |
 | **5. Filename parameters and file rotation** | [03-filenames-and-rotation.md](03-filenames-and-rotation.md) | User-controlled per-topic file patterns, size/time rotation, finalized-file reader contract |
 | **6. Verification and merge gate** | [04-testing-rollout.md](04-testing-rollout.md) | Real clients, crash injection, race/load/retention tests, docs and rollout contract verified |
@@ -68,12 +68,10 @@ The output filenames are sorted **within one topic**, not across topics. `{seq}`
 6. Slow materialization and unresolved transactions have bounded, observable backlog and an explicit backpressure/fail-closed policy.
 7. Existing acknowledged state is never silently reset. Changes in output pattern, codec version or directory layout cannot change replay interpretation.
 
-## Open design decision requiring explicit review
+## Resolved architecture decision
 
-**A. Physical WAL-per-topic + coordinator (this plan's working design):** matches independent per-topic progress but adds cross-log sync/recovery complexity.
+**Chosen: one shared segmented WAL with per-topic logical streams.** A transaction involving many topics has one durable decision; each topic's records have their own logical offset and output cursor. Physical segment cleanup must respect the oldest unpublished data from **all** topics; this is an accepted storage-efficiency trade-off for simpler crash consistency.
 
-**B. One physical segmented WAL with logical per-topic append streams:** simpler durability boundary; still supports per-topic offsets, separate output files and independent stable-prefix cursors, even if log compaction is shared.
-
-The downstream filesystem contract is the same under both. If simplicity dominates, option **B may be preferable**; do not split durable files purely for organizational aesthetics.
+**Defaults chosen:** committed-only output, size rotation target 128 MiB, time rotation 1 minute, output pattern `data/{topic}/messages-{seq:08}.jsonl`, no rotation at transaction boundaries, independent per-topic file counters. Existing nontransactional backends remain supported.
 
 See [01](01-wal-and-offsets.md) through [04](04-testing-rollout.md) for detailed acceptance criteria.
