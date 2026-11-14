@@ -6,9 +6,15 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"time"
 )
 
 const durableTxnStateVersion = 1
+
+// Retain inactive idempotent producer epochs for at least seven days.
+// Older WAL checkpoints without activity timestamps are retained until the
+// producer next writes; they cannot be safely expired by inference.
+const idempotentProducerRetention = 7 * 24 * time.Hour
 
 // The coordinator snapshots are logical records INSIDE the shared WAL. There
 // is no independent state.json or second durable transaction authority.
@@ -44,6 +50,7 @@ type storedTxnState struct {
 // needs durable batch-sequence history to deduplicate retries and preserve the
 // originally acknowledged Kafka base offsets.
 type storedIdempotentProducer struct {
+	LastActivityUnixNano int64
 	Epoch int16
 	Sequences map[string]txnPartitionSequence
 }
@@ -137,7 +144,7 @@ func (s *Server) txnSnapshotLocked() txnStateSnapshot {
 	}
 	for id,st:=range s.idempotentStates {
 		snapshot.Idempotent[id]=storedIdempotentProducer{
-			Epoch:st.Epoch,Sequences:copyTxnSequences(st.Sequences),
+			Epoch:st.Epoch,LastActivityUnixNano:st.LastActivityUnixNano,Sequences:copyTxnSequences(st.Sequences),
 		}
 	}
 	return snapshot
