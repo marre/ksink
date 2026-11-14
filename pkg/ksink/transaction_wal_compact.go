@@ -82,6 +82,15 @@ func (l *TransactionLog) compactLocked() error {
 			if err := write(record); err != nil { return failed(err) }
 		}
 	}
+	// Emit one acceptance delimiter after the replayed topic records. Replay
+	// cannot treat an interrupted checkpoint as a completed logical batch.
+	topicCount := 0
+	for _, refs := range l.topicRecords { topicCount += len(refs) }
+	if topicCount > 0 {
+		if err := write(transactionWALRecord{
+			Type: "topic-accept", BatchCount: topicCount,
+		}); err != nil { return failed(err) }
+	}
 	if err=f.Sync();err!=nil{return failed(fmt.Errorf("sync WAL checkpoint: %w",err))}
 	if err=f.Close();err!=nil{return err}
 	if err=txnSyncDirectory(filepath.Dir(snapshotPath));err!=nil{return err}
