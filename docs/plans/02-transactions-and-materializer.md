@@ -1,6 +1,6 @@
 # Phases 3–4: transaction decisions, read-committed visibility, ordered files
 
-Status: **partially implemented** (WAL participant, marker and publication primitives); actual ordered writer and cutover are not implemented. Depends on [WAL/offsets](01-wal-and-offsets.md).
+Status: **implemented in PR #52; operational verification remains ongoing**. Ordered materialization and CLI cutover are implemented. Depends on [WAL/offsets](01-wal-and-offsets.md).
 
 ## Goal and explicit scope
 
