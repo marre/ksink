@@ -219,7 +219,7 @@ func (s *Server) initializeTxnState() error {
 	s.idempotentStates=make(map[int64]storedIdempotentProducer,len(snapshot.Idempotent))
 	for id,st:=range snapshot.Idempotent {
 		s.idempotentStates[id]=storedIdempotentProducer{
-			Epoch:st.Epoch,Sequences:copyTxnSequences(st.Sequences),
+			Epoch:st.Epoch,LastActivityUnixNano:st.LastActivityUnixNano,Sequences:copyTxnSequences(st.Sequences),
 		}
 	}
 	dirty := false
