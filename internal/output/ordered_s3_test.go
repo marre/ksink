@@ -9,6 +9,7 @@ import (
     "fmt"
     "io"
     "path/filepath"
+    "os"
     "strings"
     "testing"
     "time"
@@ -276,4 +277,68 @@ func TestS3OrderedOutputBindingAndHeadFailure(t *testing.T) {
     require.ErrorContains(t,err,"remote S3 unavailable")
     require.Equal(t,int64(0),wal.TopicProgress("orders").Cursor)
     require.Equal(t,0,fake.puts)
+}
+
+func TestS3OrderedWALBindsEffectiveSDKEndpoint(t *testing.T) {
+    // The SDK's endpoint configuration must be reflected in WAL identity,
+    // even when --output-s3-endpoint is not supplied.
+    t.Setenv("AWS_REGION","us-east-1")
+    t.Setenv("AWS_ACCESS_KEY_ID","test")
+    t.Setenv("AWS_SECRET_ACCESS_KEY","test")
+    t.Setenv("AWS_ENDPOINT_URL","")
+    t.Setenv("AWS_ENDPOINT_URL_S3","http://localhost:9000")
+    wal:=orderedTestLog(t)
+    first,err:=newS3OrderedPublisher(testOrderedS3Pattern,S3OrderedOpts{})
+    require.NoError(t,err)
+    require.Contains(t,first.identity,"http://localhost:9000")
+    require.Contains(t,first.identity,`region="us-east-1"`)
+    _,err=newS3OrderedTopicMaterializerWithPublisher(wal,first,1,time.Minute)
+    require.NoError(t,err)
+    t.Setenv("AWS_ENDPOINT_URL_S3","http://localhost:9001")
+    second,err:=newS3OrderedPublisher(testOrderedS3Pattern,S3OrderedOpts{})
+    require.NoError(t,err)
+    require.Contains(t,second.identity,"http://localhost:9001")
+    _,err=newS3OrderedTopicMaterializerWithPublisher(wal,second,1,time.Minute)
+    require.ErrorContains(t,err,"binding changed")
+    // An explicit endpoint overrides the SDK's environment endpoint.
+    explicit,err:=newS3OrderedPublisher(testOrderedS3Pattern,
+        S3OrderedOpts{Endpoint:"http://localhost:9000"})
+    require.NoError(t,err)
+    require.Equal(t,first.identity,explicit.identity)
+}
+
+func TestS3OrderedWALBindsSharedConfigEndpointAndRegion(t *testing.T) {
+    t.Setenv("AWS_ACCESS_KEY_ID","test")
+    t.Setenv("AWS_SECRET_ACCESS_KEY","test")
+    t.Setenv("AWS_ENDPOINT_URL","")
+    t.Setenv("AWS_ENDPOINT_URL_S3","")
+    t.Setenv("AWS_REGION","")
+    t.Setenv("AWS_PROFILE","default")
+    configFile:=filepath.Join(t.TempDir(),"aws-config")
+    require.NoError(t,os.WriteFile(configFile,[]byte(
+        "[default]\\nregion = eu-north-1\\nendpoint_url = http://localhost:9100\\n"),0600))
+    t.Setenv("AWS_CONFIG_FILE",configFile)
+    first,err:=newS3OrderedPublisher(testOrderedS3Pattern,S3OrderedOpts{})
+    require.NoError(t,err)
+    require.Contains(t,first.identity,"http://localhost:9100")
+    require.Contains(t,first.identity,`region="eu-north-1"`)
+    wal:=orderedTestLog(t)
+    _,err=newS3OrderedTopicMaterializerWithPublisher(wal,first,1,time.Minute)
+    require.NoError(t,err)
+    require.NoError(t,os.WriteFile(configFile,[]byte(
+        "[default]\\nregion = eu-north-1\\nendpoint_url = http://localhost:9101\\n"),0600))
+    changed,err:=newS3OrderedPublisher(testOrderedS3Pattern,S3OrderedOpts{})
+    require.NoError(t,err)
+    require.Contains(t,changed.identity,"http://localhost:9101")
+    _,err=newS3OrderedTopicMaterializerWithPublisher(wal,changed,1,time.Minute)
+    require.ErrorContains(t,err,"binding changed")
+    // The AWS region also influences the default S3 service endpoint.
+    t.Setenv("AWS_ENDPOINT_URL_S3","")
+    require.NoError(t,os.WriteFile(configFile,[]byte(
+        "[default]\\nregion = eu-west-1\\n"),0600))
+    regionChanged,err:=newS3OrderedPublisher(testOrderedS3Pattern,S3OrderedOpts{})
+    require.NoError(t,err)
+    require.Contains(t,regionChanged.identity,`region="eu-west-1"`)
+    _,err=newS3OrderedTopicMaterializerWithPublisher(wal,regionChanged,1,time.Minute)
+    require.ErrorContains(t,err,"binding changed")
 }
