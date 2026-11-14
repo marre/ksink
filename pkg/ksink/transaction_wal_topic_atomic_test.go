@@ -462,3 +462,61 @@ func TestSharedWALConcurrentTopicAppendsAndCheckpointsPreserveOffsets(t *testing
 		}
 	}
 }
+
+func TestSharedWALRepeatedRestartCheckpointAndPublicationMaintainsMonotonicOffsets(t *testing.T) {
+	root:=t.TempDir()
+	path:=filepath.Join(root,"state")
+	const cycles=12
+	for cycle:=0;cycle<cycles;cycle++ {
+		wal,err:=OpenTransactionLog(path)
+		require.NoError(t,err)
+		require.NoError(t,wal.BindOutput(filepath.Join(root,"{topic}","messages-{seq:08}.jsonl")))
+		require.Equal(t,int64(cycle),wal.NextTopicOffset("orders"))
+		require.Equal(t,int64(cycle),wal.TopicProgress("orders").Cursor)
+		require.Equal(t,int64(cycle),wal.NextTopicOffset("payments"))
+		offsets,err:=wal.AppendTopicBatch([]WALTopicRecord{
+			{Topic:"orders",Data:[]byte(fmt.Sprintf("order-%d",cycle))},
+			{Topic:"payments",Data:[]byte(fmt.Sprintf("payment-%d",cycle))},
+		})
+		require.NoError(t,err)
+		require.Equal(t,[]int64{int64(cycle),int64(cycle)},offsets)
+		for _,topic:=range []string{"orders","payments"} {
+			rec,found,readErr:=wal.ReadTopicRecord(topic,int64(cycle))
+			require.NoError(t,readErr)
+			require.True(t,found)
+			require.Equal(t,fmt.Sprintf("%s-%d",map[string]string{"orders":"order","payments":"payment"}[topic],cycle),string(rec.Data))
+		}
+		// Publish only orders; payments remains live across checkpoint.
+		f:=walTestFile(uint64(cycle+1),int64(cycle),int64(cycle+1))
+		f.Path=fmt.Sprintf("orders/messages-%08d.jsonl",cycle+1)
+		require.NoError(t,wal.RecordTopicFile("orders",f))
+		require.NoError(t,wal.Compact())
+		require.NoError(t,wal.Close())
+
+		wal,err=OpenTransactionLog(path)
+		require.NoError(t,err)
+		require.Equal(t,int64(cycle+1),wal.TopicProgress("orders").Cursor)
+		require.Equal(t,int64(cycle),wal.TopicProgress("payments").Cursor)
+		rec,found,err:=wal.ReadTopicRecord("payments",int64(cycle))
+		require.NoError(t,err)
+		require.True(t,found)
+		require.Equal(t,fmt.Sprintf("payment-%d",cycle),string(rec.Data))
+		pf:=walTestFile(uint64(cycle+1),int64(cycle),int64(cycle+1))
+		pf.Path=fmt.Sprintf("payments/messages-%08d.jsonl",cycle+1)
+		require.NoError(t,wal.RecordTopicFile("payments",pf))
+		require.NoError(t,wal.Close())
+	}
+	wal,err:=OpenTransactionLog(path)
+	require.NoError(t,err)
+	defer func(){_ = wal.Close()}()
+	for _,topic:=range []string{"orders","payments"} {
+		require.Equal(t,int64(cycles),wal.NextTopicOffset(topic))
+		require.Equal(t,int64(cycles),wal.TopicProgress(topic).Cursor)
+		require.Equal(t,uint64(cycles+1),wal.TopicProgress(topic).NextFile)
+		for offset:=int64(0);offset<cycles;offset++ {
+			_,found,readErr:=wal.ReadTopicRecord(topic,offset)
+			require.NoError(t,readErr)
+			require.False(t,found)
+		}
+	}
+}
