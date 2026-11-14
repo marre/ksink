@@ -48,7 +48,7 @@ func acceptTxnBatches(data []byte, key string, sequences map[string]txnPartition
 		}
 		sha := sha256.Sum256(batch)
 		signature := txnBatchSignature{
-			Base: seqBase, Count: count, Checksum: hex.EncodeToString(sha[:]),
+			Base: seqBase, Count: count, Checksum: hex.EncodeToString(sha[:]), Offset: -1,
 		}
 		previous, exists := sequences[key]
 		duplicate := false
@@ -80,4 +80,54 @@ func acceptTxnBatches(data []byte, key string, sequences map[string]txnPartition
 
 func txnSequenceKey(topic string, partition int32) string {
 	return fmt.Sprintf("%s\x00%d", topic, partition)
+}
+
+// txnBatchFirstOffset returns the original Kafka base offset when the first
+// serialized v2 batch is an exact retry of a recently acknowledged batch.
+func txnBatchFirstOffset(raw []byte, history txnPartitionSequence) (int64, bool) {
+	if len(raw) < 61 { return 0, false }
+	length := int64(int32(binary.BigEndian.Uint32(raw[8:12])))
+	if length < 49 || length > int64(len(raw)-12) { return 0, false }
+	batch := raw[:12+int(length)]
+	base := int32(binary.BigEndian.Uint32(batch[53:57]))
+	count := int32(binary.BigEndian.Uint32(batch[57:61]))
+	checksum := sha256.Sum256(batch)
+	key := hex.EncodeToString(checksum[:])
+	for _, sig := range history.Recent {
+		if sig.Base == base && sig.Count == count && sig.Checksum == key && sig.Offset >= 0 {
+			return sig.Offset, true
+		}
+	}
+	return 0, false
+}
+
+// assignTxnAcceptedOffsets writes the offset of every newly accepted batch
+// into its retained dedup signature. Older signatures trimmed from the
+// bounded retry window do not need offsets. This runs inside WAL's acceptance
+// lock after it has assigned all record offsets and before it journals state.
+func assignTxnAcceptedOffsets(raw []byte, first int, offsets []int64, seq *txnPartitionSequence) error {
+	position := first
+	for len(raw) != 0 {
+		if len(raw) < 61 { return fmt.Errorf("truncated accepted Kafka record batch") }
+		length := int64(int32(binary.BigEndian.Uint32(raw[8:12])))
+		if length < 49 || length > int64(len(raw)-12) { return fmt.Errorf("invalid accepted Kafka batch length") }
+		batch := raw[:12+int(length)]
+		base := int32(binary.BigEndian.Uint32(batch[53:57]))
+		count := int(int32(binary.BigEndian.Uint32(batch[57:61])))
+		if count <= 0 || position > len(offsets) || count > len(offsets)-position {
+			return fmt.Errorf("accepted Kafka batch count differs from decoded records")
+		}
+		checksum := sha256.Sum256(batch)
+		hash := hex.EncodeToString(checksum[:])
+		for i := range seq.Recent {
+			if seq.Recent[i].Base == base && int(seq.Recent[i].Count) == count &&
+				seq.Recent[i].Checksum == hash {
+				seq.Recent[i].Offset = offsets[position]
+				break
+			}
+		}
+		position += count
+		raw = raw[len(batch):]
+	}
+	return nil
 }

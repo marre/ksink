@@ -16,6 +16,9 @@ type txnBatchSignature struct {
 	Base     int32
 	Count    int32
 	Checksum string
+	// Original Kafka base offset. This survives exact batch retries and is
+	// independent of producer sequence Base.
+	Offset int64
 }
 
 type txnPartitionSequence struct {
