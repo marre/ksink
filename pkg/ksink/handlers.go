@@ -110,12 +110,17 @@ func (s *Server) handleMetadata(conn net.Conn, connID uint64, correlationID int3
 	return s.sendResponse(conn, connID, correlationID, resp)
 }
 
+// ksink intentionally exposes exactly one partition (partition 0) for each
+// topic. Do not accept direct Produce or AddPartitionsToTxn requests for
+// partitions that the metadata endpoint does not advertise.
+const onlyPartition int32 = 0
+
 func (s *Server) buildTopicMetadata(topic string, apiVersion int16) kmsg.MetadataResponseTopic {
 	t := kmsg.MetadataResponseTopic{
 		Topic: new(topic),
 		Partitions: []kmsg.MetadataResponseTopicPartition{
 			{
-				Partition:   0,
+				Partition:   onlyPartition,
 				Leader:      1,
 				LeaderEpoch: 1,
 				Replicas:    []int32{1},
@@ -213,8 +218,8 @@ func (s *Server) handleProduce(ctx context.Context, conn net.Conn, connID uint64
 		for pi, partData := range topicData.Partitions {
 			key := partKey{ti, pi}
 
-			if !s.isTopicAllowed(topicData.Topic) {
-				s.logger.Warnf("[conn:%d] Rejected produce to disallowed topic: %s", connID, topicData.Topic)
+			if !s.isTopicAllowed(topicData.Topic) || partData.Partition != onlyPartition {
+				s.logger.Warnf("[conn:%d] Rejected produce to unsupported topic-partition: %s/%d", connID, topicData.Topic, partData.Partition)
 				results[key] = partResult{errCode: kerr.UnknownTopicOrPartition.Code}
 				continue
 			}
@@ -615,14 +620,21 @@ func (s *Server) handleAddPartitionsToTxn(conn net.Conn, connID uint64, correlat
 		Version: apiVersion,
 	}
 
+	hasSupportedPartition := false
 	for _, topic := range req.Topics {
 		topicResp := kmsg.AddPartitionsToTxnResponseTopic{
 			Topic: topic.Topic,
 		}
 		for _, partition := range topic.Partitions {
+			code := int16(0)
+			if partition != onlyPartition || !s.isTopicAllowed(topic.Topic) {
+				code = kerr.UnknownTopicOrPartition.Code
+			} else {
+				hasSupportedPartition = true
+			}
 			topicResp.Partitions = append(topicResp.Partitions, kmsg.AddPartitionsToTxnResponseTopicPartition{
 				Partition: partition,
-				ErrorCode: 0,
+				ErrorCode: code,
 			})
 		}
 		resp.Topics = append(resp.Topics, topicResp)
@@ -650,6 +662,11 @@ func (s *Server) handleAddPartitionsToTxn(conn net.Conn, connID uint64, correlat
 				resp.Topics[ti].Partitions[pi].ErrorCode = kerr.InvalidTxnState.Code
 			}
 		}
+		return s.sendResponse(conn, connID, correlationID, resp)
+	}
+	// An invalid-only request must not create an active transaction.
+	if !hasSupportedPartition {
+		s.txnMu.Unlock()
 		return s.sendResponse(conn, connID, correlationID, resp)
 	}
 	if !st.active {
