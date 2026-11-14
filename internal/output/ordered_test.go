@@ -290,3 +290,39 @@ func TestOrderedMaterializerOversizedRecordAndRestartSequence(t *testing.T) {
 	require.Equal(t,"ok\n",string(second))
 	require.Equal(t,uint64(3),wal.TopicProgress("orders").NextFile)
 }
+
+func TestOrderedMaterializerCrashAfterFinalizationBeforeReceiptReconcilesOnRestart(t *testing.T) {
+	root:=t.TempDir()
+	walPath:=filepath.Join(root,"wal")
+	pattern:=filepath.Join(root,"{topic}","part-{seq:08}.jsonl")
+	wal,err:=ksink.OpenTransactionLog(walPath)
+	require.NoError(t,err)
+	w,err:=NewOrderedTopicMaterializer(wal,pattern,1,time.Minute)
+	require.NoError(t,err)
+	_,err=wal.AppendTopicBatch([]ksink.WALTopicRecord{
+		{Topic:"orders",Data:[]byte("first\n")},
+		{Topic:"orders",Data:[]byte("second\n")},
+	})
+	require.NoError(t,err)
+	// Crash window: a durable final name exists, but its receipt was
+	// never recorded. The restarted process must not overwrite the name.
+	first:=filepath.Join(root,"orders","part-00000001.jsonl")
+	require.NoError(t,os.MkdirAll(filepath.Dir(first),0700))
+	require.NoError(t,os.WriteFile(first,[]byte("first\n"),0600))
+	require.NoError(t,wal.Close())
+
+	wal,err=ksink.OpenTransactionLog(walPath)
+	require.NoError(t,err)
+	defer func(){_ = wal.Close()}()
+	w,err=NewOrderedTopicMaterializer(wal,pattern,1,time.Minute)
+	require.NoError(t,err)
+	require.NoError(t,w.Flush(context.Background()))
+	raw,err:=os.ReadFile(first)
+	require.NoError(t,err)
+	require.Equal(t,"first\n",string(raw))
+	second,err:=os.ReadFile(filepath.Join(root,"orders","part-00000002.jsonl"))
+	require.NoError(t,err)
+	require.Equal(t,"second\n",string(second))
+	require.Equal(t,int64(2),wal.TopicProgress("orders").Cursor)
+	require.Equal(t,uint64(3),wal.TopicProgress("orders").NextFile)
+}
