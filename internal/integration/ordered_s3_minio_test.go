@@ -153,7 +153,7 @@ func TestOrderedS3MinIOPublicationAndRecovery(t *testing.T) {
         opts,128<<20,time.Minute)
     require.NoError(t,err)
     formatter:=func(msg *ksink.Message)([]byte,error){
-        return []byte(fmt.Sprintf("%s/%d:%s\\n",msg.Topic,msg.Offset,msg.Value)),nil
+        return []byte(fmt.Sprintf("%s/%d:%s\n",msg.Topic,msg.Offset,msg.Value)),nil
     }
     srv,err:=ksink.New(ksink.Config{
         Address:fmt.Sprintf("127.0.0.1:%d",getFreePort(t)),
@@ -192,8 +192,8 @@ func TestOrderedS3MinIOPublicationAndRecovery(t *testing.T) {
     require.NoError(t,srv.Close(ctx))
     require.NoError(t,txWriter.Flush(ctx))
     for topic,want:=range map[string]string{
-        "orders":"orders/0:first\\norders/4:later\\n",
-        "payments":"payments/0:paid\\n",
+        "orders":"orders/0:first\norders/4:later\n",
+        "payments":"payments/0:paid\n",
     } {
         object,readErr:=client.GetObject(ctx,&s3.GetObjectInput{
             Bucket:aws.String(bucket),
