@@ -365,27 +365,40 @@ func (w *OrderedTopicMaterializer) TopicFailures() map[string]error {
 	return out
 }
 
-// Run supervises all topics independently. A filesystem error for one topic
-// must not stop unrelated topics. Failures are logged on transition and then
-// retried with bounded backoff; no WAL cursor advances on failed publication.
-// The caller can also inspect TopicFailures for health reporting.
+// Run supervises each topic independently. A broken destination cannot
+// prevent healthy topics from advancing. Failed topics retry with capped
+// exponential backoff, while healthy topics are polled every 200ms.
 func (w *OrderedTopicMaterializer) Run(ctx context.Context) error {
 	ticker:=time.NewTicker(200*time.Millisecond)
 	defer ticker.Stop()
-	var retryAt time.Time
-	backoff:=time.Second
+	type retryState struct {next time.Time; delay time.Duration}
+	retries:=make(map[string]retryState)
 	for {
-		if err:=ctx.Err();err!=nil{return nil}
-		if retryAt.IsZero() || !time.Now().Before(retryAt) {
-			_,err:=w.Publish(ctx,false)
+		if ctx.Err()!=nil{return nil}
+		for _,topic:=range w.wal.TopicNames() {
+			if ctx.Err()!=nil{return nil}
+			if state,ok:=retries[topic];ok && time.Now().Before(state.next) {continue}
+			w.mu.Lock()
+			_,err:=w.publishTopic(ctx,topic,false)
+			if err!=nil {
+				w.failures[topic]=err
+			} else {
+				delete(w.failures,topic)
+			}
+			w.mu.Unlock()
 			if err!=nil {
 				if ctx.Err()!=nil{return nil}
-				log.Printf("ordered output publication error (will retry): %v",err)
-				retryAt=time.Now().Add(backoff)
-				if backoff<30*time.Second {backoff*=2;if backoff>30*time.Second {backoff=30*time.Second}}
-			} else {
-				retryAt=time.Time{}
-				backoff=time.Second
+				state:=retries[topic]
+				if state.delay==0 {state.delay=time.Second} else if state.delay<30*time.Second {
+					state.delay*=2
+					if state.delay>30*time.Second {state.delay=30*time.Second}
+				}
+				state.next=time.Now().Add(state.delay)
+				retries[topic]=state
+				log.Printf("ordered output topic %q failed (retry in %s): %v",topic,state.delay,err)
+			} else if _,wasFailing:=retries[topic];wasFailing {
+				delete(retries,topic)
+				log.Printf("ordered output topic %q recovered",topic)
 			}
 		}
 		select {
