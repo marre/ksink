@@ -761,11 +761,7 @@ func (s *Server) handleInitProducerId(ctx context.Context, conn net.Conn, connID
 			// capacity; a failure poisons further coordinator mutations.
 			cutoff:=time.Now().Add(-idempotentProducerRetention).UnixNano()
 			snapshot:=s.txnSnapshotLocked()
-			for id,st:=range snapshot.Idempotent {
-				if st.LastActivityUnixNano>0 && st.LastActivityUnixNano<cutoff {
-					delete(snapshot.Idempotent,id)
-				}
-			}
+			reclaimExpiredIdempotent(&snapshot,cutoff)
 			if len(snapshot.Idempotent)<len(s.idempotentStates) {
 				if err:=s.txnLog.AppendState(snapshot);err!=nil {
 					s.txnStoreErr=fmt.Errorf("persist idempotent producer reclamation: %w",err)
