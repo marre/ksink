@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"math"
 	"sync"
 )
 
@@ -65,6 +66,10 @@ type transactionWALRecord struct {
 	State    *txnStateSnapshot
 	Output   *WALOutputRecord
 	TopicOutput *WALTopicRecord
+	// TopicTerminal is ONE durable decision and all of its topic control
+	// marker offsets; no crash may observe only some participants.
+	TopicTerminal *walTopicTerminal
+	TopicMarker *walTopicMarker // checkpoint-only representation
 	Decision string
 	BatchCount int
 	TxnID    string
@@ -90,6 +95,7 @@ type TransactionLog struct {
 	// Logical topic/partition-0 streams share physical WAL segments but have
 	// independent append offsets and indexes.
 	topicRecords map[string][]walTopicLocation
+	topicMarkers map[string][]walTopicMarker
 	topicNext map[string]int64
 	// Immutable decisions are keyed by transaction instance, not mutable
 	// transactional.id. Their history is retained until topic output is safe.
@@ -182,6 +188,7 @@ func OpenTransactionLog(path string) (*TransactionLog, error) {
 		state:txnStateSnapshot{Version:durableTxnStateVersion,States:make(map[string]storedTxnState)},
 		data:make(map[string][]walOutputLocation),
 		topicRecords:make(map[string][]walTopicLocation),
+		topicMarkers:make(map[string][]walTopicMarker),
 		topicNext:make(map[string]int64),
 		topicDecisions:make(map[string]string),
 		topicDecisionOwners:make(map[string]string),
@@ -242,6 +249,7 @@ func (l *TransactionLog) resetReplay() {
 	l.state=txnStateSnapshot{Version:durableTxnStateVersion,States:make(map[string]storedTxnState)}
 	l.data=make(map[string][]walOutputLocation)
 	l.topicRecords=make(map[string][]walTopicLocation)
+	l.topicMarkers=make(map[string][]walTopicMarker)
 	l.topicNext=make(map[string]int64)
 	l.topicDecisions=make(map[string]string)
 	l.topicDecisionOwners=make(map[string]string)
@@ -458,6 +466,56 @@ func (l *TransactionLog) apply(rec transactionWALRecord, frameOffset, frameBytes
 			// Delimiter with no producer state is obsolete after replay.
 			l.markFrameDead(walFrameRef{key:source,size:frameBytes})
 		}
+	case "topic-terminal":
+		terminal := rec.TopicTerminal
+		if terminal == nil || terminal.TransactionID == "" ||
+			!txnWALValidInstance(terminal.Instance) ||
+			(terminal.Decision != "commit" && terminal.Decision != "abort") {
+			return fmt.Errorf("invalid atomic topic terminal decision")
+		}
+		if existing, exists := l.topicDecisions[terminal.Instance]; exists {
+			return fmt.Errorf("duplicate or conflicting terminal decision for %s: %s", terminal.Instance, existing)
+		}
+		current, exists := l.state.States[terminal.TransactionID]
+		if !exists || current.Instance != terminal.Instance ||
+			!current.Active || current.Pending != "" {
+			return fmt.Errorf("terminal decision mismatches coordinator transaction")
+		}
+		if len(terminal.Markers) != len(current.Topics) {
+			return fmt.Errorf("terminal participant count differs from enrolled topic set")
+		}
+		for i, marker := range terminal.Markers {
+			if marker.Topic != current.Topics[i] || marker.Offset != l.topicNext[marker.Topic] ||
+				marker.TransactionID != terminal.TransactionID ||
+				marker.Instance != terminal.Instance || marker.Decision != terminal.Decision {
+				return fmt.Errorf("invalid terminal marker position for %q", marker.Topic)
+			}
+			if marker.Offset == math.MaxInt64 {
+				return fmt.Errorf("topic offset exhausted for %q", marker.Topic)
+			}
+		}
+		l.topicDecisions[terminal.Instance] = terminal.Decision
+		l.topicDecisionOwners[terminal.Instance] = terminal.TransactionID
+		l.topicDecisionRefs[terminal.Instance] = walFrameRef{key:source,size:frameBytes}
+		for _, marker := range terminal.Markers {
+			l.topicMarkers[marker.Topic] = append(l.topicMarkers[marker.Topic], marker)
+			l.topicNext[marker.Topic]++
+		}
+	case "topic-marker":
+		marker := rec.TopicMarker
+		if marker == nil || marker.Topic == "" ||
+			len(marker.Topic) > 249 || marker.Offset != l.topicNext[marker.Topic] ||
+			!txnWALValidInstance(marker.Instance) ||
+			l.topicDecisions[marker.Instance] != marker.Decision ||
+			l.topicDecisionOwners[marker.Instance] != marker.TransactionID {
+			return fmt.Errorf("invalid checkpoint topic control marker")
+		}
+		if marker.Offset == math.MaxInt64 {
+			return fmt.Errorf("topic offset exhausted for %q", marker.Topic)
+		}
+		l.topicMarkers[marker.Topic] = append(l.topicMarkers[marker.Topic], *marker)
+		l.topicNext[marker.Topic]++
+		// Checkpoint marker refs are kept until publication of that topic.
 	case "topic-decision":
 		if rec.TxnID == "" || !txnWALValidInstance(rec.Instance) ||
 			(rec.Decision != "commit" && rec.Decision != "abort") {

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"sort"
 )
 
 // WALTopicRecord is a durable application record in one logical topic stream.
@@ -28,6 +29,58 @@ type walTopicLocation struct {
 	offset int64
 	size   int64
 	meta   WALTopicRecord // Data is always nil.
+}
+
+// A Kafka control marker has a topic offset but is never materialized as an
+// application record. One terminal WAL frame atomically assigns markers to
+// every enrolled topic of a transaction. A checkpoint expands them into
+// per-topic marker frames in offset order.
+type walTopicMarker struct {
+	Topic string
+	Offset int64
+	TransactionID string
+	Instance string
+	Decision string
+}
+
+type walTopicTerminal struct {
+	TransactionID string
+	Instance string
+	Decision string
+	Markers []walTopicMarker
+}
+
+// AppendTopicTerminal durably ends a transaction in ONE checksummed frame.
+// The caller must fence new Produce and drain in-flight requests first.
+// Topic markers are allocated in the same WAL order as new topic records;
+// retries must use the existing transaction decision without appending again.
+func (l *TransactionLog) AppendTopicTerminal(txnID, instance, decision string) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.broken != nil { return l.broken }
+	if decision != "commit" && decision != "abort" {
+		return fmt.Errorf("invalid transaction decision %q", decision)
+	}
+	st, ok := l.state.States[txnID]
+	if !ok || !st.Active || st.Pending != "" || st.Instance != instance ||
+		!txnWALValidInstance(instance) {
+		return fmt.Errorf("transaction %q is not eligible for a terminal decision", txnID)
+	}
+	if _, already := l.topicDecisions[instance]; already {
+		return fmt.Errorf("transaction %q already has a durable outcome", txnID)
+	}
+	terminal := &walTopicTerminal{TransactionID:txnID,Instance:instance,Decision:decision}
+	for _, topic := range st.Topics {
+		offset := l.topicNext[topic]
+		if offset == math.MaxInt64 {
+			return fmt.Errorf("topic offset exhausted for %q", topic)
+		}
+		terminal.Markers = append(terminal.Markers, walTopicMarker{
+			Topic:topic,Offset:offset,TransactionID:txnID,
+			Instance:instance,Decision:decision,
+		})
+	}
+	return l.appendLocked(transactionWALRecord{Type:"topic-terminal",TopicTerminal:terminal})
 }
 
 // maxTopicAcceptanceBatchRecords bounds metadata retained by recovery while
@@ -222,10 +275,21 @@ func (l *TransactionLog) ReadTopicRecord(topic string, offset int64) (WALTopicRe
 		return WALTopicRecord{}, false, fmt.Errorf("transaction log is closed")
 	}
 	refs := l.topicRecords[topic]
-	if offset < 0 || offset >= int64(len(refs)) {
+	if offset < 0 || offset >= l.topicNext[topic] {
 		return WALTopicRecord{}, false, nil
 	}
-	ref := refs[int(offset)]
+	// Kafka control markers occupy topic offsets, but do not appear in the
+	// application payload index. A reader must skip those known positions.
+	i := sort.Search(len(refs), func(i int) bool { return refs[i].meta.Offset >= offset })
+	if i == len(refs) || refs[i].meta.Offset != offset {
+		markers := l.topicMarkers[topic]
+		j := sort.Search(len(markers),func(j int) bool { return markers[j].Offset >= offset })
+		if j < len(markers) && markers[j].Offset == offset {
+			return WALTopicRecord{}, false, nil
+		}
+		return WALTopicRecord{}, false, fmt.Errorf("missing topic WAL offset %s/%d",topic,offset)
+	}
+	ref := refs[i]
 	f, err := os.Open(l.walPath(ref.key))
 	if err != nil {
 		return WALTopicRecord{}, false, fmt.Errorf("open topic WAL frame: %w", err)

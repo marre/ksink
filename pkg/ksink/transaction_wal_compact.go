@@ -60,43 +60,53 @@ func (l *TransactionLog) compactLocked() error {
 			Instance: instance, Decision: l.topicDecisions[instance],
 		}); err != nil { return failed(err) }
 	}
-	// Keep logical topic streams in the same authoritative checkpoint. In
-	// particular, their unmaterialized committed records must survive WAL
-	// compaction and producer transactional.id reuse.
-	topics := make([]string, 0, len(l.topicRecords))
-	for topic := range l.topicRecords { topics = append(topics, topic) }
+	// Rebuild each independent topic in ascending Kafka-log offset order.
+	// Control markers share the same offset space but have no output payload.
+	// The manifest's atomic switch makes multi-frame checkpoints all-or-none.
+	topicsSet := make(map[string]bool)
+	for topic := range l.topicRecords { topicsSet[topic]=true }
+	for topic := range l.topicMarkers { topicsSet[topic]=true }
+	topics := make([]string,0,len(topicsSet))
+	for topic := range topicsSet {topics=append(topics,topic)}
 	sort.Strings(topics)
-	topicCount := 0
-	for _, topic := range topics {
-		for _, ref := range l.topicRecords[topic] {
-			source, openErr := os.Open(l.walPath(ref.key))
-			if openErr != nil { return failed(openErr) }
-			record, n, readErr := readTxnWALFrameAt(source, ref.offset)
-			if closeErr := source.Close(); readErr == nil { readErr = closeErr }
-			if readErr != nil { return failed(readErr) }
-			if n != ref.size || record.Type != "topic-output" || record.TopicOutput == nil ||
-				record.TopicOutput.Topic != topic || record.TopicOutput.Offset != ref.meta.Offset ||
-				record.TopicOutput.TransactionID != ref.meta.TransactionID ||
-				record.TopicOutput.Instance != ref.meta.Instance {
-				return failed(fmt.Errorf("invalid topic WAL frame at offset %d", ref.offset))
-			}
-			if err := write(record); err != nil { return failed(err) }
-			topicCount++
-			// Keep the replay buffer bounded even for checkpoints that
-			// contain millions of records from multiple topics.
-			if topicCount == 512 {
-				if err := write(transactionWALRecord{
-					Type: "topic-accept", BatchCount: topicCount,
-				}); err != nil { return failed(err) }
-				topicCount = 0
-			}
-		}
+	pendingCount := 0
+	flushPending := func() error {
+		if pendingCount==0 {return nil}
+		if err:=write(transactionWALRecord{Type:"topic-accept",BatchCount:pendingCount});err!=nil{return err}
+		pendingCount=0
+		return nil
 	}
-	// Emit a final acceptance delimiter for a non-full checkpoint batch.
-	if topicCount > 0 {
-		if err := write(transactionWALRecord{
-			Type: "topic-accept", BatchCount: topicCount,
-		}); err != nil { return failed(err) }
+	for _, topic := range topics {
+		refs, marks := l.topicRecords[topic], l.topicMarkers[topic]
+		i,j:=0,0
+		for i<len(refs) || j<len(marks) {
+			if j<len(marks) && (i==len(refs) || marks[j].Offset < refs[i].meta.Offset) {
+				if err:=flushPending();err!=nil{return failed(err)}
+				marker:=marks[j]
+				if err:=write(transactionWALRecord{Type:"topic-marker",TopicMarker:&marker});err!=nil{return failed(err)}
+				j++
+				continue
+			}
+			ref:=refs[i]
+			source,openErr:=os.Open(l.walPath(ref.key))
+			if openErr!=nil{return failed(openErr)}
+			record,n,readErr:=readTxnWALFrameAt(source,ref.offset)
+			if closeErr:=source.Close();readErr==nil{readErr=closeErr}
+			if readErr!=nil{return failed(readErr)}
+			if n!=ref.size || record.Type!="topic-output" || record.TopicOutput==nil ||
+				record.TopicOutput.Topic!=topic || record.TopicOutput.Offset!=ref.meta.Offset ||
+				record.TopicOutput.TransactionID!=ref.meta.TransactionID ||
+				record.TopicOutput.Instance!=ref.meta.Instance {
+				return failed(fmt.Errorf("invalid topic WAL frame at offset %d",ref.offset))
+			}
+			if err:=write(record);err!=nil{return failed(err)}
+			pendingCount++
+			if pendingCount==512 {
+				if err:=flushPending();err!=nil{return failed(err)}
+			}
+			i++
+		}
+		if err:=flushPending();err!=nil{return failed(err)}
 	}
 	if err=f.Sync();err!=nil{return failed(fmt.Errorf("sync WAL checkpoint: %w",err))}
 	if err=f.Close();err!=nil{return err}
