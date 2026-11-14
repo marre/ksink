@@ -203,3 +203,29 @@ func TestOrderedMaterializerDistinctTopicNamesOnCaseInsensitiveFilesystems(t *te
 	require.Equal(t,uint64(2),wal.TopicProgress("orders").NextFile)
 	require.Equal(t,uint64(2),wal.TopicProgress("Orders").NextFile)
 }
+
+
+func TestOrderedMaterializerFailedTopicDoesNotSkipHealthyTopic(t *testing.T) {
+	root:=t.TempDir()
+	wal:=orderedTestLog(t)
+	w,err:=NewOrderedTopicMaterializer(wal,
+		filepath.Join(root,"{topic}","messages-{seq:08}.jsonl"),1,time.Minute)
+	require.NoError(t,err)
+	_,err=wal.AppendTopicBatch([]ksink.WALTopicRecord{
+		{Topic:"a-failed",Data:[]byte("blocked\n")},
+		{Topic:"z-healthy",Data:[]byte("good\n")},
+	})
+	require.NoError(t,err)
+	// A conflicting immutable output name is a topic-local failure.
+	failed:=filepath.Join(root,"a-failed","messages-00000001.jsonl")
+	require.NoError(t,os.MkdirAll(filepath.Dir(failed),0700))
+	require.NoError(t,os.WriteFile(failed,[]byte("wrong\n"),0600))
+	n,err:=w.Publish(context.Background(),false)
+	require.ErrorContains(t,err,"a-failed")
+	require.Equal(t,1,n,"healthy topic must still publish in the same pass")
+	raw,readErr:=os.ReadFile(filepath.Join(root,"z-healthy","messages-00000001.jsonl"))
+	require.NoError(t,readErr)
+	require.Equal(t,"good\n",string(raw))
+	require.Equal(t,int64(0),wal.TopicProgress("a-failed").Cursor)
+	require.Equal(t,int64(1),wal.TopicProgress("z-healthy").Cursor)
+}
