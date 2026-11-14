@@ -262,3 +262,25 @@ func TestSharedWALOneTopicBlockedWhileAnotherCommitsWithControlOffsets(t *testin
 	require.Equal(t,int64(4),wal.TopicStableOffset("orders"))
 	require.Equal(t,int64(2),wal.TopicStableOffset("payments"))
 }
+
+func TestSharedWALRejectsEmptyFormattedRecordsBeforeAcknowledgement(t *testing.T) {
+	root:=t.TempDir()
+	wal,instance:=testOpenWALWithActiveTransaction(t,root)
+	defer func(){_=wal.Close()}()
+	before:=wal.CurrentState()
+	state:=cloneTxnStateSnapshot(before)
+	st:=state.States["orders-producer"]
+	st.Sequences=map[string]txnPartitionSequence{txnSequenceKey("orders",0):{Next:1}}
+	state.States["orders-producer"]=st
+	_,err:=wal.appendTopicBatchFormattedWithState([]WALTopicRecord{{
+		Topic:"orders",TransactionID:"orders-producer",Instance:instance,
+	}},state,func(int,int64)([]byte,error){return nil,nil})
+	require.ErrorContains(t,err,"no formatted bytes")
+	require.Zero(t,wal.NextTopicOffset("orders"))
+	require.Empty(t,wal.CurrentState().States["orders-producer"].Sequences)
+	offsets,err:=wal.appendTopicBatchFormattedWithState([]WALTopicRecord{{
+		Topic:"orders",TransactionID:"orders-producer",Instance:instance,
+	}},state,func(int,int64)([]byte,error){return []byte("nonempty"),nil})
+	require.NoError(t,err)
+	require.Equal(t,[]int64{0},offsets)
+}
