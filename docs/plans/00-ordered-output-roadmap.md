@@ -64,7 +64,7 @@ The output filenames are sorted **within one topic**, not across topics. `{seq}`
 2. Multi-topic commit is one logical durable outcome; no partial visibility of undecided/aborted transactions after reboot.
 3. At most one partition per topic. All records from a topic are read from completed files in ascending topic-offset order, with legitimate gaps for control/aborted records.
 4. File finalization and publication-cursor updates survive crashes without double output. A completed filename is immutable and verified before already-needed WAL bytes are reclaimed.
-5. Topic WAL payloads stay live through compaction and GC until their output is provably and durably finalized; producer ID reuse must not destroy pending older generations.
+5. Shared WAL payloads stay live through compaction and GC until their output is provably and durably finalized; producer ID reuse must not destroy pending older generations.
 6. Slow materialization and unresolved transactions have bounded, observable backlog and an explicit backpressure/fail-closed policy.
 7. Existing acknowledged state is never silently reset. Changes in output pattern, codec version or directory layout cannot change replay interpretation.
 
