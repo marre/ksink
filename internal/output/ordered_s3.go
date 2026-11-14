@@ -67,7 +67,7 @@ func parseS3OrderedDestination(dst string) (bucket, pattern, root string, width 
     if err != nil { return "", "", "", 0, fmt.Errorf("invalid S3 destination: %w", err) }
     if u.Scheme != "s3" || u.Host == "" || u.User != nil || u.RawQuery != "" ||
         u.ForceQuery || u.Fragment != "" || u.RawFragment != "" || u.Opaque != "" ||
-        u.RawPath != "" || strings.ContainsAny(u.Host, ":@") {
+        strings.ContainsAny(u.Host, ":@") {
         return "", "", "", 0, errors.New("S3 output requires s3://bucket/prefix/{topic}/file-{seq:NN} without credentials, query or fragment")
     }
     if len(u.Host)<3 || len(u.Host)>63 || strings.ContainsAny(u.Host,"/\\") {
