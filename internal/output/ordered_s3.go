@@ -142,6 +142,12 @@ func newS3OrderedPublisher(dst string, opts S3OrderedOpts) (*S3OrderedPublisher,
         o.UsePathStyle=opts.ForcePathStyle
         if opts.Endpoint!=""{o.BaseEndpoint=aws.String(opts.Endpoint)}
     })
+    // The SDK can supply a service endpoint from AWS_ENDPOINT_URL_S3,
+    // AWS_ENDPOINT_URL or shared configuration even without our CLI flag.
+    // Bind the endpoint actually selected by the client, not just the flag.
+    effective:=client.Options()
+    opts.Endpoint=aws.ToString(effective.BaseEndpoint)
+    opts.Region=effective.Region
     return newS3OrderedPublisherWithClient(dst,opts,client)
 }
 
@@ -157,7 +163,7 @@ func newS3OrderedPublisherWithClient(dst string, opts S3OrderedOpts, client s3Or
     if endpoint=="" {endpoint="aws"}
     return &S3OrderedPublisher{
         client:client,bucket:bucket,pattern:pattern,root:root,width:width,opts:opts,
-        identity:fmt.Sprintf("ordered-s3-v1|endpoint=%q|bucket=%q|pattern=%q",endpoint,bucket,pattern),
+        identity:fmt.Sprintf("ordered-s3-v1|endpoint=%q|region=%q|bucket=%q|pattern=%q",endpoint,opts.Region,bucket,pattern),
     },nil
 }
 
