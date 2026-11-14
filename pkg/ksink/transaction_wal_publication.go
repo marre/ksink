@@ -190,8 +190,10 @@ func (l *TransactionLog) applyTopicProgressCheckpoint(p *WALTopicProgress,
 // the surviving suffix and the absolute next-offset counter.
 func (l *TransactionLog) prunePublishedTopicLocked(topic string,cursor int64) {
 	records:=l.topicRecords[topic]
+	candidates:=make(map[string]struct{})
 	i:=sort.Search(len(records),func(i int)bool{return records[i].meta.Offset>=cursor})
 	for _,record:=range records[:i] {
+		if record.meta.Instance!="" {candidates[record.meta.Instance]=struct{}{}}
 		l.markFrameDead(walFrameRef{key:record.key,size:record.size})
 	}
 	if i>0 {
@@ -200,6 +202,36 @@ func (l *TransactionLog) prunePublishedTopicLocked(topic string,cursor int64) {
 	markers:=l.topicMarkers[topic]
 	j:=sort.Search(len(markers),func(j int)bool{return markers[j].Offset>=cursor})
 	if j>0 {
+		for _,marker:=range markers[:j] {candidates[marker.Instance]=struct{}{}}
 		l.topicMarkers[topic]=append([]walTopicMarker(nil),markers[j:]...)
+	}
+	// A decision is needed only while some unpublished record/control
+	// marker or current coordinator generation can still refer to it.
+	// Reclaim it once every participating topic has advanced past it.
+	for instance:=range candidates {
+		retained:=false
+		for _,state:=range l.state.States {
+			if state.Instance==instance {retained=true;break}
+		}
+		if retained {continue}
+		for _,refs:=range l.topicRecords {
+			for _,ref:=range refs {
+				if ref.meta.Instance==instance {retained=true;break}
+			}
+			if retained {break}
+		}
+		if retained {continue}
+		for _,marks:=range l.topicMarkers {
+			for _,mark:=range marks {
+				if mark.Instance==instance {retained=true;break}
+			}
+			if retained {break}
+		}
+		if retained {continue}
+		l.markFrameDead(l.topicDecisionRefs[instance])
+		delete(l.topicDecisionRefs,instance)
+		delete(l.topicDecisions,instance)
+		delete(l.topicDecisionOwners,instance)
+		delete(l.topicInstances,instance)
 	}
 }
