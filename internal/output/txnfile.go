@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"sync"
 
@@ -49,8 +48,7 @@ type txnFileWriter struct {
 func transactionOutputRoot(pattern string) string {
 	dir := filepath.Clean(filepath.Dir(pattern))
 	for strings.Contains(dir, TxnIDPlaceholder) ||
-		strings.Contains(dir, TopicPlaceholder) ||
-		strings.Contains(dir, PartitionPlaceholder) {
+		strings.Contains(dir, TopicPlaceholder) {
 		parent := filepath.Dir(dir)
 		if parent == dir {
 			break
@@ -76,6 +74,9 @@ func NewTxnFileWriter(pattern string, log *ksink.TransactionLog) (TransactionalW
 	}
 	if !strings.Contains(pattern, TxnIDPlaceholder) {
 		return nil, fmt.Errorf("transactional output pattern must contain %s placeholder", TxnIDPlaceholder)
+	}
+	if strings.Contains(pattern, unsupportedPartitionPlaceholder) {
+		return nil, fmt.Errorf("{partition} is unsupported: ksink exposes only partition 0 per topic")
 	}
 	if err := log.BindOutput(pattern); err != nil {
 		return nil, fmt.Errorf("bind transaction WAL: %w", err)
@@ -201,9 +202,8 @@ func (w *txnFileWriter) Close() error {
 	return firstErr
 }
 
-func (w *txnFileWriter) resolvePath(txnID, topic string, partition int32) string {
+func (w *txnFileWriter) resolvePath(txnID, topic string) string {
 	path := strings.ReplaceAll(w.pattern, TxnIDPlaceholder, SanitizePathSegment(txnID))
 	path = strings.ReplaceAll(path, TopicPlaceholder, SanitizePathSegment(topic))
-	path = strings.ReplaceAll(path, PartitionPlaceholder, strconv.FormatInt(int64(partition), 10))
 	return filepath.Clean(path)
 }
