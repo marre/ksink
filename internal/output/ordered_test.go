@@ -133,6 +133,7 @@ func TestOrderedMaterializerRejectsSymlinkAndInvalidTemplates(t *testing.T) {
 	for _,pattern:=range []string{
 		filepath.Join(root,"{txnID}","messages-{seq:08}.jsonl"),
 		filepath.Join(root,"{topic}","messages.jsonl"),
+		filepath.Join(root,"{seq:08}","{topic}","messages.jsonl"), // misplaced sequence must return an error, never panic
 		filepath.Join(root,"{topic}","messages-{seq:03}.jsonl"),
 		filepath.Join(root,"{topic}","messages-{seq:08}-{seq:08}.jsonl"),
 		filepath.Join(root,"{topic}","x-{partition}-{seq:08}.jsonl"),
