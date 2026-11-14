@@ -2,6 +2,7 @@ package ksink
 
 import (
 	"crypto/sha256"
+	"errors"
 	"encoding/hex"
 	"path/filepath"
 	"testing"
@@ -183,4 +184,49 @@ func TestSharedWALGCIndependentTopicProgressKeepsBlockedSuffix(t *testing.T) {
 	_,ok,err=reopened.ReadTopicRecord("orders",0)
 	require.NoError(t,err)
 	require.False(t,ok)
+}
+
+func TestSharedWALCheckpointRetainsBlockedTopicAndIndependentProgress(t *testing.T) {
+	for _,stage:=range []string{"","compact:snapshot-synced","compact:manifest-synced"} {
+		t.Run(stage,func(t *testing.T) {
+			root:=t.TempDir()
+			wal,instance:=testOpenWALWithActiveTransaction(t,root)
+			state:=wal.CurrentState()
+			st:=state.States["orders-producer"]
+			st.Topics=[]string{"payments"}
+			state.States["orders-producer"]=st
+			require.NoError(t,wal.AppendState(state))
+			_,err:=wal.AppendTopicBatch([]WALTopicRecord{
+				{Topic:"orders",Data:[]byte("completed")},
+				{Topic:"payments",TransactionID:"orders-producer",Instance:instance,Data:[]byte("blocked")},
+			})
+			require.NoError(t,err)
+			require.NoError(t,wal.RecordTopicFile("orders",walTestFile(1,0,1)))
+			if stage!="" {
+				wal.faultHook=func(point string)error {
+					if point==stage {return errors.New("injected checkpoint failure")}
+					return nil
+				}
+				require.ErrorContains(t,wal.Compact(),"injected checkpoint failure")
+			} else {
+				require.NoError(t,wal.Compact())
+			}
+			require.NoError(t,wal.Close())
+			reopened,err:=OpenTransactionLog(filepath.Join(root,".ksink-kafka-state"))
+			require.NoError(t,err)
+			defer func(){_ = reopened.Close()}()
+			require.Equal(t,int64(1),reopened.TopicProgress("orders").Cursor)
+			require.Equal(t,uint64(2),reopened.TopicProgress("orders").NextFile)
+			require.Equal(t,int64(1),reopened.NextTopicOffset("payments"))
+			require.Zero(t,reopened.TopicStableOffset("payments"))
+			rec,found,err:=reopened.ReadTopicRecord("payments",0)
+			require.NoError(t,err)
+			require.True(t,found)
+			require.Equal(t,"blocked",string(rec.Data))
+			require.Equal(t,instance,rec.Instance)
+			_,found,err=reopened.ReadTopicRecord("orders",0)
+			require.NoError(t,err)
+			require.False(t,found)
+		})
+	}
 }
