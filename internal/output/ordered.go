@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"io"
 	"math"
-	"log"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -33,7 +32,6 @@ type OrderedTopicMaterializer struct {
 	now func() time.Time
 	mu sync.Mutex // only one poll/flush may publish at once
 	since map[string]time.Time
-	failures map[string]error // guarded by mu; last failure per topic
 }
 
 // KafkaTransactionStateDir is the default shared WAL root for ordered
@@ -102,7 +100,7 @@ func NewOrderedTopicMaterializer(wal *ksink.TransactionLog, pattern string,
 	if err:=wal.BindOutput(abs);err!=nil{return nil,err}
 	return &OrderedTopicMaterializer{
 		wal:wal,pattern:abs,root:root,width:width,size:maxBytes,interval:maxAge,
-		now:time.Now,since:make(map[string]time.Time),failures:make(map[string]error),
+		now:time.Now,since:make(map[string]time.Time),
 	},nil
 }
 
@@ -221,11 +219,9 @@ func (w *OrderedTopicMaterializer) Publish(ctx context.Context, force bool) (int
 			// A failed topic must not prevent other committed topic streams
 			// from publishing during this pass. Preserve every failure for
 			// the caller instead of silently reporting a partial success.
-			w.failures[topic]=err
 			topicErrors=append(topicErrors,fmt.Errorf("publish topic %q: %w",topic,err))
 			continue
 		}
-		delete(w.failures,topic)
 		published+=count
 	}
 	return published,errors.Join(topicErrors...)
@@ -355,51 +351,17 @@ func syncOrderedDir(dir string) error {
 	return f.Sync()
 }
 
-// TopicFailures returns a snapshot of currently failing topics. Errors are
-// retained until that topic successfully publishes or is found up to date.
-func (w *OrderedTopicMaterializer) TopicFailures() map[string]error {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	out:=make(map[string]error,len(w.failures))
-	for topic,err:=range w.failures {out[topic]=err}
-	return out
-}
-
-// Run supervises each topic independently. A broken destination cannot
-// prevent healthy topics from advancing. Failed topics retry with capped
-// exponential backoff, while healthy topics are polled every 200ms.
+// Run polls all topic streams. Any publication error is fatal to the
+// ordered server; the caller closes Kafka and returns a nonzero exit status.
+// Restart reconciles any completed file not yet receipted in the WAL.
 func (w *OrderedTopicMaterializer) Run(ctx context.Context) error {
 	ticker:=time.NewTicker(200*time.Millisecond)
 	defer ticker.Stop()
-	type retryState struct {next time.Time; delay time.Duration}
-	retries:=make(map[string]retryState)
 	for {
 		if ctx.Err()!=nil{return nil}
-		for _,topic:=range w.wal.TopicNames() {
+		if _,err:=w.Publish(ctx,false);err!=nil {
 			if ctx.Err()!=nil{return nil}
-			if state,ok:=retries[topic];ok && time.Now().Before(state.next) {continue}
-			w.mu.Lock()
-			_,err:=w.publishTopic(ctx,topic,false)
-			if err!=nil {
-				w.failures[topic]=err
-			} else {
-				delete(w.failures,topic)
-			}
-			w.mu.Unlock()
-			if err!=nil {
-				if ctx.Err()!=nil{return nil}
-				state:=retries[topic]
-				if state.delay==0 {state.delay=time.Second} else if state.delay<30*time.Second {
-					state.delay*=2
-					if state.delay>30*time.Second {state.delay=30*time.Second}
-				}
-				state.next=time.Now().Add(state.delay)
-				retries[topic]=state
-				log.Printf("ordered output topic %q failed (retry in %s): %v",topic,state.delay,err)
-			} else if _,wasFailing:=retries[topic];wasFailing {
-				delete(retries,topic)
-				log.Printf("ordered output topic %q recovered",topic)
-			}
+			return fmt.Errorf("ordered output publication failed: %w",err)
 		}
 		select {
 		case <-ctx.Done():return nil
