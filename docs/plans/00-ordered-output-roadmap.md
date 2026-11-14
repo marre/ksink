@@ -1,66 +1,79 @@
-# Ordered committed output: architecture and implementation roadmap
+# Ordered committed output: architecture and dependency roadmap
 
-Status: **proposal / planning only**. Applies to `marre/ksink` PR #52, head `b5b62af` at review time. This plan does not itself implement a new output format.
+Status: **proposal / implementation planning** for `marre/ksink` PR #52. No implementation implied by this document.
 
-## Target contract and deliberate limits
+## Architecture chosen for planning
 
-- A small Kafka-producer-compatible, single-process sink: **partition 0 only for each topic**; multiple topics remain allowed. No Kafka Fetch consumer protocol or consumer group support.
-- One **global ingestion sequence** across accepted records from all topics controls filesystem output order. Kafka-facing **per-topic partition-0 offsets** are a different field and must also be durable. Global order is an explicit ksink choice, not a Kafka cross-topic guarantee.
-- One committed-only ordered stream of **immutable completed files** for one external file consumer. This models `read_committed` visibility, not an `isolation.level` consumer-protocol option.
-- The WAL is the sole durable authority for accepted records, producer dedup/fencing, transaction outcomes, output publication progress and file identity. Successful Produce means its data and dedup/offset decision are durable. Successful EndTxn means its transaction decision is durable; it need not be published to disk yet.
-- No per-transaction staging or committed output directories in the target design. Readers ignore temporary files and sort completed files by a stable, zero-padded file sequence.
-- One output file series, even if producers use different topics; preserve topic/offset in an inspectable format (prefer JSONL). The ordered transactional mode does **not** allow `{topic}`, `{partition}`, or `{txnID}` routing in output paths. Keep existing nontransactional backends unchanged.
-- No migration is promised for the **unmerged** transaction-WAL/output layout in PR #52. New storage versions must explicitly reject old state, never silently start empty or misread old transaction directories.
-
-## Dependency order (do not reverse)
-
-| Phase | Plan | Prerequisite / deliverable | Gate to next phase |
-|---|---|---|---|
-| **0. Freeze semantics** | This roadmap | Decide global vs per-topic order, ack contracts, output visibility, file naming and failure model | Review decisions before changing durable format |
-| **1. WAL / ordering foundation** | [01-wal-and-offsets.md](01-wal-and-offsets.md) | Atomic ingest with persisted global sequence + per-topic offsets, durable decisions independent of transaction instance reuse, replay and safe retention | Lost-response, interleaving, replay, corruption and GC tests green |
-| **2. Transaction coordinator and read-committed eligibility** | [02-transactions-and-materializer.md](02-transactions-and-materializer.md) | EndTxn durability decoupled from publication; global stable prefix; accept/reject policy for nontransactional records; pending transaction recovery | Correct B-before-A commit handling; no early exposure or erroneous abort |
-| **3. Ordered materializer, cut over from transaction directories** | [02-transactions-and-materializer.md](02-transactions-and-materializer.md) | Sequential WAL-to-file writer, immutable finalization, durable publication cursor and crash reconciliation; remove old transaction-directory implementation | Restart exactly once, no missing/misordered files, WAL GC safe |
-| **4. Filename controls and rotation** | [03-filenames-and-rotation.md](03-filenames-and-rotation.md) | Validated name pattern and size/time rotation, stable file numbering, CLI help and reader documentation | Size/time/boundary/restart tests green |
-| **5. Full regression / release gate** | All plans | End-to-end Kafka-client compatibility, fault injection, disk pressure, race/load tests, README refresh; review scope and implementation | Build, vet, race, lint, long-running recovery tests pass |
-
-Implement **one coherent, reviewable stage at a time** on the PR #52 branch, re-running relevant tests before moving on. **Do not merge PR #52 in its current transaction-directory form**; the final merge must reflect the new agreed output contract.
-
-## Example: why ordered output differs from commit order
-
-Accepted global positions: `100 A`, `101 B`, `102 A`, `103 C` (later aborted), `104 D`.
-
-B can commit before A. While A is open, no records at or after global position 100 are eligible. After A commits, 100/A, 101/B and 102/A can be materialized in order. After C aborts, position 103 is skipped and 104/D becomes eligible (provided D committed). A file may contain records from different committed transactions; a transaction may cross file boundaries.
-
-The file consumer sees only finalized files, for example:
+Use **one physical data WAL per topic** (with exactly **partition 0**), a **small shared transaction-coordinator WAL** for producer identity/epochs and cross-topic COMMIT/ABORT decisions, and **one ordered immutable output-file sequence per topic**. There is **one materializer service**, which tracks independent stable positions for each topic. This models a single Kafka read-committed consumer subscribed to topics, but **does not** implement Kafka Fetch/consumer-group protocols.
 
 ```text
+state/
+  coordinator/manifest.json, segments/*.wal, snapshots/*.wal
+  topics/orders/manifest.json, segments/*.wal, snapshots/*.wal
+  topics/payments/manifest.json, segments/*.wal, snapshots/*.wal
+
 output/
-  messages-00000000000000000001.jsonl
-  messages-00000000000000000002.jsonl
+  orders/messages-00000001.jsonl
+  orders/messages-00000002.jsonl
+  payments/messages-00000001.jsonl
 ```
 
-Here `{seq}` is the **file number**, not the Kafka offset or global record position. Each file contains data ordered by global record position. Aborted records and transaction markers are not emitted as user records. Gaps in source offsets are legitimate.
+**Reasoning:** Kafka record ordering is per topic-partition; no global cross-topic ordering is promised. A blocked transaction in `orders` should not delay `payments` unless the **same multi-topic transaction** is unresolved for both. File sequences, publication cursors, rotation and data retention are independent per topic.
 
-## Critical correctness invariants
+**Complexity warning:** One WAL per topic **alone** cannot guarantee atomic multi-topic transaction decisions across crashes. The shared coordinator is required unless we intentionally ban multi-topic transactions. The current PR #52 already has one combined coordinator/data WAL; physically splitting it is more complex, not an automatic simplification. The benefit is independent topic state and publication. An alternative would keep **one physical WAL with per-topic logical streams**, providing simpler write/commit durability but less physical isolation. Decide this trade-off before Phase 1 implementation.
 
-1. **No success response before durability**: accepted messages + producer dedup state + assigned positions are recoverable; transaction decisions are fsynced before EndTxn success.
-2. **No early visibility**: an unresolved lower global record position blocks later records even if their transactions have committed (a stricter global rule than Kafka's per-topic LSO).
-3. **No WAL deletion before publication**: all data needed to materialize or reconstruct the next file remains live until the final file is verified durable and its publication progress recorded.
-4. **No duplicates across crashes**: finalized immutable filenames, bounds, checksums and the WAL publication cursor reconcile in either crash order.
-5. **No guessing**: missing acknowledged WAL files, missing finalized output, mismatched checksums, unsupported versions and unclear output bindings stop startup or publication with an actionable error.
-6. **Bounded operations**: WAL backlogs, output backlog, disk usage and materializer memory have limits, status and failure policies.
+## Behavior and limitations
 
-## Explicit non-goals
+- Every topic advertises and accepts partition 0 only; all other partitions are rejected. Multiple topics and atomic transactions across several topics remain supported.
+- Producer acknowledgements mean WAL-durable messages and producer sequence/offset decisions; EndTxn acknowledgement means a WAL-durable final COMMIT/ABORT decision, **not** necessarily completed file output.
+- File output contains committed records only, in broker-assigned **per-topic offsets**. Open lower-offset transactions delay later records of **that topic**. Aborts leave permitted gaps. `read_uncommitted` is not supported as a filesystem mode.
+- A transaction may occupy multiple output files or multiple topics' file series; do not expose transaction directories. File boundaries are independent of transaction boundaries.
+- The one materializer can write/publish separate topic files, but must not invent a cross-topic total order. A single external file reader may subscribe to multiple topic directories but cannot merge them into a Kafka-guaranteed global order.
+- Keep existing nontransactional stdout/HTTP/file backends unchanged unless a dedicated compatibility task says otherwise. New transactional output enforces `{topic}` in the path for multiple-topic output; reject `{txnID}` and `{partition}`. **File sequence** is distinct from topic offset and producer batch sequence.
+- The unmerged PR #52 WAL v2 and transaction-directory layout are allowed to change without migration, but reopening unsupported old state must fail clearly rather than discard data.
 
-Multi-partition topology, distributed brokers, Kafka Fetch/consumer groups, `read_uncommitted` file mode, transaction directory browsing, atomic whole-transaction file appearance, cloud-object-store output, and WAL v2-to-next-format automatic migration.
+## Implementation order and gates
 
-## External reference
+| Order | Plan | Why first / exit criterion |
+|---|---|---|
+| **0. Architecture and contracts** | This roadmap | Decide physical per-topic WAL vs logical streams in one WAL, preserve cross-topic transactions, agree EndTxn and output visibility semantics |
+| **1. Coordinator correctness / WAL lifecycle** | [01-wal-and-offsets.md](01-wal-and-offsets.md) | Durability contract, transaction generations retained through delayed publication, producer fencing and checksum/fail-closed tests |
+| **2. Per-topic WAL and append offsets** | [01-wal-and-offsets.md](01-wal-and-offsets.md) | Exactly one authoritative data log per topic, durable base offsets and idempotent accepted batches, atomic cross-log barriers |
+| **3. Transaction resolution and stable-prefix reader** | [02-transactions-and-materializer.md](02-transactions-and-materializer.md) | Commit independent of file materialization, multi-topic decision replay and per-topic read-committed gating |
+| **4. Ordered file materializer, remove transaction directories** | [02-transactions-and-materializer.md](02-transactions-and-materializer.md) | Per-topic publication cursor, immutable files and replay without duplication; old staging/commit directory code removed |
+| **5. Filename parameters and file rotation** | [03-filenames-and-rotation.md](03-filenames-and-rotation.md) | User-controlled per-topic file patterns, size/time rotation, finalized-file reader contract |
+| **6. Verification and merge gate** | [04-testing-rollout.md](04-testing-rollout.md) | Real clients, crash injection, race/load/retention tests, docs and rollout contract verified |
 
-Kafka's own `read_committed` consumers read records in partition-offset order and stop at the earliest unresolved transaction in that partition: https://kafka.apache.org/43/configuration/consumer-configs/. The global cross-topic ordering described here is **ksink-specific**.
+Changes should be delivered as **small reviewable commits or PRs in dependency order**. While PR #52 is unmerged, use its branch for the architectural rewrite; avoid merging the old directory output first. Do not start filename/rotation implementation until WAL retention and stable-prefix publication are demonstrably correct.
 
-## Review questions before implementation
+## Example: ordering for one topic
 
-- Confirm that one **global file stream** is preferable to one stream per topic. This roadmap chooses global ordering for a single reader.
-- Confirm that committed-only output may **lag a successful EndTxn acknowledgement**. This roadmap chooses yes.
-- Confirm that a transaction's records may span multiple immutable files. This roadmap chooses yes.
-- Decide the supported behavior for nontransactional Produce while `--transactional` is on; plan 02 recommends committing each such batch atomically into the ordered log.
+```text
+orders/0: offset 100 -> txn A, "created"
+orders/0: offset 101 -> txn B, "paid"
+orders/0: offset 102 -> txn A, "updated"
+```
+
+B commits first: no `orders` records at or after 100 are eligible while A is open. A commits: 100, 101 and 102 become eligible in offset order. If A aborts instead, 100 and 102 are skipped and B's 101 becomes eligible when A resolves. `payments/0` has its own offsets, stable position and output-file sequence; its independent committed transactions may be emitted meanwhile.
+
+The output filenames are sorted **within one topic**, not across topics. `{seq}` is the **file number**, not a topic offset.
+
+## Key safety invariants
+
+1. No Produce success unless data and assigned Kafka-compatible positions/dedup result are durable; no EndTxn success unless the irreversible transaction decision is durable.
+2. Multi-topic commit is one logical durable outcome; no partial visibility of undecided/aborted transactions after reboot.
+3. At most one partition per topic. All records from a topic are read from completed files in ascending topic-offset order, with legitimate gaps for control/aborted records.
+4. File finalization and publication-cursor updates survive crashes without double output. A completed filename is immutable and verified before already-needed WAL bytes are reclaimed.
+5. Topic WAL payloads stay live through compaction and GC until their output is provably and durably finalized; producer ID reuse must not destroy pending older generations.
+6. Slow materialization and unresolved transactions have bounded, observable backlog and an explicit backpressure/fail-closed policy.
+7. Existing acknowledged state is never silently reset. Changes in output pattern, codec version or directory layout cannot change replay interpretation.
+
+## Open design decision requiring explicit review
+
+**A. Physical WAL-per-topic + coordinator (this plan's working design):** matches independent per-topic progress but adds cross-log sync/recovery complexity.
+
+**B. One physical segmented WAL with logical per-topic append streams:** simpler durability boundary; still supports per-topic offsets, separate output files and independent stable-prefix cursors, even if log compaction is shared.
+
+The downstream filesystem contract is the same under both. If simplicity dominates, option **B may be preferable**; do not split durable files purely for organizational aesthetics.
+
+See [01](01-wal-and-offsets.md) through [04](04-testing-rollout.md) for detailed acceptance criteria.
