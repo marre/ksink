@@ -2,6 +2,7 @@ package ksink
 
 import (
 	"bytes"
+	"errors"
 	"encoding/binary"
 	"os"
 	"path/filepath"
@@ -257,4 +258,20 @@ func TestTransactionWALReplayRetainsReclaimableAccounting(t *testing.T) {
 	// An explicit maintenance compaction still works with counters rebuilt.
 	require.NoError(t, reopened.Compact())
 	require.Zero(t, reopened.reclaimable)
+}
+
+func TestTransactionWALFatalErrorAfterPostFsyncFailure(t *testing.T) {
+	wal,err:=OpenTransactionLog(filepath.Join(t.TempDir(),"wal"))
+	require.NoError(t,err)
+	defer func(){_ = wal.Close()}()
+	wal.faultHook=func(point string) error {
+		if point=="append:fsynced" {return errors.New("injected sync ambiguity")}
+		return nil
+	}
+	_,err=wal.AppendTopicBatch([]WALTopicRecord{{Topic:"orders",Data:[]byte("record\n")}})
+	require.ErrorContains(t,err,"injected sync ambiguity")
+	require.ErrorContains(t,wal.FatalError(),"injected sync ambiguity")
+	wal.faultHook=nil
+	_,err=wal.AppendTopicBatch([]WALTopicRecord{{Topic:"orders",Data:[]byte("later\n")}})
+	require.Error(t,err,"permanently failed WAL must reject further writes")
 }
