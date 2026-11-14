@@ -62,7 +62,7 @@ Unlike the former PR #36 approach, S3 does **not** implement `CommitTxn`,
 WAL continues to own stable offsets and all Kafka transaction semantics.
 
 S3 requires an explicit `--transaction-state-dir` (durable local WAL).
-The WAL binds the endpoint, bucket and key pattern as an opaque identity.
+The WAL binds the effective SDK endpoint (including AWS environment/shared-config overrides), resolved region, bucket and key pattern as an opaque identity. Changing any of these on restart fails closed rather than silently publishing subsequent sequences to another S3 service.
 The existing filesystem absolute-path binding is unchanged, and formatter
 binding remains separate. Retries and transport timeouts are not binding
 fields.
