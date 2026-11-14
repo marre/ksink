@@ -5,7 +5,7 @@ Status: implementation design, reviewed against restart, concurrency, and extern
 ## Requirements
 
 - One authoritative durable history for producer IDs/epochs, per-partition batch sequences, transaction instance IDs, serialized output bytes, and irreversible commit/abort decisions.
-- Support Kafka producer protocol, public `Read()` events and `AckFunc`, output formats, `{topic}`/`{partition}`/`{txnID}` routing, atomic committed directories, and nontransactional writers.
+- Support Kafka producer protocol, public `Read()` events and `AckFunc`, output formats, `{topic}`/`{txnID}` routing, atomic committed directories, and nontransactional writers. Each topic intentionally has exactly one partition (ID 0); other IDs are rejected in `Produce` and `AddPartitionsToTxn`. The `{partition}` output placeholder is unsupported.
 - Successful Produce must not precede durability of accepted output bytes **and** the corresponding sequence checkpoint. Successful EndTxn must not precede durable publication and a recorded outcome.
 - Process crashes must never cause an irreversible commit to be discarded or a second committed transaction directory to be created.
 - No database or third-party storage engine.
