@@ -180,3 +180,25 @@ func TestOrderedMaterializerHashReceiptAndNoOverwrite(t *testing.T) {
 	_,err=os.Stat(filepath.Join(root,"orders","messages-00000001.jsonl"))
 	require.True(t,os.IsNotExist(err))
 }
+
+func TestOrderedMaterializerDistinctTopicNamesOnCaseInsensitiveFilesystems(t *testing.T) {
+	root:=t.TempDir()
+	wal:=orderedTestLog(t)
+	w,err:=NewOrderedTopicMaterializer(wal,
+		filepath.Join(root,"{topic}","messages-{seq:08}.jsonl"),128<<20,time.Minute)
+	require.NoError(t,err)
+	_,err=wal.AppendTopicBatch([]ksink.WALTopicRecord{
+		{Topic:"orders",Data:[]byte("lower\n")},
+		{Topic:"Orders",Data:[]byte("upper\n")},
+	})
+	require.NoError(t,err)
+	require.NoError(t,w.Flush(context.Background()))
+	lower,err:=os.ReadFile(filepath.Join(root,"orders","messages-00000001.jsonl"))
+	require.NoError(t,err)
+	upper,err:=os.ReadFile(filepath.Join(root,"%4Frders","messages-00000001.jsonl"))
+	require.NoError(t,err)
+	require.Equal(t,"lower\n",string(lower))
+	require.Equal(t,"upper\n",string(upper))
+	require.Equal(t,uint64(2),wal.TopicProgress("orders").NextFile)
+	require.Equal(t,uint64(2),wal.TopicProgress("Orders").NextFile)
+}
