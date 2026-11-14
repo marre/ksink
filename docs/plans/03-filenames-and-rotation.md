@@ -53,8 +53,8 @@ Each topic has **its own independently increasing file number**, while its recor
 1. Enumerate topic subdirectories.
 2. For each topic, ignore temporary files; read finalized `{seq}` files in lexical filename order.
 3. Do not infer a total order across topics or interpret missing application offsets as corruption (aborts/control markers can create gaps).
-4. Process each immutable file at most once by topic + file number; persist the reader's own checkpoint. ksink cannot provide exactly-once external reader side effects without reader cooperation.
-5. Optional: provide a small `metadata.json` per finalized file with offset bounds, byte length and checksum if a reader needs verification; do not make metadata mandatory if it increases atomic publication complexity without a clear use case.
+4. Process each immutable file at most once by topic + file number; persist the reader's own checkpoint **before deleting or moving a completed file**. ksink cannot provide exactly-once external reader side effects without reader cooperation.
+5. Consumers/operators may delete completed files after processing; ksink must **never re-emit a file after its durable publication receipt**, even if its pathname is gone. It cannot distinguish intentional deletion from accidental loss. Document this trade-off plainly. Optional: offer per-file metadata if a reader needs checksum validation, without introducing another non-atomic publication artifact.
 
 ## Compatibility
 
