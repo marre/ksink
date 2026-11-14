@@ -25,7 +25,8 @@ func TestOrderedWALKafkaProducerWritesTopicOffsetsAndCommitsWithoutFileOutput(t 
 	}
 	srv, err := ksink.New(ksink.Config{
 		Address: "127.0.0.1:0", TransactionalWrite: true, Timeout: 5 * time.Second,
-	}, ksink.WithTransactionLog(wal), ksink.WithOrderedTransactionalOutput(formatter))
+	}, ksink.WithTransactionLog(wal), ksink.WithOrderedTransactionalOutput(formatter),
+		ksink.WithLogger(&integrationLogger{t}))
 	require.NoError(t, err)
 	require.NoError(t, srv.Start(context.Background()))
 
@@ -72,7 +73,8 @@ func TestOrderedWALKafkaProducerWritesTopicOffsetsAndCommitsWithoutFileOutput(t 
 	// been materialized; recovery cannot mistake it for an open transaction.
 	restarted, err := ksink.New(ksink.Config{
 		Address: "127.0.0.1:0", TransactionalWrite: true,
-	}, ksink.WithTransactionLog(reopened), ksink.WithOrderedTransactionalOutput(formatter))
+	}, ksink.WithTransactionLog(reopened), ksink.WithOrderedTransactionalOutput(formatter),
+		ksink.WithLogger(&integrationLogger{t}))
 	require.NoError(t, err)
 	require.NoError(t, restarted.Start(context.Background()))
 	defer func() { _ = restarted.Close(context.Background()) }()
