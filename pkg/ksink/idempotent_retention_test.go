@@ -51,3 +51,24 @@ func TestIdempotentProducerExpiryWALCheckpointSurvivesCompactionAndRestart(t *te
  require.Equal(t,int32(2),state.Idempotent[1].Sequences["orders/0"].Next)
  require.Equal(t,cutoff+1,state.Idempotent[1].LastActivityUnixNano)
 }
+
+func TestIdempotentProducerExpiryFailedWALAppendDoesNotReclaimDurableState(t *testing.T) {
+ dir:=filepath.Join(t.TempDir(),"state")
+ wal,err:=OpenTransactionLog(dir)
+ require.NoError(t,err)
+ state:=wal.CurrentState()
+ state.Idempotent=map[int64]storedIdempotentProducer{
+  1:{LastActivityUnixNano:1,Sequences:map[string]txnPartitionSequence{"orders/0":{Next:7}}},
+ }
+ require.NoError(t,wal.AppendState(state))
+ candidate:=cloneTxnStateSnapshot(state)
+ require.Equal(t,1,reclaimExpiredIdempotent(&candidate,2))
+ require.NoError(t,wal.Close())
+ require.Error(t,wal.AppendState(candidate),"failed WAL append must not count as a committed reclamation")
+ recovered,err:=OpenTransactionLog(dir)
+ require.NoError(t,err)
+ defer func(){_ = recovered.Close()}()
+ retained,ok:=recovered.CurrentState().Idempotent[1]
+ require.True(t,ok)
+ require.Equal(t,int32(7),retained.Sequences["orders/0"].Next)
+}
