@@ -92,6 +92,11 @@ kcat format specifiers (--output-format-string):
   %K  key length  %S  value length
   %%  literal %%   \n  newline     \t  tab     \\  backslash`,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			// Ordered output defaults to structured, self-describing JSONL.
+			// The existing nontransactional default remains raw binary.
+			if transactional && !cmd.Flags().Changed("output-format") {
+				fmtName = "jsonl"
+			}
 			if fmtName != "binary" {
 				if cmd.Flags().Changed("output-separator") || cmd.Flags().Changed("output-separator-hex") || cmd.Flags().Changed("no-separator") {
 					return fmt.Errorf("--output-separator, --output-separator-hex, and --no-separator are only supported with --output-format=binary")

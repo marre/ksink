@@ -75,6 +75,10 @@ func NewOrderedTopicMaterializer(wal *ksink.TransactionLog, pattern string,
 	}
 	root:=prefix
 	if err:=os.MkdirAll(root,0700);err!=nil{return nil,fmt.Errorf("create ordered output root: %w",err)}
+	// Persist the root directory entry as well as future file entries.
+	// Losing a newly-created output root after a durable receipt would break
+	// the consumer's completed-file contract.
+	if err:=syncOrderedDir(filepath.Dir(root));err!=nil{return nil,err}
 	info,err:=os.Lstat(root)
 	if err!=nil{return nil,err}
 	if !info.IsDir() || info.Mode()&os.ModeSymlink!=0 {
@@ -130,6 +134,9 @@ func (w *OrderedTopicMaterializer) filename(topic string, seq uint64) (string,st
 func (w *OrderedTopicMaterializer) ensureParent(final string) error {
 	dir:=filepath.Dir(final)
 	if err:=os.MkdirAll(dir,0700);err!=nil{return err}
+	// Also persist newly-created topic directories in their parent; syncing
+	// only the topic directory itself is not sufficient after a power loss.
+	if err:=syncOrderedDir(w.root);err!=nil{return err}
 	// Prevent pre-created symlink topic directories redirecting publication.
 	rel,err:=filepath.Rel(w.root,dir)
 	if err!=nil{return err}
@@ -239,6 +246,9 @@ func (w *OrderedTopicMaterializer) publishTopic(ctx context.Context,topic string
 		end,total,err=w.verifyExisting(ctx,topic,p.Cursor,stable,final,info.Size())
 		if err!=nil{return 0,err}
 		if end<=p.Cursor || total<=0{return 0,fmt.Errorf("cannot recover empty file %q",final)}
+		// An earlier attempt may have linked a complete name before its
+		// directory fsync failed. Verify durability before WAL receipt.
+		if err:=syncOrderedDir(filepath.Dir(final));err!=nil{return 0,err}
 	} else {
 		// Files always contain a whole-number prefix of committed records.
 		if err:=w.createFinal(ctx,topic,p.Cursor,end,final);err!=nil{return 0,err}
