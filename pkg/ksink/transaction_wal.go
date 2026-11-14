@@ -17,7 +17,7 @@ import (
 )
 
 const (
-	transactionWALVersion = 2
+	transactionWALVersion = 3
 	transactionWALMaxFrame = 64 << 20
 	// Compact only when enough WAL bytes are obsolete AND reclaiming
 	// them would remove a meaningful fraction of the file. A 1 GiB
@@ -231,7 +231,7 @@ func OpenTransactionLog(path string) (*TransactionLog, error) {
 			_ = log.Close()
 			return nil, fmt.Errorf("create WAL bootstrap marker: %w", err)
 		}
-		_, err = marker.Write([]byte("ksink-wal-v2\n"))
+		_, err = marker.Write([]byte("ksink-wal-v3\n"))
 		if err == nil {
 			err = marker.Sync()
 		}

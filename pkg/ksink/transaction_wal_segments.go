@@ -10,7 +10,7 @@ import (
 )
 
 const (
-	walManifestVersion = 1
+	walManifestVersion = 2
 	transactionWALSegmentBytes = 64 << 20
 )
 
@@ -41,7 +41,10 @@ func (l *TransactionLog) activeKey() walFileKey {
 func (l *TransactionLog) manifestPath() string {return filepath.Join(l.dir,"manifest.json")}
 
 func validateWALManifest(m walManifest) error {
-	if m.Version!=walManifestVersion || len(m.Segments)==0 || m.NextID==0 {
+	if m.Version!=walManifestVersion {
+		return fmt.Errorf("unsupported transaction WAL manifest version %d (expected %d): old state is not compatible with ordered output",m.Version,walManifestVersion)
+	}
+	if len(m.Segments)==0 || m.NextID==0 {
 		return fmt.Errorf("invalid transaction WAL manifest")
 	}
 	last:=m.Snapshot
