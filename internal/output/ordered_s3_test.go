@@ -207,7 +207,7 @@ func TestS3OrderedAmbiguousPUTAndConflict(t *testing.T) {
     _,err=wal.AppendTopicBatch([]ksink.WALTopicRecord{{Topic:"orders",Data:[]byte("second\n")}})
     require.NoError(t,err)
     err=w.Flush(context.Background())
-    require.ErrorContains(t,err,"mismatch")
+    require.ErrorContains(t,err,"differs from committed WAL bytes")
     require.Equal(t,"wrong",string(fake.objects["root/orders/messages-00000002.jsonl"].data))
     require.Equal(t,int64(1),wal.TopicProgress("orders").Cursor)
     require.Equal(t,1,fake.puts)
