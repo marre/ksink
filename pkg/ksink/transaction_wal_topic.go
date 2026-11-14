@@ -40,7 +40,7 @@ const maxTopicAcceptanceBatchRecords = 65536
 // Callers performing idempotent Kafka Produce must instead use
 // appendTopicBatchWithState to atomically persist producer sequence history.
 func (l *TransactionLog) AppendTopicBatch(records []WALTopicRecord) ([]int64, error) {
-	return l.appendTopicBatch(records, nil, nil)
+	return l.appendTopicBatch(records, nil, nil, nil)
 }
 
 // appendTopicBatchWithState couples topic records and their producer dedup /
@@ -49,7 +49,7 @@ func (l *TransactionLog) AppendTopicBatch(records []WALTopicRecord) ([]int64, er
 // The caller must still validate producer epoch and batch signatures.
 func (l *TransactionLog) appendTopicBatchWithState(records []WALTopicRecord, snapshot txnStateSnapshot) ([]int64, error) {
 	copied := cloneTxnStateSnapshot(snapshot)
-	return l.appendTopicBatch(records, &copied, nil)
+	return l.appendTopicBatch(records, &copied, nil, nil)
 }
 
 // appendTopicBatchFormattedWithState formats serialized output only AFTER
@@ -62,11 +62,25 @@ func (l *TransactionLog) appendTopicBatchFormattedWithState(records []WALTopicRe
 		return nil, fmt.Errorf("missing topic output formatter")
 	}
 	copied := cloneTxnStateSnapshot(snapshot)
-	return l.appendTopicBatch(records, &copied, format)
+	return l.appendTopicBatch(records, &copied, format, nil)
+}
+
+// appendTopicBatchFormattedWithStateBuilder allows the caller to bind the
+// producer-sequence snapshot to the authoritative offsets assigned while the
+// WAL mutex is held. This prevents stale offsets under concurrent producers.
+// Both callbacks must be bounded, deterministic, and must not re-enter WAL.
+func (l *TransactionLog) appendTopicBatchFormattedWithStateBuilder(records []WALTopicRecord,
+	format func(int, int64) ([]byte, error),
+	buildState func([]int64) (txnStateSnapshot, error)) ([]int64, error) {
+	if format == nil || buildState == nil {
+		return nil, fmt.Errorf("missing topic output formatter or producer snapshot builder")
+	}
+	return l.appendTopicBatch(records, nil, format, buildState)
 }
 
 func (l *TransactionLog) appendTopicBatch(records []WALTopicRecord, snapshot *txnStateSnapshot,
-	format func(int, int64) ([]byte, error)) ([]int64, error) {
+	format func(int, int64) ([]byte, error),
+	buildState func([]int64) (txnStateSnapshot, error)) ([]int64, error) {
 	if len(records) == 0 {
 		return nil, nil
 	}
@@ -81,20 +95,6 @@ func (l *TransactionLog) appendTopicBatch(records []WALTopicRecord, snapshot *tx
 	if l.binding == "" {
 		return nil, fmt.Errorf("WAL output writer is not bound")
 	}
-	if snapshot != nil {
-		if snapshot.Version != durableTxnStateVersion || snapshot.Counter <= 0 ||
-			len(snapshot.States) > maxTxnStates {
-			return nil, fmt.Errorf("invalid accepted producer state snapshot")
-		}
-		for id, old := range l.state.States {
-			nextState, exists := snapshot.States[id]
-			if !exists || old.ProducerID != nextState.ProducerID || old.Epoch != nextState.Epoch ||
-				old.Instance != nextState.Instance || old.Pending != nextState.Pending {
-				return nil, fmt.Errorf("accepted producer snapshot changed active identity %q", id)
-			}
-		}
-	}
-
 	next := make(map[string]int64)
 	changes := make([]transactionWALRecord, 0, len(records))
 	offsets := make([]int64, 0, len(records))
@@ -113,13 +113,7 @@ func (l *TransactionLog) appendTopicBatch(records []WALTopicRecord, snapshot *tx
 			if !found || !state.Active || state.Pending != "" || state.Instance != r.Instance {
 				return nil, fmt.Errorf("transaction %q is not an active WAL instance", r.TransactionID)
 			}
-			if snapshot != nil {
-				updated, ok := snapshot.States[r.TransactionID]
-				if !ok || updated.Instance != r.Instance || !updated.Active {
-					return nil, fmt.Errorf("accepted producer snapshot missing transaction %q", r.TransactionID)
-				}
-			}
-		}
+ 		}
 		offset, ok := next[r.Topic]
 		if !ok {
 			offset = l.topicNext[r.Topic]
@@ -137,6 +131,32 @@ func (l *TransactionLog) appendTopicBatch(records []WALTopicRecord, snapshot *tx
 		next[r.Topic] = offset + 1
 		offsets = append(offsets, offset)
 		changes = append(changes, transactionWALRecord{Type: "topic-output", TopicOutput: &r})
+	}
+	if buildState != nil {
+		built, err := buildState(append([]int64(nil), offsets...))
+		if err != nil { return nil, fmt.Errorf("prepare accepted producer state: %w", err) }
+		copied := cloneTxnStateSnapshot(built)
+		snapshot = &copied
+	}
+	if snapshot != nil {
+		if snapshot.Version != durableTxnStateVersion || snapshot.Counter <= 0 ||
+			len(snapshot.States) > maxTxnStates {
+			return nil, fmt.Errorf("invalid accepted producer state snapshot")
+		}
+		for id, old := range l.state.States {
+			nextState, exists := snapshot.States[id]
+			if !exists || old.ProducerID != nextState.ProducerID || old.Epoch != nextState.Epoch ||
+				old.Instance != nextState.Instance || old.Pending != nextState.Pending {
+				return nil, fmt.Errorf("accepted producer snapshot changed active identity %q", id)
+			}
+		}
+		for _, r := range records {
+			if r.TransactionID == "" { continue }
+			updated, ok := snapshot.States[r.TransactionID]
+			if !ok || updated.Instance != r.Instance || !updated.Active {
+				return nil, fmt.Errorf("accepted producer snapshot missing transaction %q", r.TransactionID)
+			}
+		}
 	}
 	// The acceptance delimiter is replayed only after all complete record
 	// frames have arrived. A crash before it discards the entire batch.
