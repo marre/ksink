@@ -205,7 +205,7 @@ func TestOrderedMaterializerDistinctTopicNamesOnCaseInsensitiveFilesystems(t *te
 }
 
 
-func TestOrderedMaterializerFailedTopicDoesNotSkipHealthyTopic(t *testing.T) {
+func TestOrderedMaterializerFailedTopicStopsPublicationImmediately(t *testing.T) {
 	root:=t.TempDir()
 	wal:=orderedTestLog(t)
 	w,err:=NewOrderedTopicMaterializer(wal,
@@ -222,12 +222,11 @@ func TestOrderedMaterializerFailedTopicDoesNotSkipHealthyTopic(t *testing.T) {
 	require.NoError(t,os.WriteFile(failed,[]byte("wrong\n"),0600))
 	n,err:=w.Publish(context.Background(),false)
 	require.ErrorContains(t,err,"a-failed")
-	require.Equal(t,1,n,"healthy topic must still publish in the same pass")
-	raw,readErr:=os.ReadFile(filepath.Join(root,"z-healthy","messages-00000001.jsonl"))
-	require.NoError(t,readErr)
-	require.Equal(t,"good\n",string(raw))
+	require.Zero(t,n,"fatal output failure must stop publication immediately")
+	_,readErr:=os.Stat(filepath.Join(root,"z-healthy","messages-00000001.jsonl"))
+	require.ErrorIs(t,readErr,os.ErrNotExist)
 	require.Equal(t,int64(0),wal.TopicProgress("a-failed").Cursor)
-	require.Equal(t,int64(1),wal.TopicProgress("z-healthy").Cursor)
+	require.Equal(t,int64(0),wal.TopicProgress("z-healthy").Cursor)
 }
 
 func TestOrderedMaterializerRunStopsOnOutputFailureAndRecoversAfterRestart(t *testing.T) {
@@ -249,14 +248,15 @@ func TestOrderedMaterializerRunStopsOnOutputFailureAndRecoversAfterRestart(t *te
 	err=w.Run(ctx)
 	require.ErrorContains(t,err,"a-blocked")
 	require.Equal(t,int64(0),wal.TopicProgress("a-blocked").Cursor)
-	require.Equal(t,int64(1),wal.TopicProgress("z-healthy").Cursor,
-		"healthy topic is still processed in the failing pass")
+	require.Equal(t,int64(0),wal.TopicProgress("z-healthy").Cursor,
+		"fatal failure must stop the pass before other topics")
 	require.NoError(t,os.Remove(blocked))
 	require.NoError(t,w.Flush(context.Background()))
 	raw,err:=os.ReadFile(blocked)
 	require.NoError(t,err)
 	require.Equal(t,"recover\n",string(raw))
 	require.Equal(t,uint64(2),wal.TopicProgress("a-blocked").NextFile)
+	require.Equal(t,int64(1),wal.TopicProgress("z-healthy").Cursor)
 }
 
 func TestOrderedMaterializerOversizedRecordAndRestartSequence(t *testing.T) {
