@@ -405,6 +405,11 @@ func (l *TransactionLog) apply(rec transactionWALRecord, frameOffset, frameBytes
 		if l.state.States == nil {
 			l.state.States = make(map[string]storedTxnState)
 		}
+		for id,st:=range l.state.Idempotent {
+			if id<=0 || id>l.state.Counter || st.Epoch<0 {
+				return fmt.Errorf("invalid idempotent producer %d in WAL state",id)
+			}
+		}
 		for id, st := range l.state.States {
 			if id == "" || st.ProducerID <= 0 || st.ProducerID > l.state.Counter ||
 				st.Epoch < 0 || (st.Pending != "" && st.Pending != "commit" && st.Pending != "abort") ||
@@ -706,11 +711,17 @@ func cloneTxnStateSnapshot(src txnStateSnapshot) txnStateSnapshot {
 	out := txnStateSnapshot{
 		Version: src.Version, Counter: src.Counter,
 		States: make(map[string]storedTxnState, len(src.States)),
+		Idempotent:make(map[int64]storedIdempotentProducer,len(src.Idempotent)),
 	}
 	for key, state := range src.States {
 		state.Sequences = copyTxnSequences(state.Sequences)
 		state.Topics = append([]string(nil), state.Topics...)
 		out.States[key] = state
+	}
+	for id,st:=range src.Idempotent {
+		out.Idempotent[id]=storedIdempotentProducer{
+			Epoch:st.Epoch,Sequences:copyTxnSequences(st.Sequences),
+		}
 	}
 	return out
 }

@@ -282,6 +282,7 @@ type Server struct {
 	// Transaction state tracking: maps transactional.id -> txnState
 	txnMu       sync.Mutex
 	txnStates   map[string]*txnState
+	idempotentStates map[int64]storedIdempotentProducer
 	txnLog      *TransactionLog
 	ownsTxnLog  bool
 	txnStoreErr error
@@ -313,6 +314,7 @@ func New(cfg Config, opts ...Option) (*Server, error) {
 		allowedTopics:   make(map[string]struct{}),
 		saslCredentials: make(map[string]map[string]string),
 		txnStates:       make(map[string]*txnState),
+		idempotentStates: make(map[int64]storedIdempotentProducer),
 		shutdownCh:      make(chan struct{}),
 		batchCh:         make(chan pendingBatch),
 		decompressor:    kgo.DefaultDecompressor(),

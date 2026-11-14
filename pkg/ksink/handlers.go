@@ -643,8 +643,9 @@ func (s *Server) handleInitProducerId(ctx context.Context, conn net.Conn, connID
 	}
 
 	// Non-transactional idempotent producers also draw from the same
-	// monotonically increasing ID space. Persist the counter when durable
-	// transaction state is enabled so IDs cannot be reused after a restart.
+	// monotonically increasing ID space. In ordered mode their producer
+	// epoch and dedup sequence history must be journaled alongside the ID,
+	// or a lost Produce response would silently duplicate final output.
 	s.txnMu.Lock()
 	if s.txnStoreErr != nil {
 		s.txnMu.Unlock()
@@ -653,6 +654,17 @@ func (s *Server) handleInitProducerId(ctx context.Context, conn net.Conn, connID
 		})
 	}
 	producerID := s.producerIDCounter.Add(1)
+	if s.orderedFormatter!=nil {
+		if len(s.idempotentStates)>=maxTxnStates {
+			s.txnMu.Unlock()
+			return s.sendResponse(conn,connID,correlationID,&kmsg.InitProducerIDResponse{
+				Version:apiVersion,ErrorCode:kerr.UnknownServerError.Code,ProducerID:-1,
+			})
+		}
+		s.idempotentStates[producerID]=storedIdempotentProducer{
+			Epoch:0,Sequences:make(map[string]txnPartitionSequence),
+		}
+	}
 	if err := s.persistTxnStateLocked(); err != nil {
 		s.txnMu.Unlock()
 		return s.sendResponse(conn, connID, correlationID, &kmsg.InitProducerIDResponse{

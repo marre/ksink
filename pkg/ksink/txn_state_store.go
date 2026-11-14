@@ -40,10 +40,19 @@ type storedTxnState struct {
 	Topics []string
 }
 
+// A nontransactional idempotent producer has no transactional.id, but still
+// needs durable batch-sequence history to deduplicate retries and preserve the
+// originally acknowledged Kafka base offsets.
+type storedIdempotentProducer struct {
+	Epoch int16
+	Sequences map[string]txnPartitionSequence
+}
+
 type txnStateSnapshot struct {
 	Version int
 	Counter int64
 	States  map[string]storedTxnState
+	Idempotent map[int64]storedIdempotentProducer
 }
 
 func txnSyncDirectory(dir string) error {
@@ -116,6 +125,7 @@ func (s *Server) txnSnapshotLocked() txnStateSnapshot {
 		Version: durableTxnStateVersion,
 		Counter: s.producerIDCounter.Load(),
 		States: make(map[string]storedTxnState, len(s.txnStates)),
+		Idempotent: make(map[int64]storedIdempotentProducer,len(s.idempotentStates)),
 	}
 	for id, st := range s.txnStates {
 		snapshot.States[id] = storedTxnState{
@@ -123,6 +133,11 @@ func (s *Server) txnSnapshotLocked() txnStateSnapshot {
 			HasOutcome: st.hasOutcome, LastCommit: st.lastCommit,
 			Pending: st.pendingAction, Instance: st.instance, Sequences: st.sequences,
 			Topics: append([]string(nil), st.topics...),
+		}
+	}
+	for id,st:=range s.idempotentStates {
+		snapshot.Idempotent[id]=storedIdempotentProducer{
+			Epoch:st.Epoch,Sequences:copyTxnSequences(st.Sequences),
 		}
 	}
 	return snapshot
@@ -180,6 +195,12 @@ func (s *Server) initializeTxnState() error {
 		}
 	}
 	s.producerIDCounter.Store(snapshot.Counter)
+	s.idempotentStates=make(map[int64]storedIdempotentProducer,len(snapshot.Idempotent))
+	for id,st:=range snapshot.Idempotent {
+		s.idempotentStates[id]=storedIdempotentProducer{
+			Epoch:st.Epoch,Sequences:copyTxnSequences(st.Sequences),
+		}
+	}
 	dirty := false
 	for id, old := range snapshot.States {
 		if old.Sequences == nil {
