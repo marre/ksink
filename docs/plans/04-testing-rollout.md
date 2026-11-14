@@ -21,8 +21,8 @@ Status: **test/release plan**, not completed. Prerequisite: [ordered materialize
 ## Fault injection boundary matrix
 
 - **Coordinator:** after participant enrollment, after record-set validation, before/after durable COMMIT/ABORT state, response lost, epoch fence, timeout abort and restart.
-- **Topic logs:** frame write, fsync, segment rotation before/after manifest rename, partial active tail, checksum failure in sealed segment, checkpoint/GC, corrupt required file, limit overflow.
-- **Cross-log:** one topic WAL fsynced and one not; missing participant file; prepared decision before coordinator fsync; committed coordinator with missing local marker/cache; replay different log recovery orders.
+- **Shared WAL / logical topic streams:** frame write, fsync, segment rotation before/after manifest rename, partial active tail, checksum failure in sealed segment, checkpoint/GC with one topic blocked and another published, corrupt required file, limit overflow.
+- **Cross-topic transaction:** records from several topics fsynced in one shared WAL, then commit decision fsync; crash before/after the decision; one topic published and another pending; replay consistently recognizes one authoritative decision.
 - **Materializer:** read lease vs WAL GC; temp file create, write, sync, close; rename, parent sync, cursor receipt; crash each boundary; topic writer blocked by storage errors while others proceed.
 - **Rotation:** size boundary, age boundary without new Produce, restart while active, shutdown flush, filename overflow, path collision, output rename conflict and output deletion after receipt.
 - **Corruption and operator errors:** missing manifest, unknown WAL/storage format, changed output path/formatter, swapped topic directories, checksum mismatch, unsupported filesystem, insufficient disk.
@@ -41,13 +41,13 @@ Every failpoint must assert one of two outcomes: the exact expected committed-on
 
 ## Documentation and compatibility gate
 
-- Update README with designed one-partition limit, **one WAL per topic + coordinator** as an internal storage model (if ultimately selected), committed-only semantics, cross-topic visibility caveat, and simple read-final-files example.
+- Update README with the designed one-partition limit, **one physical WAL with independent logical topic streams** as the storage model, committed-only semantics, cross-topic visibility caveat, and simple read-final-files example.
 - Replace examples referring to `committed/<txn-id>/` and old `{txnID}` patterns with `{topic}` and `{seq}` templates.
 - Document filenames and rotation defaults, atomic rename filesystem requirements, background publication/backpressure, WAL retention, recovery, failure states and output-directory deletion hazards.
 - Document compatibility: unmerged PR #52 old WAL version is intentionally incompatible; never silently reinitialize acknowledged previous state. Existing nontransactional backends unchanged.
 - Ensure no README/CLI claim suggests support for consumer group, Kafka Fetch API or global order across topics.
 - Confirm worktree diff and migration/removal checklist has no stale test/command/documentation references.
-- Independent correctness review of WAL GC, cross-topic two-phase commit barrier, publication cursor replay and directory path validation.
+- Independent correctness review of shared WAL GC, cross-topic single-decision durability, per-topic publication cursor replay and directory path validation.
 
 ## Delivery recommendation
 
