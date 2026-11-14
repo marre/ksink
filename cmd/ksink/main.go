@@ -106,8 +106,9 @@ kcat format specifiers (--output-format-string):
 		"Durable Kafka transaction state directory (default: .ksink-kafka-state under the transactional output root)")
 	rootCmd.Flags().StringVar(&dst, "output", "-",
 		`Output destination: "-" for stdout (default), file path, or http(s):// URL.
-The path may contain {topic} and/or {partition} to route messages to per-topic and/or per-partition files
+The path may contain {topic} to route messages to per-topic files
 (e.g. "{topic}.jsonl" produces "orders.jsonl", "events.jsonl", etc.).
+Only partition 0 exists for each topic; {partition} is not supported.
 With --transactional, must also contain {txnID}
 (e.g. "{topic}-{txnID}.jsonl" produces "orders-my-txn.jsonl").
 Topic names are sanitised to prevent path traversal.`)
