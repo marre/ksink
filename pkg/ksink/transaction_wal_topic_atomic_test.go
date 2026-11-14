@@ -3,6 +3,8 @@ package ksink
 import (
 	"fmt"
 	"os"
+	"errors"
+	"sync"
 	"path/filepath"
 	"testing"
 
@@ -373,5 +375,90 @@ func TestSharedWALCorruptAcceptedTopicPayloadFailsClosed(t *testing.T) {
 		require.Error(t,readErr,"corrupted acknowledged data must not be returned")
 		require.False(t,found)
 		require.Empty(t,rec.Data)
+	}
+}
+
+func TestSharedWALPostSyncFailurePoisonsOwnerAndRecoversAcceptedBatch(t *testing.T) {
+	root:=t.TempDir()
+	wal,err:=OpenTransactionLog(filepath.Join(root,"state"))
+	require.NoError(t,err)
+	require.NoError(t,wal.BindOutput(filepath.Join(root,"{topic}","messages-{seq:08}.jsonl")))
+	wal.faultHook=func(stage string)error {
+		if stage=="append:fsynced" {return errors.New("injected post-sync failure")}
+		return nil
+	}
+	_,err=wal.AppendTopicBatch([]WALTopicRecord{
+		{Topic:"orders",Data:[]byte("one")},
+		{Topic:"payments",Data:[]byte("two")},
+	})
+	require.ErrorContains(t,err,"injected post-sync failure")
+	_,err=wal.AppendTopicBatch([]WALTopicRecord{{Topic:"orders",Data:[]byte("must-not-append")}})
+	require.ErrorContains(t,err,"injected post-sync failure")
+	require.NoError(t,wal.Close())
+	reopened,err:=OpenTransactionLog(filepath.Join(root,"state"))
+	require.NoError(t,err)
+	defer func(){_ = reopened.Close()}()
+	// The fsync happened before the caller saw an error. Recovery must
+	// resolve this ambiguity from the durable acceptance delimiter.
+	for _,topic:=range []string{"orders","payments"} {
+		require.Equal(t,int64(1),reopened.NextTopicOffset(topic))
+		record,ok,readErr:=reopened.ReadTopicRecord(topic,0)
+		require.NoError(t,readErr)
+		require.True(t,ok)
+		if topic=="orders" {require.Equal(t,"one",string(record.Data))} else {
+			require.Equal(t,"two",string(record.Data))
+		}
+	}
+}
+
+func TestSharedWALConcurrentTopicAppendsAndCheckpointsPreserveOffsets(t *testing.T) {
+	root:=t.TempDir()
+	wal,err:=OpenTransactionLog(filepath.Join(root,"state"))
+	require.NoError(t,err)
+	require.NoError(t,wal.BindOutput(filepath.Join(root,"{topic}","messages-{seq:08}.jsonl")))
+	const writers=4
+	const perWriter=25
+	var wg sync.WaitGroup
+	errs:=make(chan error,writers+1)
+	for i:=0;i<writers;i++ {
+		topic:=fmt.Sprintf("topic-%d",i)
+		wg.Add(1)
+		go func(){
+			defer wg.Done()
+			for n:=0;n<perWriter;n++ {
+				offsets,appendErr:=wal.AppendTopicBatch([]WALTopicRecord{
+					{Topic:topic,Data:[]byte(fmt.Sprintf("%d",n))},
+				})
+				if appendErr!=nil {errs<-appendErr;return}
+				if len(offsets)!=1 || offsets[0]!=int64(n) {
+					errs<-fmt.Errorf("%s offset at %d: %v",topic,n,offsets)
+					return
+				}
+			}
+		}()
+	}
+	wg.Add(1)
+	go func(){
+		defer wg.Done()
+		for n:=0;n<8;n++ {
+			if compactErr:=wal.Compact();compactErr!=nil {errs<-compactErr;return}
+		}
+	}()
+	wg.Wait()
+	close(errs)
+	for e:=range errs {require.NoError(t,e)}
+	require.NoError(t,wal.Close())
+	reopened,err:=OpenTransactionLog(filepath.Join(root,"state"))
+	require.NoError(t,err)
+	defer func(){_ = reopened.Close()}()
+	for i:=0;i<writers;i++ {
+		topic:=fmt.Sprintf("topic-%d",i)
+		require.Equal(t,int64(perWriter),reopened.NextTopicOffset(topic))
+		for n:=0;n<perWriter;n++ {
+			record,ok,readErr:=reopened.ReadTopicRecord(topic,int64(n))
+			require.NoError(t,readErr)
+			require.True(t,ok)
+			require.Equal(t,fmt.Sprintf("%d",n),string(record.Data))
+		}
 	}
 }
