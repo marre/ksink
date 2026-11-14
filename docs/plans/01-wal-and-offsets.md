@@ -1,54 +1,65 @@
-# Phase 1: WAL gap closure and durable ordering
+# Phases 1–2: close WAL gaps and establish per-topic offsets
 
-Status: **implementation plan**; no functional changes in this document.
+Status: **plan, not implementation**. Working architecture: one durable data WAL for **partition 0 of each topic**, plus a shared durable transaction coordinator WAL. Keep the one-physical-WAL alternative under review (see [roadmap](00-ordered-output-roadmap.md)).
 
-## Observed gaps in current PR #52
+## Current code facts and risks in PR #52
 
-The current WAL has useful foundations: checksummed binary payload frames, fsynced batched appends, segmented manifest-backed storage, checkpoints and crash failpoints. Retain those.
+Strengths worth retaining: checksum-framed binary output payloads, segmented WAL and manifest, fsynced batched append, producer-epoch fencing, deterministic retry signatures, checkpointing and fault injection.
 
-1. **No authoritative record positions.** `pkg/ksink/handlers.go:parseRecords` obtains `Message.Offset` from a synthetic fetch decode; `ProduceResponseTopicPartition` does not assign a meaningful broker append offset. `WALOutputRecord` stores transaction ID, instance, destination path and formatted bytes, but no global position or topic offset.
-2. **Dedup state and records use different operations.** `handleProduce` delivers output, then snapshots producer sequences in another WAL operation. The redesigned flow must assign positions, persist accepted payloads and durable producer-sequence decisions as one logical atomic acknowledgement boundary.
-3. **Retention is tied to directory publication.** `TransactionLog.apply` discards output on `published`; the `state` replay path can discard older instance references when a producer starts a new generation. Neither rule is safe when a successful commit waits behind an unresolved earlier record.
-4. **Recovery is keyed to the latest producer state.** `RecoveryTransactions()` enumerates current `state.States`, not all committed-but-not-yet-emitted generations. The ordered writer needs persistent outcome/history independent of subsequent transactional.id reuse.
-5. **Streaming holds a global WAL lock for filesystem callbacks.** `StreamOutput` holds `TransactionLog.mu` while consuming every payload. The future publisher should not block incoming WAL appends during potentially slow disk writes.
-6. **Space and checkpoint behavior need reevaluation.** Current compaction and sealed-segment reclamation assume published output is obsolete. Unresolved old transactions can pin large spans of WAL; no measured backlog/backpressure policy or scaled benchmark exists for the new workload.
-7. **The WAL stores serialized output paths and bytes.** Output filenames will be assigned at materialization time and rotation can split records differently. WAL records must become filename-independent logical ordered data, while retaining deterministic formatted bytes and their format/configuration binding.
+1. **No authoritative topic offset assignment.** `Message.Offset` originates in `parseRecords` from a synthetic fetch decode. `ProduceResponseTopicPartition` does not contain a meaningful assigned base offset. Need per-topic partition-0 offsets durable before Produce acknowledgement.
+2. **Producer state and payload are written separately.** `handleProduce` first delivers to filesystem writer (WAL), then calls `persistTxnStateLocked()` to journal dedup sequences. The new append protocol must define crash/response-loss behavior atomically; a duplicate batch must not allocate offsets or append again.
+3. **Publisher-dependent GC.** A `published` record makes all transaction output frames obsolete. Coordinator checkpoint replay can discard older instance references on transactional.id reuse. Both are wrong when output is delayed behind earlier unresolved records: retain all unmaterialized committed generations.
+4. **Latest-instance-only recovery.** `RecoveryTransactions()` iterates current producer states, not arbitrary outstanding older generations with committed-but-unpublished data.
+5. **Output paths are coupled to WAL payloads.** `WALOutputRecord` has `Path` and formatted `Data`; per-topic file names and rotation must be materializer decisions, while the WAL records logical topic + offset + deterministic payload.
+6. **WAL read lock across file writes.** `StreamOutput` keeps a global WAL mutex through streaming callbacks; split readers or use safe segment leases/snapshots to avoid blocking Kafka Produce during slow output I/O.
+7. **Unresolved backlog pressure.** Large open transactions can pin sealed segments. Current 16 MiB/25% checkpoint triggers don't express per-topic lag, retained bytes or throttling.
+8. **Cross-log authority.** Separating topic WALs requires a single durable transaction decision and a recoverable, explicit participant list. Avoid optimistic per-topic commit markers that become partially visible after crashes.
 
-These are **design gaps / risks identified from code structure**, not all independently demonstrated data-loss bugs.
+## Proposed durable structure
 
-## Proposed WAL model
+```text
+state/
+  coordinator/manifest.json + segments, snapshots    # identities, epochs, participants, final txn decisions
+  topics/<sanitized-unique-topic-id>/
+    manifest.json + segments, snapshots               # topic records, offsets, producer batch dedup, cursor references
+```
 
-Each accepted application record carries:
+Topic storage must avoid collisions of sanitized names (use a reversible encoding or stable escaped ID and a durable original-name mapping). Each topic WAL has monotonically increasing **broker-assigned offset**, stored along with topic, transaction instance (or committed nontransactional batch), deterministic serialized bytes, producer sequence details and CRC. There is **no global record order**.
 
-- `globalSeq` (monotonic uint64 for ordering the one output stream);
-- `topic`, fixed `partition=0`, and a broker-assigned, monotonic **topic offset**;
-- `transactionInstance` or an explicitly committed nontransactional-batch identity;
-- serialized output bytes (or a fully specified deterministic payload representation), plus checksum;
-- durable producer ID/epoch and per-topic producer batch signatures required for dedup.
+Coordinator stores producer ID/epoch fencing, transaction instance and participant `{topic, durable end offset / batch IDs}`, and irreversible COMMIT/ABORT. Durable producer batch state can be topic-local, but the coordinator must validate ownership/fencing and retained participant generations.
 
-Use metadata frames for `txn-begin` / `txn-commit` / `txn-abort`, durable producer state and publication progress; preserve active/open records through checkpoints. If maintaining precise Kafka topic offsets, account for Kafka control-marker offset semantics separately from the global application-record sequence. Never conflate **Kafka producer sequence**, **topic offset**, **globalSeq**, or future **output file sequence**.
+## Required cross-log durability protocol
 
-## Implementation steps, in order
+1. **Transaction start/enrollment:** persist an immutable instance and registered topic(s) with coordinator authority before a topic can acknowledge its records as eligible for that transaction.
+2. **Produce:** validate producer/epoch and topic-local sequence; append records and their assigned offsets and dedup checkpoint **in one topic-WAL fsync barrier**. Return correct Kafka Produce base offset and retain it for identical retries.
+3. **Prepare/finalize commit:** stop new Produce for the instance, drain admitted requests, prove all touched topic WALs are fsynced and persist the complete participant/final-offset set. **Only then** fsync the **one global COMMIT decision** and acknowledge EndTxn. The Abort path uses an equally durable decision.
+4. **Materializer:** each topic independently scans its stable readable prefix, consulting coordinator decisions; it may publish only records with an authoritative COMMIT or implicit committed nontransactional status. An unresolved earlier offset blocks later offsets **only within that topic**. Aborted records are skipped.
+5. **Crash recovery:** load coordinator + all selected topic manifests. Fail closed on any missing acknowledged participant segment. Reconcile in-flight/enrollment, decided transactions and output cursors. Never infer that a missing topic log means an empty transaction.
 
-1. **Define vNext WAL schema and replay invariants.** Add explicit record/metadata types and version checks. Old unmerged WAL state must be refused rather than implicitly migrated. Define maximum frame/record limits, overflow behavior and invariant validation.
-2. **Allocate durable positions atomically with accepted record batches.** Under a serial WAL ordering boundary, reserve global sequence and topic offsets, produce deterministic formatted output, persist payload and dedup/next-offset checkpoint, fsync, then acknowledge Produce. Failed or duplicate batches must not gain fresh positions. Return correct base offsets in Produce responses.
-3. **Persist transaction outcomes by immutable instance.** Retain their first/last globalSeq, state and data references until all associated stream positions are durably published or skipped, even when a transactional ID is reused. Do not rely solely on `state.States` or on a `published` per-transaction marker.
-4. **Introduce durable materialization progress.** WAL stores an ordered output cursor and finalized-file records (`fileSeq`, globalSeq bounds, path, byte count/digest). Cursor advances **only after** the corresponding immutable file is durably finalized or a wholly aborted span is durably skipped.
-5. **Redesign replay/indexing and WAL reclamation.** Recover all pending decisions and indexed records, not just the latest producer generations. Keep any payload needed for unpublished output live. Deletion and compaction require a proof of non-liveness; checkpoint the cursor, decisions, producer state and all live record references together.
-6. **Bound memory and contention.** Stream by global position with bounded buffers/read leases or snapshot segment handles; prevent GC of leased segments without holding the write mutex throughout output I/O. Benchmark snapshot frequency and remove unnecessary O(all-producers) full state snapshots per Produce if material.
-7. **Define disk exhaustion and error response policy.** Expose backlog bytes/oldest unresolved globalSeq and a configurable fail-closed/backpressure limit; do not allow unbounded WAL growth while the ordered consumer is blocked.
+A process crash between topic WAL append and coordinator decision leaves no visible committed record; replay must not reuse that topic offset incorrectly. Repeated produce requests must have specified lost-response behavior. Avoid needing a second fsync for every Produce unless correctness requires it; if necessary, first define and benchmark the cost.
 
-## Acceptance tests / fault matrix
+## Implementation tasks (dependency order)
 
-- Two producers interleaved A/B/A; B commits first; replay and output remain globally 0/1/2 after A resolves.
-- Two accepted batches concurrent across topics; unique globalSeq, correct topic offsets, persisted across restart.
-- Exact duplicate retries and lost Produce acknowledgements do not add records or advance positions. Out-of-order/reused producer sequence rejected; compare with real franz-go clients.
-- Abort creates observable gaps but no emitted records. No gaps may appear from failed WAL appends that were nevertheless acknowledged.
-- Commit followed by transactional.id reuse **before publication** retains all earlier committed payloads across checkpoint and sealed-segment GC.
-- Crash after WAL fsync, before response; after checksum frame; during manifest rotation; during checkpoint and GC; corrupt sealed segment vs torn active tail.
-- Compaction with 1 GiB unpublished backlog, slow writer, concurrent ingestion; memory, lock hold time and disk usage measured.
-- Fail closed when acknowledged required WAL data disappears or next counters overflow; never reinitialize silently.
+1. **Schema and ownership:** versioned `CoordinatorState` / `TopicLog` records; validate topic names, unique paths, offsets, producer IDs and participant references. Explicitly reject the old PR #52 WAL v2/transaction directory format; no silent migration.
+2. **Topic append and offsets:** one topic WAL per active topic; durable offset assignment, accepted-record batch IDs, signatures and replay, with correct base-offset responses and no duplicate offset consumption. Confirm behavior for nontransactional records and Kafka control-marker offsets.
+3. **Participant fencing and decision barrier:** transaction coordination serialized with producer writes and topic enrollment, with COMMIT only after every participant log is durable. A decision must not depend on file output.
+4. **Replay and retention:** rebuild all outstanding generations and topic-offset ordered indexes; retain data through producer reuse; reject missing acknowledged data; safe segment GC respecting publisher progress.
+5. **Reader API / lock design:** bounded offset-ordered WAL iterators with safe segment lifetimes; keep slow materializer disk writes outside producer/WAL mutexes; measure fairness and blocked startup cases.
+6. **Backpressure and observability:** per-topic oldest unstable offset, end offset, emitted offset, blocked transaction, retained bytes and GC backlog, health/errors. Define disk-full policy and bounds.
+7. **Checkpoint optimization:** avoid copying unrelated large producer snapshots on every message if benchmarks show cost. Validate CRC, maximum-frame rules, snapshots and generation handling.
 
-## Exit criteria
+## Acceptance tests
 
-Ordering is durable at the Produce-ack boundary; all outstanding generations and decisions survive recovery/compaction; no record needed by the ordered publisher is reclaimed; correct producer and record positions can be reconstructed without reading any transaction output directory.
+- Multiple topics with independent offsets and independent stable boundaries.
+- A/B/A interleaving on one topic; B commits before A; outputs remain offset ordered after A resolves.
+- One transaction spans `orders` and `payments`; neither topic emits until the **single** coordinator COMMIT is durable; crash at each topic-fsync, coordinator-fsync and decision-response boundary.
+- Cross-topic transaction with one missing/corrupt participant WAL fails closed. No false commit and no data loss.
+- Exact retry after lost Produce response returns the same topic base offset, no extra records. Out-of-order producer sequence rejected.
+- Producer ID reused for new generation while older committed generation remains blocked; all older bytes still recover after checkpoint and GC.
+- Crash after manifest creation/rotation/checkpoint/fsync, partial active tail and corrupt sealed segment; deletion guard holds for every topic WAL.
+- Large backlog, many topics and concurrent materialization with bounded memory, fair locks and measured fsync rates.
+- No code path holds a topic-WAL lock across callback I/O to final output files.
+
+## Gate
+
+Move on only when the topic logs and coordinator can replay a fully accepted multi-topic transaction and producer dedup/offset history **without touching transaction output directories**. CI build, vet, race and lint must pass; fault-injection tests must cover both coordinator and topic journals.
