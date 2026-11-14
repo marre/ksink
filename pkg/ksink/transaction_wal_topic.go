@@ -52,6 +52,15 @@ func (l *TransactionLog) appendTopicBatchWithState(records []WALTopicRecord, sna
 	return l.appendTopicBatch(records, &copied, nil, nil)
 }
 
+// appendTopicBatchFormatted uses the same offset-aware formatting boundary
+// for immediately committed nontransactional messages. No producer checkpoint
+// is required by this method.
+func (l *TransactionLog) appendTopicBatchFormatted(records []WALTopicRecord,
+	format func(int, int64) ([]byte, error)) ([]int64, error) {
+	if format == nil { return nil, fmt.Errorf("missing topic output formatter") }
+	return l.appendTopicBatch(records, nil, format, nil)
+}
+
 // appendTopicBatchFormattedWithState formats serialized output only AFTER
 // assigning authoritative per-topic offsets, but BEFORE WAL persistence.
 // The formatter must be deterministic, bounded and must not call this WAL.
