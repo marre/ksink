@@ -13,7 +13,10 @@ import (
 const (
 	walMetadataTag byte = 1
 	walOutputTag byte = 2
+	walTopicOutputTag byte = 3
 	walOutputHeaderBytes = 1 + 4 + 2 + 4 + 4
+	// tag + txnID len + instance len + topic len + topic offset + data len
+	walTopicOutputHeaderBytes = 1 + 4 + 2 + 4 + 8 + 4
 )
 
 // encodeTxnWALRecord stores output bytes without JSON/base64 expansion.
@@ -21,6 +24,29 @@ const (
 // length and CRC32C envelope is identical for both types of record.
 func encodeTxnWALRecord(rec transactionWALRecord) ([]byte, error) {
 	rec.Version = transactionWALVersion
+	if rec.Type == "topic-output" {
+		if rec.TopicOutput == nil { return nil, errors.New("missing topic WAL output") }
+		o := rec.TopicOutput
+		if len(o.TransactionID) > 1<<20 || len(o.Instance) > 65535 || len(o.Topic) > 249 {
+			return nil, errors.New("topic WAL identity too long")
+		}
+		total := uint64(walTopicOutputHeaderBytes) + uint64(len(o.TransactionID)) +
+			uint64(len(o.Instance)) + uint64(len(o.Topic)) + uint64(len(o.Data))
+		if total > transactionWALMaxFrame { return nil, fmt.Errorf("topic WAL output exceeds %d bytes", transactionWALMaxFrame) }
+		out := make([]byte, int(total))
+		out[0] = walTopicOutputTag
+		binary.BigEndian.PutUint32(out[1:5], uint32(len(o.TransactionID)))
+		binary.BigEndian.PutUint16(out[5:7], uint16(len(o.Instance)))
+		binary.BigEndian.PutUint32(out[7:11], uint32(len(o.Topic)))
+		binary.BigEndian.PutUint64(out[11:19], uint64(o.Offset))
+		binary.BigEndian.PutUint32(out[19:23], uint32(len(o.Data)))
+		pos := walTopicOutputHeaderBytes
+		for _, field := range []string{o.TransactionID, o.Instance, o.Topic} {
+			pos += copy(out[pos:], field)
+		}
+		copy(out[pos:], o.Data)
+		return out, nil
+	}
 	if rec.Type != "output" {
 		jsonBytes, err := json.Marshal(rec)
 		if err != nil { return nil, err }
@@ -62,6 +88,25 @@ func decodeTxnWALRecord(raw []byte) (transactionWALRecord, error) {
 		if rec.Type=="output" { return rec, errors.New("WAL output must be binary") }
 		if rec.Version != transactionWALVersion { return rec, fmt.Errorf("unknown WAL version %d", rec.Version) }
 		return rec, nil
+	}
+	if raw[0] == walTopicOutputTag {
+		if len(raw) < walTopicOutputHeaderBytes { return transactionWALRecord{}, errors.New("truncated binary topic WAL header") }
+		idLen := binary.BigEndian.Uint32(raw[1:5])
+		instanceLen := uint32(binary.BigEndian.Uint16(raw[5:7]))
+		topicLen := binary.BigEndian.Uint32(raw[7:11])
+		offset := binary.BigEndian.Uint64(raw[11:19])
+		payloadLen := binary.BigEndian.Uint32(raw[19:23])
+		total := uint64(walTopicOutputHeaderBytes) + uint64(idLen)+uint64(instanceLen)+uint64(topicLen)+uint64(payloadLen)
+		if total!=uint64(len(raw)) || idLen>(1<<20) || topicLen>249 || offset>uint64(1<<63-1) {
+			return transactionWALRecord{}, errors.New("invalid binary topic WAL field lengths or offset")
+		}
+		pos := walTopicOutputHeaderBytes
+		id := string(raw[pos:pos+int(idLen)]); pos+=int(idLen)
+		instance := string(raw[pos:pos+int(instanceLen)]); pos+=int(instanceLen)
+		topic := string(raw[pos:pos+int(topicLen)]); pos+=int(topicLen)
+		return transactionWALRecord{Version:transactionWALVersion, Type:"topic-output", TopicOutput:&WALTopicRecord{
+			Topic:topic, Offset:int64(offset), TransactionID:id, Instance:instance, Data:raw[pos:],
+		}}, nil
 	}
 	if raw[0] != walOutputTag { return transactionWALRecord{}, fmt.Errorf("unknown WAL tag %d", raw[0]) }
 	if len(raw) < walOutputHeaderBytes { return transactionWALRecord{}, errors.New("truncated binary WAL header") }
