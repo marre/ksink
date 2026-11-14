@@ -359,6 +359,7 @@ func (w *OrderedTopicMaterializer) Run(ctx context.Context) error {
 	defer ticker.Stop()
 	for {
 		if ctx.Err()!=nil{return nil}
+		if err:=w.wal.FatalError();err!=nil {return fmt.Errorf("ordered WAL permanently failed: %w",err)}
 		if _,err:=w.Publish(ctx,false);err!=nil {
 			if ctx.Err()!=nil{return nil}
 			return fmt.Errorf("ordered output publication failed: %w",err)
