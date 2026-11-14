@@ -266,7 +266,6 @@ func (w *OrderedTopicMaterializer) verifyExisting(ctx context.Context,topic stri
 	if err!=nil{return 0,0,err}
 	defer f.Close() //nolint:errcheck
 	var total int64
-	var end=start
 	for pos:=start;pos<stable;pos++ {
 		if err:=ctx.Err();err!=nil{return 0,0,err}
 		record,found,readErr:=w.wal.ReadTopicRecord(topic,pos)
@@ -280,8 +279,7 @@ func (w *OrderedTopicMaterializer) verifyExisting(ctx context.Context,topic stri
 			if !bytes.Equal(got,record.Data){return 0,0,fmt.Errorf("existing finalized file %q has mismatched bytes",path)}
 			total+=int64(len(record.Data))
 		}
-		end=pos+1
-		if total==expected {return end,total,nil}
+		if total==expected {return pos+1,total,nil}
 	}
 	return 0,0,fmt.Errorf("existing finalized file %q has unexpected length",path)
 }

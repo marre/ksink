@@ -170,10 +170,6 @@ Topic names are encoded to prevent collisions and path traversal.`)
 	}
 }
 
-func run(addr, dst, fmtName, fmtStr string, jsonB64Key, jsonB64Val bool, separator, sepHex string, noSeparator, transactional bool, stateDir string, tOpts output.TLSOpts, httpOpts output.HTTPOpts) error {
-	return runWithRotation(addr,dst,fmtName,fmtStr,jsonB64Key,jsonB64Val,separator,sepHex,noSeparator,transactional,stateDir,tOpts,httpOpts,128<<20,time.Minute)
-}
-
 func runWithRotation(addr, dst, fmtName, fmtStr string, jsonB64Key, jsonB64Val bool, separator, sepHex string, noSeparator, transactional bool, stateDir string, tOpts output.TLSOpts, httpOpts output.HTTPOpts, rotateSize int64, rotateInterval time.Duration) error {
 	var sep []byte
 	if fmtName == "binary" {
