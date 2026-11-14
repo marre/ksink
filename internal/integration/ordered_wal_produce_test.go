@@ -24,7 +24,8 @@ func TestOrderedWALKafkaProducerWritesTopicOffsetsAndCommitsWithoutFileOutput(t 
 		return []byte(fmt.Sprintf("%s/%d: %s\n", msg.Topic, msg.Offset, msg.Value)), nil
 	}
 	srv, err := ksink.New(ksink.Config{
-		Address: "127.0.0.1:0", TransactionalWrite: true, Timeout: 5 * time.Second,
+		Address: fmt.Sprintf("127.0.0.1:%d", getFreePort(t)),
+		TransactionalWrite: true, Timeout: 5 * time.Second,
 	}, ksink.WithTransactionLog(wal), ksink.WithOrderedTransactionalOutput(formatter),
 		ksink.WithLogger(&integrationLogger{t}))
 	require.NoError(t, err)
@@ -72,7 +73,8 @@ func TestOrderedWALKafkaProducerWritesTopicOffsetsAndCommitsWithoutFileOutput(t 
 	// A durable Kafka EndTxn has succeeded even though no output files have
 	// been materialized; recovery cannot mistake it for an open transaction.
 	restarted, err := ksink.New(ksink.Config{
-		Address: "127.0.0.1:0", TransactionalWrite: true,
+		Address: fmt.Sprintf("127.0.0.1:%d", getFreePort(t)),
+		TransactionalWrite: true,
 	}, ksink.WithTransactionLog(reopened), ksink.WithOrderedTransactionalOutput(formatter),
 		ksink.WithLogger(&integrationLogger{t}))
 	require.NoError(t, err)
