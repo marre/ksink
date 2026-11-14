@@ -117,6 +117,7 @@ func TestOrderedWALReclaimsDecisionOnlyAfterAllTopicsAdvance(t *testing.T) {
 	// reference. The old decision must still be available to both topics.
 	next:=sendInitProducerID(t,conn,5,&txnID,30000)
 	require.Zero(t,next.ErrorCode)
+	sendAddPartitionsToTxn(t,conn,6,txnID,next.ProducerID,next.ProducerEpoch,"orders")
 	require.NoError(t,wal.SkipTopicOffsets("orders",2))
 	require.Equal(t,"abort",wal.TopicTransactionDecision(instance))
 	require.NoError(t,wal.SkipTopicOffsets("payments",2))
