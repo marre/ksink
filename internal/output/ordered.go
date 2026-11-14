@@ -72,8 +72,9 @@ func NewOrderedTopicMaterializer(wal *ksink.TransactionLog, pattern string,
 		return nil,errors.New("ordered output pattern must be ROOT/{topic}/FILE-{seq:NN}")
 	}
 	start:=strings.Index(after,"{seq:")
+	if start<0 {return nil,errors.New("ordered output sequence placeholder must be in the filename")}
 	stop:=strings.Index(after[start:],"}")
-	if start<0 || stop<0 {return nil,errors.New("invalid ordered output sequence placeholder")}
+	if stop<0 {return nil,errors.New("invalid ordered output sequence placeholder")}
 	stop+=start
 	spec:=after[start+5:stop]
 	width,err:=strconv.Atoi(spec)
