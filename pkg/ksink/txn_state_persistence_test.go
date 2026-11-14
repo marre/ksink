@@ -28,7 +28,7 @@ func recordBatchForSequence(pid int64, epoch int16, base, count int32, discrimin
 
 func TestTxnSequenceDedupAcrossTransactions(t *testing.T) {
 	state := make(map[string]txnPartitionSequence)
-	key := txnSequenceKey("orders", 3)
+	key := txnSequenceKey("orders", 0)
 	first := recordBatchForSequence(99, 2, 0, 2, 0)
 	second := recordBatchForSequence(99, 2, 2, 3, 0)
 	bad := recordBatchForSequence(99, 2, 1, 1, 0)
@@ -54,10 +54,12 @@ func TestTxnSequenceDedupAcrossTransactions(t *testing.T) {
 	_, code = acceptTxnBatches(recordBatchForSequence(99, 2, 5, 0, 0), key, state)
 	require.Equal(t, kerr.CorruptMessage.Code, code)
 
-	otherPartition := txnSequenceKey("orders", 4)
-	data, code = acceptTxnBatches(first, otherPartition, state)
+	// With only partition 0 per topic, independent topics still maintain
+	// separate producer sequence histories.
+	otherTopic := txnSequenceKey("payments", 0)
+	data, code = acceptTxnBatches(first, otherTopic, state)
 	require.Zero(t, code)
-	require.Equal(t, first, data, "sequences are per partition")
+	require.Equal(t, first, data, "sequences are independent for each topic")
 }
 
 func TestTxnSequencesMixedRetryAndNewBatch(t *testing.T) {
