@@ -1,6 +1,6 @@
 # Ordered committed output: architecture and dependency roadmap
 
-Status: **proposal / implementation planning** for `marre/ksink` PR #52. No implementation implied by this document.
+Status: **implementation roadmap for PR #52**. Core architecture is implemented; outstanding release work is tracked in [04](04-testing-rollout.md).
 
 ## Architecture chosen for planning
 
@@ -65,7 +65,7 @@ The output filenames are sorted **within one topic**, not across topics. `{seq}`
 3. At most one partition per topic. All records from a topic are read from completed files in ascending topic-offset order, with legitimate gaps for control/aborted records.
 4. File finalization and publication-cursor updates survive crashes without reusing a **durably receipted** filename. The writer must reconcile a final file after a crash but before its WAL receipt. A reader deleting that file in this window makes the outcome indistinguishable from no publication: end-to-end exactly-once external effects require a reader checkpoint/handshake, not just WAL durability.
 5. Shared WAL payloads stay live through compaction and GC until their output is provably and durably finalized; producer ID reuse must not destroy pending older generations.
-6. Slow materialization and unresolved transactions have bounded, observable backlog and an explicit backpressure/fail-closed policy.
+6. WAL or output write failures terminate the process with nonzero status; acknowledged WAL records recover on restart. Metrics, bounded-backlog admission control and backpressure are explicitly out of scope.
 7. Existing acknowledged state is never silently reset. Changes in output pattern, codec version or directory layout cannot change replay interpretation.
 
 ## Resolved architecture decision
@@ -79,3 +79,10 @@ See [01](01-wal-and-offsets.md) through [04](04-testing-rollout.md) for detailed
 ## Design validation checkpoint — November 14, 2026
 
 The intended single shared WAL remains appropriate. Implemented incrementally on PR #52: durable sorted participant enrollment, checksummed single-frame multi-topic transaction terminal decisions (including one Kafka control-marker offset per enrolled topic), independent topic stable offsets, replay-aware offsets/deduplication, WAL v4 format rejection of older manifests, and durable per-topic publication receipts with monotonic file numbers. The ordered filesystem materializer, per-topic retention/GC, idempotent nontransactional producer support, and size/time rotation are now implemented and under regression verification. Serialization settings are bound to the WAL to avoid mixed-format output after restart. Fault-injection and review coverage remain in progress. The PR intentionally remains draft.
+
+
+## Revised operating policy (November 2026)
+
+- **Fatal I/O:** any WAL or output write/sync/finalization failure must cause nonzero process termination; never acknowledge undurable data. Restart replays durable WAL and reconciles immutable output receipts. This policy is a requirement, not proof that all current code paths already enforce it.
+- **No metrics or backpressure feature:** no metrics endpoint, per-topic health metrics, configured disk budget or bounded-backlog admission control is required. Disk exhaustion is a fatal I/O failure.
+- **Rotation restart:** a process crash or restart may reset a pending in-memory time-rotation interval. Durable topic offsets, output cursors and file sequence numbers must not reset.
