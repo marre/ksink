@@ -311,11 +311,11 @@ absolute per-topic next-offset counters so an old completed file cannot
 cause offset or filename reuse after recovery. Pending records remain live
 in the WAL, including when another topic is blocked.
 
-The current transaction WAL format is **v3** with manifest **v2**. **No
+The current transaction WAL format is **v4** with manifest **v3**. **No
 migration or backwards compatibility is provided** for older/unmerged
 transaction WALs or old `committed/<txnID>` directories. Start a new
 state/output directory when switching to this layout. An unsupported WAL
-manifest fails startup rather than resetting acknowledged history.
+manifest fails startup rather than resetting acknowledged history. The WAL also binds the output serialization settings; changing `--output-format`, its formatting options, or the binary delimiter with the same WAL is rejected. Size and interval rotation settings may change.
 
 #### Intentional limitations
 
