@@ -230,7 +230,7 @@ func TestOrderedMaterializerFailedTopicDoesNotSkipHealthyTopic(t *testing.T) {
 	require.Equal(t,int64(1),wal.TopicProgress("z-healthy").Cursor)
 }
 
-func TestOrderedMaterializerRunRetriesFailedTopicWithoutLosingHealthyTopic(t *testing.T) {
+func TestOrderedMaterializerRunStopsOnOutputFailureAndRecoversAfterRestart(t *testing.T) {
 	root:=t.TempDir()
 	wal:=orderedTestLog(t)
 	w,err:=NewOrderedTopicMaterializer(wal,
@@ -244,28 +244,19 @@ func TestOrderedMaterializerRunRetriesFailedTopicWithoutLosingHealthyTopic(t *te
 	blocked:=filepath.Join(root,"a-blocked","messages-00000001.jsonl")
 	require.NoError(t,os.MkdirAll(filepath.Dir(blocked),0700))
 	require.NoError(t,os.WriteFile(blocked,[]byte("conflict\n"),0600))
-	ctx,cancel:=context.WithCancel(context.Background())
-	done:=make(chan error,1)
-	go func(){done<-w.Run(ctx)}()
-	t.Cleanup(func(){cancel();require.NoError(t,<-done)})
-	require.Eventually(t,func()bool{
-		return wal.TopicProgress("z-healthy").Cursor==1 &&
-			w.TopicFailures()["a-blocked"]!=nil
-	},3*time.Second,20*time.Millisecond)
-	select {
-	case runErr:=<-done:
-		t.Fatalf("worker exited on a single topic failure: %v",runErr)
-	default:
-	}
+	ctx,cancel:=context.WithTimeout(context.Background(),3*time.Second)
+	defer cancel()
+	err=w.Run(ctx)
+	require.ErrorContains(t,err,"a-blocked")
 	require.Equal(t,int64(0),wal.TopicProgress("a-blocked").Cursor)
+	require.Equal(t,int64(1),wal.TopicProgress("z-healthy").Cursor,
+		"healthy topic is still processed in the failing pass")
 	require.NoError(t,os.Remove(blocked))
-	require.Eventually(t,func()bool{
-		return wal.TopicProgress("a-blocked").Cursor==1 &&
-			len(w.TopicFailures())==0
-	},5*time.Second,20*time.Millisecond)
+	require.NoError(t,w.Flush(context.Background()))
 	raw,err:=os.ReadFile(blocked)
 	require.NoError(t,err)
 	require.Equal(t,"recover\n",string(raw))
+	require.Equal(t,uint64(2),wal.TopicProgress("a-blocked").NextFile)
 }
 
 func TestOrderedMaterializerOversizedRecordAndRestartSequence(t *testing.T) {
