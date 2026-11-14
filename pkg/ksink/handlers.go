@@ -535,7 +535,12 @@ func (s *Server) handleInitProducerId(ctx context.Context, conn net.Conn, connID
 				}
 				instance := existing.instance
 				s.txnMu.Unlock()
-				err := s.deliverEvent(ctx, &TxnAbortEvent{TransactionalID: txnID, TransactionInstance: instance})
+				var err error
+				if s.orderedFormatter == nil {
+					err = s.deliverEvent(ctx, &TxnAbortEvent{TransactionalID: txnID, TransactionInstance: instance})
+				}
+				// The ordered WAL's durable abort decision is sufficient
+				// for zombie fencing. File publication is asynchronous.
 				s.txnMu.Lock()
 				existing.ending = false
 				if err != nil {
