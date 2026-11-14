@@ -136,3 +136,41 @@ func TestSharedWALCheckpointReplayChunksLargeTopicStream(t *testing.T) {
 		require.Equal(t, fmt.Sprintf("message-%04d", index), string(record.Data))
 	}
 }
+
+func TestSharedWALFormatsAfterOffsetAssignmentWithoutConsumingFailedOffsets(t *testing.T) {
+	root := t.TempDir()
+	wal, instance := testOpenWALWithActiveTransaction(t, root)
+	defer func() { _ = wal.Close() }()
+	state := wal.CurrentState()
+	st := state.States["orders-producer"]
+	st.Sequences = map[string]txnPartitionSequence{
+		txnSequenceKey("orders", 0): {Next: 2},
+	}
+	state.States["orders-producer"] = st
+	records := []WALTopicRecord{
+		{Topic: "orders", TransactionID: "orders-producer", Instance: instance},
+		{Topic: "orders", TransactionID: "orders-producer", Instance: instance},
+	}
+	_, err := wal.appendTopicBatchFormattedWithState(records, state, func(i int, offset int64) ([]byte, error) {
+		if i == 1 { return nil, fmt.Errorf("format failed") }
+		return []byte(fmt.Sprintf("%d", offset)), nil
+	})
+	require.ErrorContains(t, err, "format failed")
+	require.Zero(t, wal.NextTopicOffset("orders"))
+	require.Empty(t, wal.CurrentState().States["orders-producer"].Sequences,
+		"format failure cannot checkpoint producer sequence state")
+
+	offsets, err := wal.appendTopicBatchFormattedWithState(records, state,
+		func(i int, offset int64) ([]byte, error) {
+			return []byte(fmt.Sprintf("record-%d-offset-%d", i, offset)), nil
+		})
+	require.NoError(t, err)
+	require.Equal(t, []int64{0, 1}, offsets)
+	require.Equal(t, int32(2), wal.CurrentState().States["orders-producer"].Sequences[txnSequenceKey("orders", 0)].Next)
+	for i := range records {
+		got, exists, readErr := wal.ReadTopicRecord("orders", int64(i))
+		require.NoError(t, readErr)
+		require.True(t, exists)
+		require.Equal(t, fmt.Sprintf("record-%d-offset-%d", i, i), string(got.Data))
+	}
+}
