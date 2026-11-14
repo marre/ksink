@@ -104,14 +104,16 @@ func NewOrderedTopicMaterializer(wal *ksink.TransactionLog, pattern string,
 }
 
 // topicName maps arbitrary topic bytes to a unique, safe directory component.
-// Ordinary alphanumeric names stay readable; all other bytes use %HH escaping.
+// Lowercase ASCII names stay readable; uppercase and all other bytes use
+// %HH escaping. This is injective even on case-insensitive filesystems:
+// "Orders" and "orders" must NEVER share a physical topic directory.
 // Dots (including "." and "..") cannot become traversal components.
 func orderedTopicName(topic string) string {
 	var b strings.Builder
 	const digits="0123456789ABCDEF"
 	for _,c:=range []byte(topic) {
-		if (c>='A'&&c<='Z') || (c>='a'&&c<='z') ||
-			(c>='0'&&c<='9') || c=='-' || c=='_' {
+		if (c>='a'&&c<='z') || (c>='0'&&c<='9') ||
+			c=='-' || c=='_' {
 			b.WriteByte(c)
 		} else {
 			b.WriteByte('%');b.WriteByte(digits[c>>4]);b.WriteByte(digits[c&15])

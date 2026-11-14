@@ -146,6 +146,11 @@ func TestOrderedMaterializerRejectsSymlinkAndInvalidTemplates(t *testing.T) {
 	require.NotContains(t,safe,"/")
 	require.NotEqual(t,orderedTopicName("a%b"),safe)
 	require.NotEqual(t,orderedTopicName(".."),"..")
+	require.Equal(t,"orders",orderedTopicName("orders"))
+	require.Equal(t,"%4Frders",orderedTopicName("Orders"),
+		"uppercase topic bytes must be escaped to avoid case-insensitive collisions")
+	require.NotEqual(t,strings.ToLower(orderedTopicName("Orders")),
+		strings.ToLower(orderedTopicName("orders")))
 }
 
 func TestOrderedMaterializerHashReceiptAndNoOverwrite(t *testing.T) {

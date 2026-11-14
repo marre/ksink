@@ -247,8 +247,8 @@ With no explicit `--output-format`, transactional CLI output uses **JSONL**
 (nontransactional output still defaults to binary). The required `{topic}`
 placeholder occupies one directory component, and `{seq:08}` supplies a
 zero-padded **per-topic file number**, not the Kafka offset. Supported sequence
-widths are 6–20. Topic names are encoded injectively, so distinct names never
-share an output directory.
+widths are 6–20. Topic names are encoded injectively (including escaping uppercase bytes), so
+distinct names do not collide even on case-insensitive filesystems.
 
 The first rotation condition wins. `--rotate-size` is a target size; a
 single record can exceed it, but a record is never split. A nonempty,
