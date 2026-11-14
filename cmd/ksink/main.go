@@ -118,7 +118,7 @@ kcat format specifiers (--output-format-string):
 				if strings.HasPrefix(f.Name,"output-s3-") {changedS3=true}
 			})
 			if changedS3 && (!transactional || !strings.HasPrefix(dst,"s3://")) {
-				return fmt.Errorf("--output-s3-* flags require --transactional --output s3://...")
+				return fmt.Errorf("S3 flags require --transactional with an s3:// output destination")
 			}
 			return runWithRotationS3(addr, dst, fmtName, fmtStr, jsonB64Key, jsonB64Val, separator, sepHex, noSeparator, transactional, stateDir, tOpts, httpOpts, size, rotateInterval, s3Opts)
 		},
@@ -192,10 +192,6 @@ Topic names are encoded to prevent collisions and path traversal.`)
 	if err := rootCmd.Execute(); err != nil {
 		os.Exit(1)
 	}
-}
-
-func runWithRotation(addr, dst, fmtName, fmtStr string, jsonB64Key, jsonB64Val bool, separator, sepHex string, noSeparator, transactional bool, stateDir string, tOpts output.TLSOpts, httpOpts output.HTTPOpts, rotateSize int64, rotateInterval time.Duration) error {
-	return runWithRotationS3(addr,dst,fmtName,fmtStr,jsonB64Key,jsonB64Val,separator,sepHex,noSeparator,transactional,stateDir,tOpts,httpOpts,rotateSize,rotateInterval,output.S3OrderedOpts{})
 }
 
 func runWithRotationS3(addr, dst, fmtName, fmtStr string, jsonB64Key, jsonB64Val bool, separator, sepHex string, noSeparator, transactional bool, stateDir string, tOpts output.TLSOpts, httpOpts output.HTTPOpts, rotateSize int64, rotateInterval time.Duration,s3Opts output.S3OrderedOpts) error {
