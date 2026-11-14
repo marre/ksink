@@ -207,6 +207,10 @@ func (s *Server) handleProduce(ctx context.Context, conn net.Conn, connID uint64
 	// First pass: parse all records and track per-partition status
 	type partResult struct {
 		errCode int16
+		first int
+		count int
+		accepted []byte
+		baseOffset int64
 	}
 	type partKey struct {
 		topicIdx, partIdx int
@@ -244,7 +248,16 @@ func (s *Server) handleProduce(ctx context.Context, conn net.Conn, connID uint64
 					continue
 				}
 				if len(recordBatches) == 0 {
-					results[key] = partResult{} // acknowledged exact duplicate
+					// An exact retransmission must keep its ORIGINAL Kafka
+					// base offset, not return a new append position.
+					result := partResult{baseOffset: -1}
+					if s.orderedFormatter != nil {
+						if offset, ok := txnBatchFirstOffset(partData.Records,
+							txnProduceState.sequences[txnSequenceKey(topicData.Topic, partData.Partition)]); ok {
+							result.baseOffset = offset
+						}
+					}
+					results[key] = result
 					continue
 				}
 			}
@@ -256,7 +269,15 @@ func (s *Server) handleProduce(ctx context.Context, conn net.Conn, connID uint64
 				continue
 			}
 
-			results[key] = partResult{}
+			result := partResult{first: len(allMsgs), count: len(batch),
+				accepted: recordBatches, baseOffset: -1}
+			if s.orderedFormatter != nil && txnProduceState != nil {
+				if offset, ok := txnBatchFirstOffset(partData.Records,
+					txnProduceState.sequences[txnSequenceKey(topicData.Topic, partData.Partition)]); ok {
+					result.baseOffset = offset
+				}
+			}
+			results[key] = result
 			if txnProduceState != nil && candidate != nil {
 				proposedSequences = candidate
 				sequenceChanged = true
@@ -271,10 +292,73 @@ func (s *Server) handleProduce(ctx context.Context, conn net.Conn, connID uint64
 		}
 	}
 
-	// Deliver batch via channel and wait for ack
+	// In ordered-output mode, the WAL itself is the durable sink. It must
+	// assign offsets BEFORE the formatter runs and must checkpoint producer
+	// sequences inside the SAME acceptance frame as the payloads.
 	var handlerErr error
 	if len(allMsgs) > 0 {
-		handlerErr = s.deliverEvent(ctx, &MessagesEvent{Messages: allMsgs})
+		if s.orderedFormatter != nil {
+			records := make([]WALTopicRecord, 0, len(allMsgs))
+			for _, msg := range allMsgs {
+				records = append(records, WALTopicRecord{
+					Topic: msg.Topic, TransactionID: msg.TransactionalID,
+					Instance: msg.TransactionInstance,
+				})
+			}
+			encode := func(i int, offset int64) ([]byte, error) {
+				allMsgs[i].Offset = offset
+				return s.orderedFormatter(allMsgs[i])
+			}
+			var offsets []int64
+			if txnProduceState != nil {
+				// Serialize state snapshot preparation with all producer
+				// generations while WAL assigns offsets and fsyncs.
+				s.txnMu.Lock()
+				if s.txnStoreErr != nil {
+					handlerErr = s.txnStoreErr
+				} else {
+					var updatedSequences map[string]txnPartitionSequence
+					offsets, handlerErr = s.txnLog.appendTopicBatchFormattedWithStateBuilder(
+						records, encode, func(assigned []int64) (txnStateSnapshot, error) {
+							updatedSequences = copyTxnSequences(proposedSequences)
+							for ti, topicData := range req.Topics {
+								for pi, partData := range topicData.Partitions {
+									result := results[partKey{ti, pi}]
+									if result.count == 0 { continue }
+									sequenceKey := txnSequenceKey(topicData.Topic, partData.Partition)
+									seq := updatedSequences[sequenceKey]
+									if err := assignTxnAcceptedOffsets(result.accepted,
+										result.first, assigned, &seq); err != nil {
+										return txnStateSnapshot{}, err
+									}
+									updatedSequences[sequenceKey] = seq
+								}
+							}
+							snapshot := s.txnSnapshotLocked()
+							current := snapshot.States[txnID]
+							current.Sequences = updatedSequences
+							snapshot.States[txnID] = current
+							return snapshot, nil
+						})
+					if handlerErr == nil {
+						txnProduceState.sequences = updatedSequences
+					}
+				}
+				s.txnMu.Unlock()
+			} else {
+				offsets, handlerErr = s.txnLog.appendTopicBatchFormatted(records, encode)
+			}
+			if handlerErr == nil {
+				for key, result := range results {
+					if result.count != 0 && result.baseOffset < 0 {
+						result.baseOffset = offsets[result.first]
+						results[key] = result
+					}
+				}
+			}
+		} else {
+			handlerErr = s.deliverEvent(ctx, &MessagesEvent{Messages: allMsgs})
+		}
 		if handlerErr != nil {
 			s.logger.Errorf("[conn:%d] Batch processing error: %v", connID, handlerErr)
 		}
@@ -284,7 +368,7 @@ func (s *Server) handleProduce(ctx context.Context, conn net.Conn, connID uint64
 	// sequences are durably recorded. If the sink already accepted data but
 	// checkpointing fails, mark the transaction unresolved (it cannot commit
 	// or accept more data until an explicit abort / restart).
-	if txnProduceState != nil {
+	if txnProduceState != nil && s.orderedFormatter == nil {
 		s.txnMu.Lock()
 		if handlerErr == nil && sequenceChanged {
 			txnProduceState.sequences = proposedSequences
@@ -298,6 +382,10 @@ func (s *Server) handleProduce(ctx context.Context, conn net.Conn, connID uint64
 				txnProduceState.needsResolution = true
 			}
 		}
+		s.txnMu.Unlock()
+	} else if txnProduceState != nil && handlerErr != nil {
+		s.txnMu.Lock()
+		txnProduceState.needsResolution = true
 		s.txnMu.Unlock()
 	}
 
@@ -313,6 +401,9 @@ func (s *Server) handleProduce(ctx context.Context, conn net.Conn, connID uint64
 			}
 
 			result := results[partKey{ti, pi}]
+			if s.orderedFormatter != nil {
+				partResp.BaseOffset = result.baseOffset
+			}
 			if result.errCode != 0 {
 				partResp.ErrorCode = result.errCode
 			} else if handlerErr != nil {
@@ -793,7 +884,12 @@ func (s *Server) handleEndTxn(ctx context.Context, conn net.Conn, connID uint64,
 	} else {
 		evt = &TxnAbortEvent{TransactionalID: req.TransactionalID, TransactionInstance: instance}
 	}
-	err := s.deliverEvent(ctx, evt)
+	var err error
+	if s.orderedFormatter == nil {
+		err = s.deliverEvent(ctx, evt)
+	}
+	// With ordered output the durable coordinator decision is sufficient for
+	// EndTxn success. A separate materializer advances topic files later.
 
 	s.txnMu.Lock()
 	st.ending = false
