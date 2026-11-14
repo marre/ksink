@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 )
 
 // compactLocked writes a self-contained snapshot in a NEW file, fsyncs it
@@ -45,6 +46,28 @@ func (l *TransactionLog) compactLocked() error {
 				if readErr!=nil{return failed(readErr)}
 				if err=write(transactionWALRecord{Type:"output",Output:&record});err!=nil{return failed(err)}
 			}
+		}
+	}
+	// Keep logical topic streams in the same authoritative checkpoint. In
+	// particular, their unmaterialized committed records must survive WAL
+	// compaction and producer transactional.id reuse.
+	topics := make([]string, 0, len(l.topicRecords))
+	for topic := range l.topicRecords { topics = append(topics, topic) }
+	sort.Strings(topics)
+	for _, topic := range topics {
+		for _, ref := range l.topicRecords[topic] {
+			source, openErr := os.Open(l.walPath(ref.key))
+			if openErr != nil { return failed(openErr) }
+			record, n, readErr := readTxnWALFrameAt(source, ref.offset)
+			if closeErr := source.Close(); readErr == nil { readErr = closeErr }
+			if readErr != nil { return failed(readErr) }
+			if n != ref.size || record.Type != "topic-output" || record.TopicOutput == nil ||
+				record.TopicOutput.Topic != topic || record.TopicOutput.Offset != ref.meta.Offset ||
+				record.TopicOutput.TransactionID != ref.meta.TransactionID ||
+				record.TopicOutput.Instance != ref.meta.Instance {
+				return failed(fmt.Errorf("invalid topic WAL frame at offset %d", ref.offset))
+			}
+			if err := write(record); err != nil { return failed(err) }
 		}
 	}
 	if err=f.Sync();err!=nil{return failed(fmt.Errorf("sync WAL checkpoint: %w",err))}
