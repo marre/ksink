@@ -537,6 +537,16 @@ func (s *Server) handleInitProducerId(ctx context.Context, conn net.Conn, connID
 				existing.inFlight.Wait()
 				s.txnMu.Lock()
 				if existing.pendingAction == "" {
+					if s.orderedFormatter != nil {
+						if err := s.txnLog.AppendTopicTerminal(txnID, existing.instance, "abort"); err != nil {
+							existing.ending = false
+							s.txnStoreErr = fmt.Errorf("ordered WAL zombie abort: %w", err)
+							s.txnMu.Unlock()
+							return s.sendResponse(conn, connID, correlationID, &kmsg.InitProducerIDResponse{
+								Version: apiVersion, ErrorCode: kerr.UnknownServerError.Code, ProducerID: -1,
+							})
+						}
+					}
 					existing.pendingAction = "abort"
 					if err := s.persistTxnStateLocked(); err != nil {
 						existing.ending = false
@@ -906,6 +916,18 @@ func (s *Server) handleEndTxn(ctx context.Context, conn net.Conn, connID uint64,
 		return s.sendResponse(conn, connID, correlationID, resp)
 	}
 	if st.pendingAction == "" {
+		// One atomic WAL frame contains the outcome and every enrolled
+		// topic's control-marker offset. Commit success never depends on
+		// when the per-topic file materializer finishes publishing.
+		if s.orderedFormatter != nil {
+			if err := s.txnLog.AppendTopicTerminal(req.TransactionalID, st.instance, action); err != nil {
+				st.ending = false
+				s.txnStoreErr = fmt.Errorf("ordered WAL terminal decision: %w", err)
+				s.txnMu.Unlock()
+				resp.ErrorCode = kerr.UnknownServerError.Code
+				return s.sendResponse(conn, connID, correlationID, resp)
+			}
+		}
 		st.pendingAction = action
 		if err := s.persistTxnStateLocked(); err != nil {
 			st.ending = false

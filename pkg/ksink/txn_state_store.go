@@ -149,17 +149,33 @@ func (s *Server) initializeTxnState() error {
 		// A restart fences every old producer epoch. Any transaction that
 		// has not durably decided COMMIT/ABORT must be aborted BEFORE new
 		// producers can append behind its unresolved topic offsets.
-		var mustAbort bool
+		var changed bool
 		for id, old := range snapshot.States {
-			if old.Active && old.Pending == "" {
+			if !old.Active { continue }
+			if decided := s.txnLog.TopicTransactionDecision(old.Instance); decided != "" {
+				// A process may die after the single-frame outcome + marker
+				// fsync but before the mutable coordinator checkpoint. Never
+				// convert a durably committed transaction into an abort.
+				if old.Pending != "" && old.Pending != decided {
+					return fmt.Errorf("conflicting recovered WAL decision for %q", id)
+				}
+				if old.Pending != decided { old.Pending = decided; changed = true }
+			} else if old.Pending == "" {
+				// No irreversible decision: fence old epoch and append every
+				// enrolled topic's abort control-marker in one WAL frame.
+				if err := s.txnLog.AppendTopicTerminal(id, old.Instance, "abort"); err != nil {
+					return fmt.Errorf("abort undecided transaction %q on restart: %w", id, err)
+				}
 				old.Pending = "abort"
-				snapshot.States[id] = old
-				mustAbort = true
+				changed = true
+			} else {
+				return fmt.Errorf("transaction %q has a pending decision without control markers", id)
 			}
+			snapshot.States[id] = old
 		}
-		if mustAbort {
+		if changed {
 			if err := s.txnLog.AppendState(snapshot); err != nil {
-				return fmt.Errorf("abort undecided ordered WAL transactions on restart: %w", err)
+				return fmt.Errorf("persist recovered ordered WAL decisions: %w", err)
 			}
 		}
 	}
