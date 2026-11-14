@@ -63,18 +63,17 @@ Build changes on the unmerged PR #52 branch in the dependency order from [roadma
 
 ## Output supervision verification (November 2026)
 
-The ordered materializer now maintains per-topic publication error state. Its
-background supervisor retries a failed topic with capped exponential backoff,
-logs failures and recovery, and continues to poll healthy topics. The
-`TopicFailures()` snapshot is available to embedding health checks. The
+The ordered materializer now returns the first publication failure, including
+permanent WAL failures, to the CLI. The CLI closes Kafka and returns an error
+instead of retrying output writes. The
 command waits for the worker to exit before forced shutdown flush; a flush
 failure is reported as an error, not a successful drain.
 
-Regression coverage includes a pre-existing conflicting final file on one
-topic while another publishes, subsequent recovery of the blocked topic, an
-oversized single record, and file-number continuity across restart.
+Regression coverage includes a pre-existing conflicting final file causing
+the worker to fail, safe subsequent publication after recovery, an oversized
+single record, and file-number continuity across restart.
 
-**Remaining merge gate:** change the current retrying output worker to terminate on write failure, verify WAL and output error propagation and restart recovery, and finish correctness/fault-injection tests. Disk-space reservation, backlog admission control, metrics and persisted rotation deadlines are explicitly excluded.
+**Remaining merge gate:** verify fatal WAL and output error propagation, restart recovery, and finish correctness/fault-injection tests. Disk-space reservation, backlog admission control, metrics and persisted rotation deadlines are explicitly excluded.
 
 
 ## Revised operating policy (November 2026)
