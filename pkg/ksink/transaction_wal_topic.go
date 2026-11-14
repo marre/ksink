@@ -93,6 +93,30 @@ func (l *TransactionLog) NextTopicOffset(topic string) int64 {
 	return l.topicNext[topic]
 }
 
+// TopicTransactionDecision reports an irreversible transaction outcome for a
+// logical topic record. An empty result means the transaction is still open
+// or undecided. Nontransactional records are implicitly committed.
+func (l *TransactionLog) TopicTransactionDecision(instance string) string {
+	if instance == "" { return "commit" }
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.topicDecisions[instance]
+}
+
+// TopicStableOffset is the first offset whose visibility is not yet resolved.
+// All smaller offsets are either committed or aborted and can be processed in
+// offset order. This is per topic, never a global cross-topic barrier.
+func (l *TransactionLog) TopicStableOffset(topic string) int64 {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for _, ref := range l.topicRecords[topic] {
+		if ref.meta.Instance != "" && l.topicDecisions[ref.meta.Instance] == "" {
+			return ref.meta.Offset
+		}
+	}
+	return l.topicNext[topic]
+}
+
 // ReadTopicRecord reads exactly one checksummed WAL record by its topic offset.
 // Keeping the mutex only during this bounded read allows the future output
 // materializer to write files without holding back concurrent WAL appends.
