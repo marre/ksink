@@ -94,6 +94,18 @@ func (s *Server) persistTxnStateLocked() error {
 	if s.txnStoreErr != nil {
 		return s.txnStoreErr
 	}
+	snapshot := s.txnSnapshotLocked()
+	if err := s.txnLog.AppendState(snapshot); err != nil {
+		s.txnStoreErr = fmt.Errorf("transaction WAL is unavailable: %w", err)
+		return s.txnStoreErr
+	}
+	return nil
+}
+
+// txnSnapshotLocked makes a coordinator snapshot while s.txnMu is held.
+// Ordered output uses this snapshot inside the same WAL acceptance boundary
+// as its serialized messages and producer batch signatures.
+func (s *Server) txnSnapshotLocked() txnStateSnapshot {
 	snapshot := txnStateSnapshot{
 		Version: durableTxnStateVersion,
 		Counter: s.producerIDCounter.Load(),
@@ -106,11 +118,7 @@ func (s *Server) persistTxnStateLocked() error {
 			Pending: st.pendingAction, Instance: st.instance, Sequences: st.sequences,
 		}
 	}
-	if err := s.txnLog.AppendState(snapshot); err != nil {
-		s.txnStoreErr = fmt.Errorf("transaction WAL is unavailable: %w", err)
-		return s.txnStoreErr
-	}
-	return nil
+	return snapshot
 }
 
 // initializeTxnState replays the shared WAL. The filesystem materializer must

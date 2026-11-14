@@ -222,6 +222,16 @@ func WithTransactionLog(log *TransactionLog) Option {
 	return func(s *Server) { s.txnLog = log }
 }
 
+// WithOrderedTransactionalOutput opts into WAL-backed producer acknowledgements
+// for the forthcoming ordered-file materializer. The formatter receives a
+// Message with its authoritative topic offset already assigned. This mode
+// does not deliver MessagesEvent / TxnCommitEvent to Read; it is NOT intended
+// for the legacy transactional-directory writer. The CLI must only enable it
+// after configuring an ordered WAL materializer.
+func WithOrderedTransactionalOutput(format func(*Message) ([]byte, error)) Option {
+	return func(s *Server) { s.orderedFormatter = format }
+}
+
 // txnState tracks the state of a transactional producer identified by its
 // transactional.id. It stores the assigned producer ID, the current epoch
 // (bumped on each InitProducerID call), and whether a transaction is
@@ -274,6 +284,7 @@ type Server struct {
 	txnLog      *TransactionLog
 	ownsTxnLog  bool
 	txnStoreErr error
+	orderedFormatter func(*Message) ([]byte, error)
 
 	// Decompressor for parsing record batches
 	decompressor kgo.Decompressor
@@ -311,6 +322,9 @@ func New(cfg Config, opts ...Option) (*Server, error) {
 	}
 	if cfg.TransactionalWrite && s.txnLog == nil && cfg.TransactionStateDir == "" {
 		return nil, fmt.Errorf("transactional writes require WithTransactionLog or TransactionStateDir")
+	}
+	if s.orderedFormatter != nil && !cfg.TransactionalWrite {
+		return nil, fmt.Errorf("ordered WAL output requires TransactionalWrite")
 	}
 
 	// Set up allowed topics
