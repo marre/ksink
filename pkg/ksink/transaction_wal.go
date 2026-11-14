@@ -65,6 +65,7 @@ type transactionWALRecord struct {
 	State    *txnStateSnapshot
 	Output   *WALOutputRecord
 	TopicOutput *WALTopicRecord
+	Decision string
 	TxnID    string
 	Instance string
 	HasOutput bool
@@ -89,6 +90,10 @@ type TransactionLog struct {
 	// independent append offsets and indexes.
 	topicRecords map[string][]walTopicLocation
 	topicNext map[string]int64
+	// Immutable decisions are keyed by transaction instance, not mutable
+	// transactional.id. Their history is retained until topic output is safe.
+	topicDecisions map[string]string
+	topicDecisionRefs map[string]walFrameRef
 	published map[string]bool
 	publishedHasOutput map[string]bool
 	aborted   map[string]bool
@@ -175,6 +180,8 @@ func OpenTransactionLog(path string) (*TransactionLog, error) {
 		data:make(map[string][]walOutputLocation),
 		topicRecords:make(map[string][]walTopicLocation),
 		topicNext:make(map[string]int64),
+		topicDecisions:make(map[string]string),
+		topicDecisionRefs:make(map[string]walFrameRef),
 		published:make(map[string]bool),
 		publishedHasOutput:make(map[string]bool),
 		aborted:make(map[string]bool),
@@ -231,6 +238,8 @@ func (l *TransactionLog) resetReplay() {
 	l.data=make(map[string][]walOutputLocation)
 	l.topicRecords=make(map[string][]walTopicLocation)
 	l.topicNext=make(map[string]int64)
+	l.topicDecisions=make(map[string]string)
+	l.topicDecisionRefs=make(map[string]walFrameRef)
 	l.published=make(map[string]bool)
 	l.publishedHasOutput=make(map[string]bool)
 	l.aborted=make(map[string]bool)
@@ -368,6 +377,17 @@ func (l *TransactionLog) apply(rec transactionWALRecord, frameOffset, frameBytes
 			key:source, offset:frameOffset, size:frameBytes, meta:metadata,
 		})
 		l.topicNext[topic]++
+	case "topic-decision":
+		if rec.TxnID == "" || !txnWALValidInstance(rec.Instance) ||
+			(rec.Decision != "commit" && rec.Decision != "abort") {
+			return fmt.Errorf("invalid durable topic transaction decision")
+		}
+		if previous, exists := l.topicDecisions[rec.Instance]; exists && previous != rec.Decision {
+			return fmt.Errorf("conflicting topic transaction decision for %s", rec.Instance)
+		}
+		l.markFrameDead(l.topicDecisionRefs[rec.Instance])
+		l.topicDecisionRefs[rec.Instance] = walFrameRef{key: source, size: frameBytes}
+		l.topicDecisions[rec.Instance] = rec.Decision
 	case "published":
 		if rec.TxnID == "" || !txnWALValidInstance(rec.Instance) || l.aborted[rec.Instance] {
 			return fmt.Errorf("invalid WAL publication marker")
@@ -541,7 +561,27 @@ func (l *TransactionLog) AppendState(snapshot txnStateSnapshot) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	copied := cloneTxnStateSnapshot(snapshot)
-	return l.appendLocked(transactionWALRecord{Type: "state", State: &copied})
+	records := []transactionWALRecord{{Type: "state", State: &copied}}
+	// A pending COMMIT/ABORT is the irreversible decision barrier. Store it
+	// independently of the mutable transactional.id snapshot so that a
+	// generation can be reused while its output still awaits publication.
+	names := make([]string, 0, len(copied.States))
+	for id := range copied.States { names = append(names, id) }
+	sort.Strings(names)
+	for _, id := range names {
+		st := copied.States[id]
+		if st.Instance == "" || st.Pending == "" { continue }
+		if existing, exists := l.topicDecisions[st.Instance]; exists {
+			if existing != st.Pending {
+				return fmt.Errorf("cannot reverse durable transaction decision for %s", st.Instance)
+			}
+			continue
+		}
+		records = append(records, transactionWALRecord{
+			Type: "topic-decision", TxnID: id, Instance: st.Instance, Decision: st.Pending,
+		})
+	}
+	return l.appendBatchLocked(records)
 }
 
 func (l *TransactionLog) CurrentState() txnStateSnapshot {
