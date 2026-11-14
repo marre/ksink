@@ -60,3 +60,22 @@ Build changes on the unmerged PR #52 branch in the dependency order from [roadma
 - Control-marker offsets remain gaps in application output after checkpoint; later records must receive the correct next Kafka offset.
 - Crash after file finalization and before publication receipt, with the final file present: reconcile digest then commit receipt. Document the intrinsically ambiguous case where a reader has already consumed and removed that file without a read-side checkpoint/handshake.
 - WAL v2 manifest opened with WAL v3 code must fail without modifying acknowledged old state.
+
+## Output supervision verification (November 2026)
+
+The ordered materializer now maintains per-topic publication error state. Its
+background supervisor retries a failed topic with capped exponential backoff,
+logs failures and recovery, and continues to poll healthy topics. The
+`TopicFailures()` snapshot is available to embedding health checks. The
+command waits for the worker to exit before forced shutdown flush; a flush
+failure is reported as an error, not a successful drain.
+
+Regression coverage includes a pre-existing conflicting final file on one
+topic while another publishes, subsequent recovery of the blocked topic, an
+oversized single record, and file-number continuity across restart.
+
+**Not yet a completed merge gate:** disk-space reservation / bounded backlog
+admission control and prolonged real filesystem fault-injection testing. A
+durable WAL prevents acknowledgement of unsuccessful disk writes but does not
+by itself impose a finite backlog while output remains unavailable. Do not
+interpret passing CI as proof of those operational guarantees.
