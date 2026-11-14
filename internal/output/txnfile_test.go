@@ -21,11 +21,14 @@ func TestTxnFileWriterRequiresSharedWAL(t *testing.T) {
 	t.Cleanup(func() { _ = log.Close() })
 	_, err = output.NewTxnFileWriter(filepath.Join(dir, "no-transaction-placeholder.jsonl"), log)
 	require.ErrorContains(t, err, "must contain {txnID}")
+
+	_, err = output.NewTxnFileWriter(filepath.Join(dir, "{topic}-{partition}-{txnID}.jsonl"), log)
+	require.ErrorContains(t, err, "{partition} is unsupported")
 }
 
 func TestTxnFileWriterExclusiveLockAndRecovery(t *testing.T) {
 	root := t.TempDir()
-	pattern := filepath.Join(root, "{topic}-{partition}-{txnID}.jsonl")
+	pattern := filepath.Join(root, "{topic}-{txnID}.jsonl")
 	log, err := ksink.OpenTransactionLog(filepath.Join(root, ".ksink-kafka-state"))
 	require.NoError(t, err)
 	defer func() { _ = log.Close() }()
@@ -56,4 +59,23 @@ func TestTxnFileWriterRejectsUnjournaledStaging(t *testing.T) {
 	require.ErrorContains(t, err, "not recorded in the transaction WAL")
 	require.FileExists(t, filepath.Join(pending, ".ksink-commit-intent"),
 		"unknown staged data must never be deleted or migrated automatically")
+}
+
+func TestTxnFileWriterRejectsNonzeroPartition(t *testing.T) {
+	root := t.TempDir()
+	pattern := filepath.Join(root, "{topic}-{txnID}.jsonl")
+	wal, err := ksink.OpenTransactionLog(filepath.Join(root, ".ksink-kafka-state"))
+	require.NoError(t, err)
+	defer func() { _ = wal.Close() }()
+
+	writer, err := output.NewTxnFileWriter(pattern, wal)
+	require.NoError(t, err)
+	defer func() { _ = writer.Close() }()
+
+	err = writer.Write([]byte("invalid"), &ksink.Message{
+		Topic: "orders", Partition: 1,
+		TransactionalID: "producer", TransactionInstance: "producer-0123456789abcdef0123456789abcdef",
+	})
+	require.ErrorContains(t, err, "only accepts partition 0")
+	require.NoDirExists(t, filepath.Join(root, ".ksink-pending", "producer-0123456789abcdef0123456789abcdef"))
 }
