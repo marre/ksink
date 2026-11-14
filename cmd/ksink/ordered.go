@@ -87,6 +87,17 @@ func runOrdered(addr,dst,stateDir string, fmtr format.Formatter, serialization s
 		writerErr=fmt.Errorf("close Kafka server: %w",err)
 	}
 	workerCancel()
+	// Wait for the worker to release the publication lock before flushing.
+	// Otherwise an in-flight retry could race shutdown diagnostics.
+	if writerErr==nil {
+		select {
+		case err:=<-errCh:
+			if err!=nil {writerErr=fmt.Errorf("ordered output worker: %w",err)}
+		default:
+			// Worker completion is awaited below if it has not exited yet.
+			if err:=<-errCh;err!=nil {writerErr=fmt.Errorf("ordered output worker: %w",err)}
+		}
+	}
 	// The materializer goroutine can still hold its output lock until its
 	// last publish call returns. Flush serializes behind it.
 	if err:=writer.Flush(context.Background());err!=nil && writerErr==nil {
