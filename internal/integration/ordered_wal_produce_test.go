@@ -48,10 +48,12 @@ func TestOrderedWALKafkaProducerWritesTopicOffsetsAndCommitsWithoutFileOutput(t 
 	require.NoError(t, client.EndTransaction(ctx, kgo.TryCommit))
 	client.Close()
 
-	require.Equal(t, int64(1), wal.NextTopicOffset("orders"))
-	require.Equal(t, int64(1), wal.NextTopicOffset("payments"))
-	require.Equal(t, int64(1), wal.TopicStableOffset("orders"))
-	require.Equal(t, int64(1), wal.TopicStableOffset("payments"))
+	// The COMMIT marker itself consumes offset 1 in each topic, while
+	// the consumer-facing file materializer will skip marker records.
+	require.Equal(t, int64(2), wal.NextTopicOffset("orders"))
+	require.Equal(t, int64(2), wal.NextTopicOffset("payments"))
+	require.Equal(t, int64(2), wal.TopicStableOffset("orders"))
+	require.Equal(t, int64(2), wal.TopicStableOffset("payments"))
 	for topic, want := range map[string]string{
 		"orders": "orders/0: order-1\n",
 		"payments": "payments/0: payment-1\n",
@@ -80,8 +82,8 @@ func TestOrderedWALKafkaProducerWritesTopicOffsetsAndCommitsWithoutFileOutput(t 
 	require.NoError(t, err)
 	require.NoError(t, restarted.Start(context.Background()))
 	defer func() { _ = restarted.Close(context.Background()) }()
-	require.Equal(t, int64(1), reopened.TopicStableOffset("orders"))
-	require.Equal(t, int64(1), reopened.TopicStableOffset("payments"))
+	require.Equal(t, int64(2), reopened.TopicStableOffset("orders"))
+	require.Equal(t, int64(2), reopened.TopicStableOffset("payments"))
 	for _, topic := range []string{"orders", "payments"} {
 		record, exists, readErr := reopened.ReadTopicRecord(topic, 0)
 		require.NoError(t, readErr)

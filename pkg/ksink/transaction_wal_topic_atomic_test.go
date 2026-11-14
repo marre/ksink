@@ -174,3 +174,91 @@ func TestSharedWALFormatsAfterOffsetAssignmentWithoutConsumingFailedOffsets(t *t
 		require.Equal(t, fmt.Sprintf("record-%d-offset-%d", i, i), string(got.Data))
 	}
 }
+
+func TestSharedWALAtomicControlMarkersAndTopicOffsets(t *testing.T) {
+	root:=t.TempDir()
+	wal,instance:=testOpenWALWithActiveTransaction(t,root)
+	st:=wal.CurrentState()
+	prod:=st.States["orders-producer"]
+	prod.Topics=[]string{"orders","payments"}
+	st.States["orders-producer"]=prod
+	require.NoError(t,wal.AppendState(st))
+
+	offsets,err:=wal.AppendTopicBatch([]WALTopicRecord{
+		{Topic:"orders",TransactionID:"orders-producer",Instance:instance,Data:[]byte("order")},
+		{Topic:"payments",TransactionID:"orders-producer",Instance:instance,Data:[]byte("payment")},
+	})
+	require.NoError(t,err)
+	require.Equal(t,[]int64{0,0},offsets)
+	require.NoError(t,wal.AppendTopicTerminal("orders-producer",instance,"commit"))
+	require.Equal(t,"commit",wal.TopicTransactionDecision(instance))
+	require.Equal(t,int64(2),wal.NextTopicOffset("orders"))
+	require.Equal(t,int64(2),wal.NextTopicOffset("payments"))
+	for _,topic:=range []string{"orders","payments"} {
+		record,ok,readErr:=wal.ReadTopicRecord(topic,1)
+		require.NoError(t,readErr)
+		require.False(t,ok,"control markers must never appear as user data: %+v",record)
+	}
+	_,err=wal.AppendTopicBatch([]WALTopicRecord{{Topic:"orders",Data:[]byte("after commit")}})
+	require.NoError(t,err)
+	_,err=wal.AppendTopicBatch([]WALTopicRecord{{Topic:"payments",Data:[]byte("after commit")}})
+	require.NoError(t,err)
+	require.Equal(t,int64(3),wal.NextTopicOffset("orders"))
+	require.Equal(t,int64(3),wal.NextTopicOffset("payments"))
+	require.ErrorContains(t,wal.AppendTopicTerminal("orders-producer",instance,"commit"),"already has a durable outcome")
+	require.NoError(t,wal.Compact())
+	require.NoError(t,wal.Close())
+
+	next,err:=OpenTransactionLog(filepath.Join(root,".ksink-kafka-state"))
+	require.NoError(t,err)
+	defer func(){_=next.Close()}()
+	require.Equal(t,"commit",next.TopicTransactionDecision(instance))
+	for _,topic:=range []string{"orders","payments"} {
+		require.Equal(t,int64(3),next.NextTopicOffset(topic))
+		marker,isRecord,err:=next.ReadTopicRecord(topic,1)
+		require.NoError(t,err)
+		require.False(t,isRecord,"control marker must remain a gap: %+v",marker)
+		data,isRecord,err:=next.ReadTopicRecord(topic,2)
+		require.NoError(t,err)
+		require.True(t,isRecord)
+		require.Equal(t,"after commit",string(data.Data))
+	}
+}
+
+func TestSharedWALOneTopicBlockedWhileAnotherCommitsWithControlOffsets(t *testing.T) {
+	root:=t.TempDir()
+	wal,err:=OpenTransactionLog(filepath.Join(root,".ksink-kafka-state"))
+	require.NoError(t,err)
+	defer func(){_=wal.Close()}()
+	require.NoError(t,wal.BindOutput(filepath.Join(root,"data","{topic}","messages-{seq:08}.jsonl")))
+	a,err:=newTxnInstance("A")
+	require.NoError(t,err)
+	b,err:=newTxnInstance("B")
+	require.NoError(t,err)
+	snapshot:=wal.CurrentState()
+	snapshot.States["A"]=storedTxnState{ProducerID:snapshot.Counter,Active:true,Instance:a,Topics:[]string{"orders"}}
+	snapshot.States["B"]=storedTxnState{ProducerID:snapshot.Counter,Active:true,Instance:b,Topics:[]string{"orders","payments"}}
+	require.NoError(t,wal.AppendState(snapshot))
+	for _,r:=range []WALTopicRecord{
+		{Topic:"orders",TransactionID:"A",Instance:a,Data:[]byte("A0")},
+		{Topic:"orders",TransactionID:"B",Instance:b,Data:[]byte("B1")},
+		{Topic:"payments",TransactionID:"B",Instance:b,Data:[]byte("B-payment")},
+	} {
+		_,err=wal.AppendTopicBatch([]WALTopicRecord{r})
+		require.NoError(t,err)
+	}
+	require.NoError(t,wal.AppendTopicTerminal("B",b,"commit"))
+	require.Equal(t,int64(0),wal.TopicStableOffset("orders"))
+	require.Equal(t,int64(2),wal.TopicStableOffset("payments"))
+	require.NoError(t,wal.AppendTopicTerminal("A",a,"abort"))
+	require.Equal(t,int64(4),wal.TopicStableOffset("orders"))
+	// orders: A0, B1, B COMMIT at 2, A ABORT at 3.
+	for _,pos:=range []int64{2,3} {
+		_,found,err:=wal.ReadTopicRecord("orders",pos)
+		require.NoError(t,err)
+		require.False(t,found)
+	}
+	require.NoError(t,wal.Compact())
+	require.Equal(t,int64(4),wal.TopicStableOffset("orders"))
+	require.Equal(t,int64(2),wal.TopicStableOffset("payments"))
+}

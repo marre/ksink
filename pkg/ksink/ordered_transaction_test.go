@@ -78,7 +78,8 @@ func TestOrderedModeRestartDurablyAbortsUndecidedTopicRecords(t *testing.T) {
 	next := newOrderedTestServer(t, recovered)
 	defer func() { _ = next.Close(context.Background()); _ = recovered.Close() }()
 	require.Equal(t, "abort", recovered.TopicTransactionDecision(instance))
-	require.Equal(t, int64(1), recovered.TopicStableOffset("orders"))
+	require.Equal(t, int64(2), recovered.TopicStableOffset("orders"),
+		"restart ABORT marker consumes offset 1")
 	connection := newTxnStateTestConn(t, next)
 	defer func() { _ = connection.Close() }()
 	// Restarted producer must reinitialize, not resume the old epoch.
