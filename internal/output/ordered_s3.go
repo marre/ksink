@@ -126,7 +126,7 @@ func normalizeS3OrderedOpts(opts S3OrderedOpts) (S3OrderedOpts,error) {
 }
 
 func newS3OrderedPublisher(dst string, opts S3OrderedOpts) (*S3OrderedPublisher,error) {
-    bucket, pattern, root, width, err:=parseS3OrderedDestination(dst)
+    _, _, _, _, err:=parseS3OrderedDestination(dst)
     if err!=nil{return nil,err}
     opts,err=normalizeS3OrderedOpts(opts)
     if err!=nil{return nil,err}
