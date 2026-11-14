@@ -115,3 +115,67 @@ func TestOrderedWALKafkaProducerWritesTopicOffsetsAndCommitsWithoutFileOutput(t 
 			"a second publish cannot duplicate an immutable output file")
 	}
 }
+
+func TestOrderedWALNonTransactionalIdempotentFranzProducer(t *testing.T) {
+	root := t.TempDir()
+	stateDir := filepath.Join(root, "wal")
+	wal, err := ksink.OpenTransactionLog(stateDir)
+	require.NoError(t, err)
+	pattern := filepath.Join(root, "{topic}", "messages-{seq:08}.jsonl")
+	require.NoError(t, wal.BindOutput(pattern))
+	formatter := func(msg *ksink.Message) ([]byte, error) {
+		return []byte(fmt.Sprintf("%s/%d:%s\n", msg.Topic, msg.Offset, msg.Value)), nil
+	}
+	srv, err := ksink.New(ksink.Config{
+		Address: fmt.Sprintf("127.0.0.1:%d", getFreePort(t)),
+		TransactionalWrite: true, Timeout: 5 * time.Second,
+	}, ksink.WithTransactionLog(wal), ksink.WithOrderedTransactionalOutput(formatter),
+		ksink.WithLogger(&integrationLogger{t}))
+	require.NoError(t, err)
+	require.NoError(t, srv.Start(context.Background()))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	// franz-go defaults to an idempotent nontransactional producer.
+	client, err := kgo.NewClient(
+		kgo.SeedBrokers(srv.Addr().String()),
+		kgo.RequestTimeoutOverhead(5*time.Second),
+	)
+	require.NoError(t, err)
+	results := client.ProduceSync(ctx,
+		&kgo.Record{Topic: "orders", Value: []byte("one")},
+		&kgo.Record{Topic: "payments", Value: []byte("payment")},
+	)
+	require.NoError(t, results.FirstErr())
+	require.NoError(t, client.ProduceSync(ctx,
+		&kgo.Record{Topic: "orders", Value: []byte("two")}).FirstErr())
+	client.Close()
+	require.Equal(t, int64(2), wal.NextTopicOffset("orders"))
+	require.Equal(t, int64(1), wal.NextTopicOffset("payments"))
+	for i, want := range []string{"orders/0:one\n", "orders/1:two\n"} {
+		got, found, readErr := wal.ReadTopicRecord("orders", int64(i))
+		require.NoError(t, readErr)
+		require.True(t, found)
+		require.Equal(t, want, string(got.Data))
+	}
+	require.NoError(t, srv.Close(context.Background()))
+	require.NoError(t, wal.Close())
+
+	reopened, err := ksink.OpenTransactionLog(stateDir)
+	require.NoError(t, err)
+	defer func() { _ = reopened.Close() }()
+	require.Equal(t, int64(2), reopened.NextTopicOffset("orders"),
+		"recovery must retain original acknowledged offsets")
+	for i, want := range []string{"orders/0:one\n", "orders/1:two\n"} {
+		got, exists, readErr := reopened.ReadTopicRecord("orders", int64(i))
+		require.NoError(t, readErr)
+		require.True(t, exists)
+		require.Equal(t, want, string(got.Data))
+	}
+	writer, err := output.NewOrderedTopicMaterializer(reopened, pattern, 128<<20, time.Minute)
+	require.NoError(t, err)
+	require.NoError(t, writer.Flush(ctx))
+	data, err := os.ReadFile(filepath.Join(root, "orders", "messages-00000001.jsonl"))
+	require.NoError(t, err)
+	require.Equal(t, "orders/0:one\norders/1:two\n", string(data))
+}
