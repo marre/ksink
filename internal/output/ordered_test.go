@@ -326,3 +326,46 @@ func TestOrderedMaterializerCrashAfterFinalizationBeforeReceiptReconcilesOnResta
 	require.Equal(t,int64(2),wal.TopicProgress("orders").Cursor)
 	require.Equal(t,uint64(3),wal.TopicProgress("orders").NextFile)
 }
+
+func TestOrderedMaterializerSizeOnlyRotationWaitsForTarget(t *testing.T) {
+	root:=t.TempDir()
+	wal:=orderedTestLog(t)
+	w,err:=NewOrderedTopicMaterializer(wal,filepath.Join(root,"{topic}","part-{seq:08}.jsonl"),10,0)
+	require.NoError(t,err)
+	_,err=wal.AppendTopicBatch([]ksink.WALTopicRecord{{Topic:"orders",Data:[]byte("short")}})
+	require.NoError(t,err)
+	for i:=0;i<3;i++ {
+		n,err:=w.Publish(context.Background(),false)
+		require.NoError(t,err)
+		require.Zero(t,n)
+	}
+	_,err=os.Stat(filepath.Join(root,"orders","part-00000001.jsonl"))
+	require.ErrorIs(t,err,os.ErrNotExist)
+	_,err=wal.AppendTopicBatch([]ksink.WALTopicRecord{{Topic:"orders",Data:[]byte("12345")}})
+	require.NoError(t,err)
+	n,err:=w.Publish(context.Background(),false)
+	require.NoError(t,err)
+	require.Equal(t,1,n)
+	raw,err:=os.ReadFile(filepath.Join(root,"orders","part-00000001.jsonl"))
+	require.NoError(t,err)
+	require.Equal(t,"short12345",string(raw))
+}
+
+func TestOrderedMaterializerLongTopicNamesRemainPublishableAndDistinct(t *testing.T) {
+	root:=t.TempDir()
+	wal:=orderedTestLog(t)
+	w,err:=NewOrderedTopicMaterializer(wal,filepath.Join(root,"{topic}","part-{seq:08}.jsonl"),1,0)
+	require.NoError(t,err)
+	first:=strings.Repeat("A",249)
+	second:=strings.Repeat("A",248)+"B"
+	require.NotEqual(t,orderedTopicName(first),orderedTopicName(second))
+	require.LessOrEqual(t,len(orderedTopicName(first)),255)
+	_,err=wal.AppendTopicBatch([]ksink.WALTopicRecord{{Topic:first,Data:[]byte("one")},{Topic:second,Data:[]byte("two")}})
+	require.NoError(t,err)
+	require.NoError(t,w.Flush(context.Background()))
+	for topic,want:=range map[string]string{first:"one",second:"two"} {
+		raw,err:=os.ReadFile(filepath.Join(root,orderedTopicName(topic),"part-00000001.jsonl"))
+		require.NoError(t,err)
+		require.Equal(t,want,string(raw))
+	}
+}
