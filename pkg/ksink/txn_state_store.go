@@ -141,6 +141,24 @@ func (s *Server) initializeTxnState() error {
 		return nil
 	}
 	snapshot := s.txnLog.CurrentState()
+	if s.orderedFormatter != nil {
+		// A restart fences every old producer epoch. Any transaction that
+		// has not durably decided COMMIT/ABORT must be aborted BEFORE new
+		// producers can append behind its unresolved topic offsets.
+		var mustAbort bool
+		for id, old := range snapshot.States {
+			if old.Active && old.Pending == "" {
+				old.Pending = "abort"
+				snapshot.States[id] = old
+				mustAbort = true
+			}
+		}
+		if mustAbort {
+			if err := s.txnLog.AppendState(snapshot); err != nil {
+				return fmt.Errorf("abort undecided ordered WAL transactions on restart: %w", err)
+			}
+		}
+	}
 	s.producerIDCounter.Store(snapshot.Counter)
 	dirty := false
 	for id, old := range snapshot.States {
@@ -155,12 +173,12 @@ func (s *Server) initializeTxnState() error {
 		}
 		// A completed filesystem publication makes a pending COMMIT
 		// unambiguous. A crashed pending ABORT is likewise recoverable.
-		if old.Pending == "commit" && s.txnLog.Published(old.Instance) {
+		if old.Pending == "commit" && (s.orderedFormatter != nil || s.txnLog.Published(old.Instance)) {
 			st.hasOutcome = true
 			st.lastCommit = true
 			st.pendingAction = ""
 			dirty = true
-		} else if old.Pending == "abort" && s.txnLog.Aborted(old.Instance) {
+		} else if old.Pending == "abort" && (s.orderedFormatter != nil || s.txnLog.Aborted(old.Instance)) {
 			st.hasOutcome = true
 			st.lastCommit = false
 			st.pendingAction = ""
