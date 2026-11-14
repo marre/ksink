@@ -13,7 +13,7 @@ Status: **test/release plan**, not completed. Prerequisite: [ordered materialize
 | Out-of-order producer sequence / stale epoch | Error/fenced; no output or offset advancement |
 | Multi-topic single transaction | One coordinator COMMIT/ABORT decision; each topic independently obeys own stable offset |
 | B commits before earlier A in same topic | B not exposed until earlier A resolves; then offsets sorted |
-| Abort | Aborted records omitted, permitted offset gaps, no loss of later committed records |
+| Abort | Aborted records omitted, permitted offset gaps for aborted data and transaction control markers, no loss of later committed records |
 | Crash/restart with decided but unpublished transaction | Recover from authoritative logs and publish exactly once |
 | Many topics + one stuck transaction | Unrelated topics continue emitting completed files |
 | Shutdown while buffered file nonempty | Gracefully finalize, or replay/rebuild on crash; no partial file visible |

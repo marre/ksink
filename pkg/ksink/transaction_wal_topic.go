@@ -38,16 +38,16 @@ const maxTopicAcceptanceBatchRecords = 65536
 // and their acceptance delimiter. This low-level API is intended for records
 // that require no additional producer checkpoint (e.g. nontransactional input).
 // Callers performing idempotent Kafka Produce must instead use
-// AppendTopicBatchWithState to atomically persist producer sequence history.
+// appendTopicBatchWithState to atomically persist producer sequence history.
 func (l *TransactionLog) AppendTopicBatch(records []WALTopicRecord) ([]int64, error) {
 	return l.appendTopicBatch(records, nil, nil)
 }
 
-// AppendTopicBatchWithState couples topic records and their producer dedup /
+// appendTopicBatchWithState couples topic records and their producer dedup /
 // coordinator state in one replay-atomic acceptance frame. The entire batch
 // and updated state become durable together, before Kafka Produce success.
 // The caller must still validate producer epoch and batch signatures.
-func (l *TransactionLog) AppendTopicBatchWithState(records []WALTopicRecord, snapshot txnStateSnapshot) ([]int64, error) {
+func (l *TransactionLog) appendTopicBatchWithState(records []WALTopicRecord, snapshot txnStateSnapshot) ([]int64, error) {
 	copied := cloneTxnStateSnapshot(snapshot)
 	return l.appendTopicBatch(records, &copied, nil)
 }

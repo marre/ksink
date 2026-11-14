@@ -31,6 +31,14 @@ The shared WAL indexes logical streams by **exact topic name**, avoiding collisi
 
 In the **same WAL**, coordinator frames store producer ID/epoch fencing, transaction instance and participant `{topic, durable end offset / batch IDs}`, and irreversible COMMIT/ABORT. Logical topic-stream indexes store offsets, producer batch dedup and publication progress. All frames share one physical checksum, manifest and replay domain.
 
+## Kafka offset and idempotency contract
+
+- Assign each topic/partition-0 a monotonic **Kafka log offset**, independently of the producer batch's sequence number and the output file's sequence. Kafka transaction COMMIT/ABORT control markers **also consume topic-log offsets**, although they are never emitted as application records. Preserve those gaps so Produce BaseOffset behaves like Kafka. Replay must distinguish control-marker positions from user payloads.
+- A multi-topic EndTxn decision and its per-participant control marker positions must be represented by a **single durable logical operation**, or a recoverable idempotent protocol that prevents later appends from overtaking missing markers. The single shared WAL makes a combined acceptance record preferable.
+- Extend each producer-batch dedup signature with its **original assigned base offset**. A repeated exact batch must return the same base offset and neither append new payload nor advance the topic offset. The existing five-batch retry window and Kafka sequence wrap rules still apply.
+- The output format may include `Message.Offset`. Therefore the server must select Kafka offsets **before formatting**, and persist formatted bytes + producer dedup snapshot under the same fsync/acceptance boundary. Formatter errors must not consume offsets or alter producer state.
+- The old `Read()/AckFunc` event path currently delegates formatted payload persistence to the CLI and then writes producer state separately. The future ordered CLI path must deliberately couple formatting and WAL acceptance in one ownership boundary; do not just call the new low-level topic API from the existing writer and claim idempotency.
+
 ## Required single-WAL durability protocol
 
 1. **Transaction start/enrollment:** durably persist immutable instance and participant topic(s) in the shared WAL before accepted records can be attributed to that transaction.

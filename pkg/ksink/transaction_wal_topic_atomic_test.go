@@ -17,7 +17,7 @@ func TestSharedWALBatchAcceptsProducerSnapshotAtomically(t *testing.T) {
 		txnSequenceKey("orders", 0): {Next: 2},
 	}
 	snapshot.States["orders-producer"] = state
-	offsets, err := wal.AppendTopicBatchWithState([]WALTopicRecord{
+	offsets, err := wal.appendTopicBatchWithState([]WALTopicRecord{
 		{Topic: "orders", TransactionID: "orders-producer", Instance: instance, Data: []byte("first")},
 		{Topic: "orders", TransactionID: "orders-producer", Instance: instance, Data: []byte("second")},
 	}, snapshot)
@@ -67,7 +67,7 @@ func TestSharedWALUnacceptedBatchDoesNotAdvanceProducerCheckpoint(t *testing.T) 
 	defer func() { _ = recovered.Close() }()
 	require.Zero(t, recovered.NextTopicOffset("orders"))
 	require.Empty(t, recovered.CurrentState().States["orders-producer"].Sequences)
-	offsets, err := recovered.AppendTopicBatchWithState([]WALTopicRecord{{
+	offsets, err := recovered.appendTopicBatchWithState([]WALTopicRecord{{
 		Topic: "orders", TransactionID: "orders-producer",
 		Instance: instance, Data: []byte("accepted"),
 	}}, snapshot)
