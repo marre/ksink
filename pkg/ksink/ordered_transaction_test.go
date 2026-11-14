@@ -137,3 +137,49 @@ func TestOrderedWALReclaimsDecisionOnlyAfterAllTopicsAdvance(t *testing.T) {
 	require.Equal(t,int64(2),reopened.NextTopicOffset("payments"))
 	require.Empty(t,reopened.TopicTransactionDecision(instance))
 }
+
+func TestOrderedWALReclaimsDecisionAfterPublicationPrecedesGenerationRollover(t *testing.T) {
+	root:=t.TempDir()
+	wal,err:=OpenTransactionLog(filepath.Join(root,"state"))
+	require.NoError(t,err)
+	require.NoError(t,wal.BindOutput(filepath.Join(root,"{topic}","messages-{seq:08}.jsonl")))
+	srv:=newOrderedTestServer(t,wal)
+	conn:=newTxnStateTestConn(t,srv)
+	txnID:="decision-gc-late-rollover"
+	init:=sendInitProducerID(t,conn,1,&txnID,30000)
+	require.Zero(t,init.ErrorCode)
+	sendAddPartitionsToTxn(t,conn,2,txnID,init.ProducerID,init.ProducerEpoch,"orders")
+	sendAddPartitionsToTxn(t,conn,3,txnID,init.ProducerID,init.ProducerEpoch,"payments")
+	wal.mu.Lock()
+	instance:=wal.state.States[txnID].Instance
+	wal.mu.Unlock()
+	_,err=wal.AppendTopicBatch([]WALTopicRecord{
+		{Topic:"orders",TransactionID:txnID,Instance:instance,Data:[]byte("order")},
+		{Topic:"payments",TransactionID:txnID,Instance:instance,Data:[]byte("payment")},
+	})
+	require.NoError(t,err)
+	require.Zero(t,sendEndTxnForSafetyTest(t,conn,4,txnID,init.ProducerID,init.ProducerEpoch,false).ErrorCode)
+	require.NoError(t,wal.SkipTopicOffsets("orders",2))
+	require.NoError(t,wal.SkipTopicOffsets("payments",2))
+	require.Equal(t,"abort",wal.TopicTransactionDecision(instance),
+		"current coordinator generation still owns the decision")
+	next:=sendInitProducerID(t,conn,5,&txnID,30000)
+	require.Zero(t,next.ErrorCode)
+	sendAddPartitionsToTxn(t,conn,6,txnID,next.ProducerID,next.ProducerEpoch,"orders")
+	require.Empty(t,wal.TopicTransactionDecision(instance),
+		"old decision must be reclaimed without another publication receipt")
+	wal.mu.Lock()
+	require.NotContains(t,wal.topicDecisionRefs,instance)
+	require.NotContains(t,wal.topicInstances,instance)
+	wal.mu.Unlock()
+	require.NoError(t,conn.Close())
+	require.NoError(t,srv.Close(context.Background()))
+	require.NoError(t,wal.Compact())
+	require.NoError(t,wal.Close())
+	reopened,err:=OpenTransactionLog(filepath.Join(root,"state"))
+	require.NoError(t,err)
+	defer func(){_ = reopened.Close()}()
+	require.Empty(t,reopened.TopicTransactionDecision(instance))
+	require.Equal(t,int64(2),reopened.NextTopicOffset("orders"))
+	require.Equal(t,int64(2),reopened.NextTopicOffset("payments"))
+}
