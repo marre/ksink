@@ -67,6 +67,7 @@ func (l *TransactionLog) RecordTopicFile(topic string, file WALTopicFile) error 
 		return fmt.Errorf("topic file publication is out of order")
 	}
 	p:=WALTopicProgress{Topic:topic,Cursor:file.End,NextFile:file.Sequence+1,LastFile:&file}
+	if err:=l.validateTopicProgress(&p);err!=nil{return err}
 	return l.appendLocked(transactionWALRecord{Type:"topic-progress",TopicProgress:&p})
 }
 
@@ -80,10 +81,14 @@ func (l *TransactionLog) SkipTopicOffsets(topic string, end int64) error {
 	if prev.NextFile==0 {prev.NextFile=1}
 	if end<=prev.Cursor {return fmt.Errorf("topic skip cursor must advance")}
 	p:=WALTopicProgress{Topic:topic,Cursor:end,NextFile:prev.NextFile,LastFile:prev.LastFile}
+	if err:=l.validateTopicProgress(&p);err!=nil{return err}
 	return l.appendLocked(transactionWALRecord{Type:"topic-progress",TopicProgress:&p})
 }
 
-func (l *TransactionLog) applyTopicProgress(p *WALTopicProgress, size int64, source walFileKey) error {
+// Validate BEFORE writing as well as during replay. A rejected caller
+// request must not append a validly checksummed but semantically invalid WAL
+// record, or poison the log after fsync.
+func (l *TransactionLog) validateTopicProgress(p *WALTopicProgress) error {
 	if p==nil || p.Topic=="" || len(p.Topic)>249 {
 		return fmt.Errorf("invalid topic publication receipt")
 	}
@@ -129,6 +134,11 @@ func (l *TransactionLog) applyTopicProgress(p *WALTopicProgress, size int64, sou
 	if newFile!=hasCommitted {
 		return fmt.Errorf("publication would lose committed records or create an empty file")
 	}
+	return nil
+}
+
+func (l *TransactionLog) applyTopicProgress(p *WALTopicProgress, size int64, source walFileKey) error {
+	if err:=l.validateTopicProgress(p);err!=nil{return err}
 	l.markFrameDead(l.topicProgressRefs[p.Topic])
 	l.topicProgressRefs[p.Topic]=walFrameRef{key:source,size:size}
 	copied:=*p
