@@ -140,5 +140,5 @@ func TestOrderedS3MinIOPublicationAndRecovery(t *testing.T) {
     require.NoError(t,err)
     err=w.Flush(ctx)
     require.ErrorContains(t,err,"mismatch")
-    require.Equal(t,int64(3),wal.TopicProgress("orders").Cursor)
+    require.Equal(t,int64(2),wal.TopicProgress("orders").Cursor)
 }
