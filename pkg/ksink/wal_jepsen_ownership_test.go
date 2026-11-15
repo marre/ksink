@@ -42,7 +42,7 @@ func TestWALJepsenExclusiveProcessOwnership(t *testing.T) {
     require.NoError(t, err)
     stdin, err := child.StdinPipe() // keep open: child blocks holding its WAL lock
     require.NoError(t, err)
-    defer stdin.Close()
+    defer func() { _ = stdin.Close() }()
     require.NoError(t, child.Start())
     t.Cleanup(func() {
         if child.ProcessState == nil {
