@@ -127,6 +127,7 @@ type TransactionLog struct {
 	markerRefs map[string]walFrameRef
 	faultHook func(string) error // test-only, called while holding mu
 	frameWrite func(*os.File,[]byte)(int,error) // test-only: inject partial writes and syscall failures
+	manifestWrite func(*os.File,[]byte)(int,error) // test-only: injected manifest short writes
 	segmentLimit int64 // tests may reduce rotation threshold; defaults to 64 MiB
 	nextFrameSeq uint64 // monotonic physical frame sequence across snapshots/segments
 }
