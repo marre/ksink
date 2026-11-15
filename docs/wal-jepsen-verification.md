@@ -94,6 +94,12 @@ and rejecting all conflicting publication receipts. Unit tests also
 cover lost upload completion responses, checksum absence/mismatch,
 corrupted bodies and changing multipart boundary settings.
 
+An additional external-process test exercises **five overlapping Kafka
+transactional producers**, concurrent multi-topic Produce/Commit/Abort,
+restart and offset-monotone per-topic output verification using the
+Kafka-assigned offsets returned to clients. This is different from a
+single producer issuing five simultaneous inflight Produce requests.
+
 The injected syscall error is returned **at the real WAL code boundary**,
 but is not itself a real kernel EIO/ENOSPC, and does not simulate drive
 write caches or unflushed filesystem journal sectors.
@@ -150,7 +156,7 @@ their histories/reports have been inspected.
 * **Producer-history breadth:** the external CLI campaign validates
   committed-only projection and ambiguous EndTxn with multiple topics.
   Comprehensive Jepsen certification would additionally need
-  concurrent overlapping producers, five in-flight batches, response
+  five in-flight batches within the same producer, response
   partitioning, producer ID fencing under sustained partitions, and
   independent read/write-linearizability analysis.
 * **Unsupported contracts:** shared/network WAL filesystems, concurrent
