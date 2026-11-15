@@ -33,10 +33,11 @@ type fakeOrderedS3Upload struct {
 type fakeOrderedS3 struct {
     objects map[string]fakeOrderedS3Object
     uploads map[string]*fakeOrderedS3Upload
-    puts, creates, parts, completes, aborts int
+    puts, gets, creates, parts, completes, aborts int
     putAmbiguous bool
     completeAmbiguous bool
     headError error
+    getError error
 }
 func newFakeOrderedS3() *fakeOrderedS3 {
     return &fakeOrderedS3{
@@ -49,6 +50,16 @@ func (f *fakeOrderedS3) HeadObject(_ context.Context,in *s3.HeadObjectInput,_ ..
     obj,ok:=f.objects[aws.ToString(in.Key)]
     if !ok {return nil,&smithy.GenericAPIError{Code:"NotFound",Message:"not found"}}
     return &s3.HeadObjectOutput{ContentLength:aws.Int64(int64(len(obj.data))),Metadata:obj.meta},nil
+}
+func (f *fakeOrderedS3) GetObject(_ context.Context,in *s3.GetObjectInput,_ ...func(*s3.Options)) (*s3.GetObjectOutput,error) {
+    f.gets++
+    if f.getError!=nil{return nil,f.getError}
+    obj,ok:=f.objects[aws.ToString(in.Key)]
+    if !ok {return nil,&smithy.GenericAPIError{Code:"NoSuchKey",Message:"not found"}}
+    return &s3.GetObjectOutput{
+        Body:io.NopCloser(bytes.NewReader(obj.data)),
+        ContentLength:aws.Int64(int64(len(obj.data))),
+    },nil
 }
 func fakeOrderedS3StoreMetadata(in map[string]string) map[string]string {
     out:=make(map[string]string,len(in))
@@ -212,6 +223,47 @@ func TestS3OrderedAmbiguousPUTAndConflict(t *testing.T) {
     require.Equal(t,"wrong",string(fake.objects["root/orders/messages-00000002.jsonl"].data))
     require.Equal(t,int64(1),wal.TopicProgress("orders").Cursor)
     require.Equal(t,1,fake.puts)
+}
+
+func TestS3OrderedExistingObjectForgedMetadataFailsClosed(t *testing.T) {
+    wal:=orderedTestLog(t)
+    fake:=newFakeOrderedS3()
+    w:=testOrderedS3Materializer(t,wal,fake,1)
+    expected:=[]byte("correct\\n")
+    _,err:=wal.AppendTopicBatch([]ksink.WALTopicRecord{{Topic:"orders",Data:expected}})
+    require.NoError(t,err)
+    digest:=sha256.Sum256(expected)
+    // Same length and forged hash metadata: HEAD alone must not prove bytes.
+    fake.objects["root/orders/messages-00000001.jsonl"]=fakeOrderedS3Object{
+        data:[]byte("garbage\\n"),
+        meta:map[string]string{"ksink-sha256":hex.EncodeToString(digest[:])},
+    }
+    err=w.Flush(context.Background())
+    require.ErrorContains(t,err,"body differs from committed WAL bytes")
+    require.Zero(t,wal.TopicProgress("orders").Cursor,"no receipt for a forged object")
+    require.Equal(t,uint64(1),wal.TopicProgress("orders").NextFile)
+    require.Zero(t,fake.puts,"immutable object must never be overwritten")
+    require.Equal(t,1,fake.gets)
+}
+
+func TestS3OrderedExistingObjectGETFailureFailsClosed(t *testing.T) {
+    wal:=orderedTestLog(t)
+    fake:=newFakeOrderedS3()
+    w:=testOrderedS3Materializer(t,wal,fake,1)
+    data:=[]byte("correct\\n")
+    _,err:=wal.AppendTopicBatch([]ksink.WALTopicRecord{{Topic:"orders",Data:data}})
+    require.NoError(t,err)
+    digest:=sha256.Sum256(data)
+    fake.objects["root/orders/messages-00000001.jsonl"]=fakeOrderedS3Object{
+        data:data,meta:map[string]string{"ksink-sha256":hex.EncodeToString(digest[:])},
+    }
+    fake.getError=errors.New("simulated GET outage")
+    require.ErrorContains(t,w.Flush(context.Background()),"simulated GET outage")
+    require.Zero(t,wal.TopicProgress("orders").Cursor)
+    fake.getError=nil
+    require.NoError(t,w.Flush(context.Background()))
+    require.Equal(t,int64(1),wal.TopicProgress("orders").Cursor)
+    require.Zero(t,fake.puts)
 }
 
 func TestS3OrderedCrashAfterObjectBeforeReceipt(t *testing.T) {
