@@ -44,6 +44,36 @@ type externalJepsenMessage struct {
     ordinal int
 }
 
+// Keep the operation identity and all enrolled topic payloads together.
+// A lost EndTxn response is uncertain about COMMIT versus ABORT, not about
+// whether only a subset of the transaction committed.
+type externalJepsenAmbiguousTxn struct {
+    operationID string
+    payloads []string
+}
+
+// Check the final converged output, not transient cross-topic visibility.
+// An ambiguous EndTxn may commit or abort, but all its topic payloads must
+// share that one outcome.
+func externalJepsenCheckAmbiguousTransactions(groups []externalJepsenAmbiguousTxn, seen map[string]int) error {
+    for _, group := range groups {
+        if len(group.payloads)==0 {
+            return fmt.Errorf("ambiguous transaction %q has no payloads",group.operationID)
+        }
+        count:=seen[group.payloads[0]]
+        if count!=0 && count!=1 {
+            return fmt.Errorf("ambiguous transaction %q has %d copies of %q",group.operationID,count,group.payloads[0])
+        }
+        for _, payload:=range group.payloads[1:] {
+            if got:=seen[payload];got!=count {
+                return fmt.Errorf("ambiguous transaction %q has partial final outcome: %q count=%d, %q count=%d",
+                    group.operationID,group.payloads[0],count,payload,got)
+            }
+        }
+    }
+    return nil
+}
+
 func externalJepsenCount(t *testing.T,name string,defaultValue int) int {
     t.Helper()
     value:=os.Getenv(name)
@@ -169,6 +199,7 @@ func TestWALJepsenExternalCampaign(t *testing.T) {
     port:=getFreePort(t)
     addr:=fmt.Sprintf("127.0.0.1:%d",port)
     all:=make(map[string]*externalJepsenMessage)
+    ambiguousGroups:=make([]externalJepsenAmbiguousTxn,0)
     order:=map[string]int{"orders":0,"payments":0}
     lastNext:=map[string]int64{"orders":0,"payments":0}
     emit(externalJepsenEvent{Operation:"campaign",Phase:"start",
@@ -239,6 +270,9 @@ func TestWALJepsenExternalCampaign(t *testing.T) {
                 }else {
                     event.Phase="indeterminate"
                     event.Error=endErr.Error()
+                    ambiguousGroups=append(ambiguousGroups,externalJepsenAmbiguousTxn{
+                        operationID:operationID,payloads:append([]string(nil),payloads...),
+                    })
                 }
                 emit(event)
             } else {
@@ -297,8 +331,10 @@ func TestWALJepsenExternalCampaign(t *testing.T) {
             ambiguous++
         }
     }
+    require.NoError(t,externalJepsenCheckAmbiguousTransactions(ambiguousGroups,seen),
+        "an indeterminate EndTxn must never leave only some participant topics committed")
     emit(externalJepsenEvent{Operation:"verify",Phase:"ok",
-        Payloads:[]string{fmt.Sprintf("confirmed=%d ambiguous=%d",confirmed,ambiguous)}})
+        Payloads:[]string{fmt.Sprintf("confirmed=%d ambiguous=%d grouped_transactions=%d",confirmed,ambiguous,len(ambiguousGroups))}})
     t.Logf("external WAL campaign passed: seed=%d cycles=%d transactions/cycle=%d confirmed=%d ambiguous=%d history=%s",
         seed,cycles,transactions,confirmed,ambiguous,historyPath)
 }
@@ -310,4 +346,28 @@ func TestWALJepsenExternalHistorySchema(t *testing.T) {
     require.Equal(t,"indeterminate",event.Phase)
     scanner:=bufio.NewScanner(strings.NewReader("{}\n"))
     require.True(t,scanner.Scan())
+}
+
+// A per-payload checker would accept the partial result in the second
+// case; operation-level consistency must reject it after convergence.
+func TestWALJepsenAmbiguousMultiTopicTransactionIsAtomic(t *testing.T) {
+    groups:=[]externalJepsenAmbiguousTxn{{
+        operationID:"lost-endtxn-1",payloads:[]string{"orders:1","payments:1"},
+    }}
+    for _,tc:=range []struct{
+        name string
+        seen map[string]int
+        wantError string
+    }{
+        {name:"both absent",seen:map[string]int{}},
+        {name:"both present",seen:map[string]int{"orders:1":1,"payments:1":1}},
+        {name:"orders only",seen:map[string]int{"orders:1":1},wantError:"partial final outcome"},
+        {name:"payments only",seen:map[string]int{"payments:1":1},wantError:"partial final outcome"},
+        {name:"duplicate member",seen:map[string]int{"orders:1":2,"payments:1":1},wantError:"copies"},
+    }{
+        t.Run(tc.name,func(t *testing.T){
+            err:=externalJepsenCheckAmbiguousTransactions(groups,tc.seen)
+            if tc.wantError=="" {require.NoError(t,err)} else {require.ErrorContains(t,err,tc.wantError)}
+        })
+    }
 }
