@@ -4,18 +4,21 @@ import (
     "bytes"
     "context"
     "crypto/sha256"
+    "encoding/base64"
     "encoding/hex"
     "errors"
     "fmt"
     "io"
     "path/filepath"
     "os"
+    "strconv"
     "strings"
     "testing"
     "time"
 
     "github.com/aws/aws-sdk-go-v2/aws"
     "github.com/aws/aws-sdk-go-v2/service/s3"
+    "github.com/aws/aws-sdk-go-v2/service/s3/types"
     "github.com/aws/smithy-go"
     "github.com/marre/ksink/pkg/ksink"
     "github.com/stretchr/testify/require"
@@ -24,6 +27,8 @@ import (
 type fakeOrderedS3Object struct {
     data []byte
     meta map[string]string
+    checksum string
+    checksumType types.ChecksumType
 }
 type fakeOrderedS3Upload struct {
     key string
@@ -33,11 +38,13 @@ type fakeOrderedS3Upload struct {
 type fakeOrderedS3 struct {
     objects map[string]fakeOrderedS3Object
     uploads map[string]*fakeOrderedS3Upload
-    puts, gets, creates, parts, completes, aborts int
+    puts, heads, creates, parts, completes, aborts int
     putAmbiguous bool
     completeAmbiguous bool
+    corruptPut bool
+    corruptPart bool
+    headMissingChecksum bool
     headError error
-    getError error
 }
 func newFakeOrderedS3() *fakeOrderedS3 {
     return &fakeOrderedS3{
@@ -45,39 +52,52 @@ func newFakeOrderedS3() *fakeOrderedS3 {
         uploads:make(map[string]*fakeOrderedS3Upload),
     }
 }
-func (f *fakeOrderedS3) HeadObject(_ context.Context,in *s3.HeadObjectInput,_ ...func(*s3.Options)) (*s3.HeadObjectOutput,error) {
-    if f.headError!=nil{return nil,f.headError}
-    obj,ok:=f.objects[aws.ToString(in.Key)]
-    if !ok {return nil,&smithy.GenericAPIError{Code:"NotFound",Message:"not found"}}
-    return &s3.HeadObjectOutput{ContentLength:aws.Int64(int64(len(obj.data))),Metadata:obj.meta},nil
-}
-func (f *fakeOrderedS3) GetObject(_ context.Context,in *s3.GetObjectInput,_ ...func(*s3.Options)) (*s3.GetObjectOutput,error) {
-    f.gets++
-    if f.getError!=nil{return nil,f.getError}
-    obj,ok:=f.objects[aws.ToString(in.Key)]
-    if !ok {return nil,&smithy.GenericAPIError{Code:"NoSuchKey",Message:"not found"}}
-    return &s3.GetObjectOutput{
-        Body:io.NopCloser(bytes.NewReader(obj.data)),
-        ContentLength:aws.Int64(int64(len(obj.data))),
-    },nil
-}
 func fakeOrderedS3StoreMetadata(in map[string]string) map[string]string {
     out:=make(map[string]string,len(in))
     for k,v:=range in {out[k]=v}
     return out
 }
+func fakeStoredOrderedS3Object(data []byte,meta map[string]string,partSize int64) fakeOrderedS3Object {
+    h:=newS3OrderedHasher(partSize)
+    _,_=h.Write(data)
+    _,checksum:=h.sums()
+    typ:=types.ChecksumTypeFullObject
+    if partSize>0 {typ=types.ChecksumTypeComposite}
+    return fakeOrderedS3Object{
+        data:append([]byte(nil),data...),meta:fakeOrderedS3StoreMetadata(meta),
+        checksum:checksum,checksumType:typ,
+    }
+}
+func (f *fakeOrderedS3) HeadObject(_ context.Context,in *s3.HeadObjectInput,_ ...func(*s3.Options)) (*s3.HeadObjectOutput,error) {
+    f.heads++
+    if in.ChecksumMode!=types.ChecksumModeEnabled {return nil,errors.New("missing S3 checksum-mode HEAD")}
+    if f.headError!=nil{return nil,f.headError}
+    obj,ok:=f.objects[aws.ToString(in.Key)]
+    if !ok {return nil,&smithy.GenericAPIError{Code:"NotFound",Message:"not found"}}
+    out:=&s3.HeadObjectOutput{
+        ContentLength:aws.Int64(int64(len(obj.data))),
+        Metadata:fakeOrderedS3StoreMetadata(obj.meta),
+        ChecksumType:obj.checksumType,ChecksumSHA256:aws.String(obj.checksum),
+    }
+    if f.headMissingChecksum {out.ChecksumSHA256=nil}
+    return out,nil
+}
 func (f *fakeOrderedS3) PutObject(_ context.Context,in *s3.PutObjectInput,_ ...func(*s3.Options)) (*s3.PutObjectOutput,error) {
     f.puts++
     if aws.ToString(in.IfNoneMatch)!="*" {return nil,errors.New("missing conditional PUT")}
+    if in.ChecksumAlgorithm!=types.ChecksumAlgorithmSha256 {return nil,errors.New("missing SHA256 PUT algorithm")}
     if _,ok:=f.objects[aws.ToString(in.Key)];ok {
         return nil,&smithy.GenericAPIError{Code:"PreconditionFailed",Message:"exists"}
     }
     data,err:=io.ReadAll(in.Body)
     if err!=nil{return nil,err}
     if int64(len(data))!=aws.ToInt64(in.ContentLength){return nil,errors.New("wrong PUT length")}
-    f.objects[aws.ToString(in.Key)]=fakeOrderedS3Object{
-        data:data,meta:fakeOrderedS3StoreMetadata(in.Metadata),
+    if f.corruptPut && len(data)>0 {data[0]^=0xff}
+    hash:=sha256.Sum256(data)
+    if base64.StdEncoding.EncodeToString(hash[:])!=aws.ToString(in.ChecksumSHA256) {
+        return nil,&smithy.GenericAPIError{Code:"BadDigest",Message:"PUT data failed SHA256"}
     }
+    f.objects[aws.ToString(in.Key)]=fakeStoredOrderedS3Object(data,in.Metadata,0)
     if f.putAmbiguous {
         f.putAmbiguous=false
         return nil,errors.New("response lost after durable PUT")
@@ -86,6 +106,9 @@ func (f *fakeOrderedS3) PutObject(_ context.Context,in *s3.PutObjectInput,_ ...f
 }
 func (f *fakeOrderedS3) CreateMultipartUpload(_ context.Context,in *s3.CreateMultipartUploadInput,_ ...func(*s3.Options)) (*s3.CreateMultipartUploadOutput,error) {
     f.creates++
+    if in.ChecksumAlgorithm!=types.ChecksumAlgorithmSha256 || in.ChecksumType!=types.ChecksumTypeComposite {
+        return nil,errors.New("missing SHA256 composite multipart checksum")
+    }
     id:=fmt.Sprintf("upload-%d",f.creates)
     f.uploads[id]=&fakeOrderedS3Upload{key:aws.ToString(in.Key),
         meta:fakeOrderedS3StoreMetadata(in.Metadata),parts:make(map[int32][]byte)}
@@ -98,8 +121,17 @@ func (f *fakeOrderedS3) UploadPart(_ context.Context,in *s3.UploadPartInput,_ ..
     data,err:=io.ReadAll(in.Body)
     if err!=nil{return nil,err}
     if int64(len(data))!=aws.ToInt64(in.ContentLength){return nil,errors.New("wrong part size")}
+    if f.corruptPart && len(data)>0 {data[0]^=0xff}
+    hash:=sha256.Sum256(data)
+    checksum:=base64.StdEncoding.EncodeToString(hash[:])
+    if checksum!=aws.ToString(in.ChecksumSHA256) {
+        return nil,&smithy.GenericAPIError{Code:"BadDigest",Message:"part data failed SHA256"}
+    }
     upload.parts[aws.ToInt32(in.PartNumber)]=data
-    return &s3.UploadPartOutput{ETag:aws.String(fmt.Sprintf("etag-%d",aws.ToInt32(in.PartNumber)))},nil
+    return &s3.UploadPartOutput{
+        ETag:aws.String(fmt.Sprintf("etag-%d",aws.ToInt32(in.PartNumber))),
+        ChecksumSHA256:aws.String(checksum),
+    },nil
 }
 func (f *fakeOrderedS3) CompleteMultipartUpload(_ context.Context,in *s3.CompleteMultipartUploadInput,_ ...func(*s3.Options)) (*s3.CompleteMultipartUploadOutput,error) {
     f.completes++
@@ -111,12 +143,19 @@ func (f *fakeOrderedS3) CompleteMultipartUpload(_ context.Context,in *s3.Complet
     upload:=f.uploads[aws.ToString(in.UploadId)]
     if upload==nil {return nil,errors.New("missing multipart upload")}
     var payload []byte
-    for _,part:=range in.MultipartUpload.Parts {
+    for i,part:=range in.MultipartUpload.Parts {
+        if aws.ToInt32(part.PartNumber)!=int32(i+1) {return nil,errors.New("nonconsecutive S3 parts")}
         data,ok:=upload.parts[aws.ToInt32(part.PartNumber)]
         if !ok {return nil,errors.New("missing part")}
+        hash:=sha256.Sum256(data)
+        if base64.StdEncoding.EncodeToString(hash[:])!=aws.ToString(part.ChecksumSHA256) {
+            return nil,&smithy.GenericAPIError{Code:"BadDigest",Message:"multipart checksum mismatch"}
+        }
         payload=append(payload,data...)
     }
-    f.objects[key]=fakeOrderedS3Object{data:payload,meta:upload.meta}
+    partSize,err:=strconv.ParseInt(upload.meta["ksink-part-size"],10,64)
+    if err!=nil {return nil,err}
+    f.objects[key]=fakeStoredOrderedS3Object(payload,upload.meta,partSize)
     delete(f.uploads,aws.ToString(in.UploadId))
     if f.completeAmbiguous {
         f.completeAmbiguous=false
@@ -213,9 +252,8 @@ func TestS3OrderedAmbiguousPUTAndConflict(t *testing.T) {
     require.Equal(t,1,fake.puts,"ambiguous success must be HEAD-reconciled without overwriting")
     require.Equal(t,int64(1),wal.TopicProgress("orders").Cursor)
     // An unrelated completed object is never replaced by subsequent output.
-    fake.objects["root/orders/messages-00000002.jsonl"]=fakeOrderedS3Object{
-        data:[]byte("wrong"),meta:map[string]string{"ksink-sha256":strings.Repeat("0",64)},
-    }
+    fake.objects["root/orders/messages-00000002.jsonl"]=fakeStoredOrderedS3Object(
+        []byte("wrong"),map[string]string{"ksink-sha256":strings.Repeat("0",64)},0)
     _,err=wal.AppendTopicBatch([]ksink.WALTopicRecord{{Topic:"orders",Data:[]byte("second\n")}})
     require.NoError(t,err)
     err=w.Flush(context.Background())
@@ -233,20 +271,19 @@ func TestS3OrderedExistingObjectForgedMetadataFailsClosed(t *testing.T) {
     _,err:=wal.AppendTopicBatch([]ksink.WALTopicRecord{{Topic:"orders",Data:expected}})
     require.NoError(t,err)
     digest:=sha256.Sum256(expected)
-    // Same length and forged hash metadata: HEAD alone must not prove bytes.
-    fake.objects["root/orders/messages-00000001.jsonl"]=fakeOrderedS3Object{
-        data:[]byte("garbage\\n"),
-        meta:map[string]string{"ksink-sha256":hex.EncodeToString(digest[:])},
-    }
+    // Forged user metadata matches WAL, but S3-validated checksum is for
+    // different bytes. HEAD must detect the conflict without a GET.
+    fake.objects["root/orders/messages-00000001.jsonl"]=fakeStoredOrderedS3Object(
+        []byte("garbage\\n"),map[string]string{"ksink-sha256":hex.EncodeToString(digest[:])},0)
     err=w.Flush(context.Background())
-    require.ErrorContains(t,err,"body differs from committed WAL bytes")
+    require.ErrorContains(t,err,"server-validated SHA256 checksum differs")
     require.Zero(t,wal.TopicProgress("orders").Cursor,"no receipt for a forged object")
     require.Equal(t,uint64(1),wal.TopicProgress("orders").NextFile)
     require.Zero(t,fake.puts,"immutable object must never be overwritten")
-    require.Equal(t,1,fake.gets)
+    require.Positive(t,fake.heads)
 }
 
-func TestS3OrderedExistingObjectGETFailureFailsClosed(t *testing.T) {
+func TestS3OrderedMissingChecksumFailsClosed(t *testing.T) {
     wal:=orderedTestLog(t)
     fake:=newFakeOrderedS3()
     w:=testOrderedS3Materializer(t,wal,fake,1)
@@ -254,17 +291,29 @@ func TestS3OrderedExistingObjectGETFailureFailsClosed(t *testing.T) {
     _,err:=wal.AppendTopicBatch([]ksink.WALTopicRecord{{Topic:"orders",Data:data}})
     require.NoError(t,err)
     digest:=sha256.Sum256(data)
-    fake.objects["root/orders/messages-00000001.jsonl"]=fakeOrderedS3Object{
-        data:data,meta:map[string]string{"ksink-sha256":hex.EncodeToString(digest[:])},
-    }
-    fake.getError=errors.New("simulated GET outage")
-    require.ErrorContains(t,w.Flush(context.Background()),"simulated GET outage")
+    fake.objects["root/orders/messages-00000001.jsonl"]=fakeStoredOrderedS3Object(
+        data,map[string]string{"ksink-sha256":hex.EncodeToString(digest[:])},0)
+    fake.headMissingChecksum=true
+    require.ErrorContains(t,w.Flush(context.Background()),"lacks server-validated SHA256")
     require.Zero(t,wal.TopicProgress("orders").Cursor)
-    fake.getError=nil
+    fake.headMissingChecksum=false
     require.NoError(t,w.Flush(context.Background()))
     require.Equal(t,int64(1),wal.TopicProgress("orders").Cursor)
     require.Zero(t,fake.puts)
 }
+
+func TestS3OrderedPUTChecksumMismatchFailsClosed(t *testing.T) {
+    wal:=orderedTestLog(t)
+    fake:=newFakeOrderedS3()
+    fake.corruptPut=true
+    w:=testOrderedS3Materializer(t,wal,fake,1)
+    _,err:=wal.AppendTopicBatch([]ksink.WALTopicRecord{{Topic:"orders",Data:[]byte("correct")}})
+    require.NoError(t,err)
+    require.ErrorContains(t,w.Flush(context.Background()),"BadDigest")
+    require.Zero(t,wal.TopicProgress("orders").Cursor)
+    require.Empty(t,fake.objects)
+}
+
 
 func TestS3OrderedCrashAfterObjectBeforeReceipt(t *testing.T) {
     state:=filepath.Join(t.TempDir(),"wal")
@@ -278,9 +327,8 @@ func TestS3OrderedCrashAfterObjectBeforeReceipt(t *testing.T) {
     })
     require.NoError(t,err)
     digest:=sha256.Sum256([]byte("first\n"))
-    fake.objects["root/orders/messages-00000001.jsonl"]=fakeOrderedS3Object{
-        data:[]byte("first\n"),meta:map[string]string{"ksink-sha256":hex.EncodeToString(digest[:])},
-    }
+    fake.objects["root/orders/messages-00000001.jsonl"]=fakeStoredOrderedS3Object(
+        []byte("first\n"),map[string]string{"ksink-sha256":hex.EncodeToString(digest[:])},0)
     require.NoError(t,wal.Close())
     wal,err=ksink.OpenTransactionLog(state)
     require.NoError(t,err)
@@ -312,6 +360,68 @@ func TestS3OrderedMultipartAndAmbiguousCompletion(t *testing.T) {
     require.Equal(t,0,fake.puts)
     require.Equal(t,data,fake.objects["root/big/messages-00000001.jsonl"].data)
     require.Equal(t,int64(1),wal.TopicProgress("big").Cursor)
+}
+
+func TestS3OrderedMultipartSHA256ChecksumAndBoundaryRecovery(t *testing.T) {
+    data:=append(bytes.Repeat([]byte("x"),5<<20),[]byte("second part")...)
+    part1:=sha256.Sum256(data[:5<<20])
+    part2:=sha256.Sum256(data[5<<20:])
+    combined:=sha256.New()
+    _,_=combined.Write(part1[:])
+    _,_=combined.Write(part2[:])
+    expected:=base64.StdEncoding.EncodeToString(combined.Sum(nil))+"-2"
+    h:=newS3OrderedHasher(5<<20)
+    _,_=h.Write(data[:100])
+    _,_=h.Write(data[100:])
+    _,actual:=h.sums()
+    require.Equal(t,expected,actual)
+
+    state:=filepath.Join(t.TempDir(),"wal")
+    wal,err:=ksink.OpenTransactionLog(state)
+    require.NoError(t,err)
+    fake:=newFakeOrderedS3()
+    p,err:=newS3OrderedPublisherWithClient(testOrderedS3Pattern,S3OrderedOpts{MultipartPartSize:5<<20},fake)
+    require.NoError(t,err)
+    _,err=newS3OrderedTopicMaterializerWithPublisher(wal,p,1,time.Minute)
+    require.NoError(t,err)
+    _,err=wal.AppendTopicBatch([]ksink.WALTopicRecord{{Topic:"big",Data:data}})
+    require.NoError(t,err)
+    digest:=sha256.Sum256(data)
+    fake.objects["root/big/messages-00000001.jsonl"]=fakeStoredOrderedS3Object(
+        data,map[string]string{
+            "ksink-sha256":hex.EncodeToString(digest[:]),"ksink-part-size":strconv.FormatInt(5<<20,10),
+        },5<<20)
+    require.NoError(t,wal.Close())
+    wal,err=ksink.OpenTransactionLog(state)
+    require.NoError(t,err)
+    defer func(){require.NoError(t,wal.Close())}()
+    // The new part-size setting differs; recovery uses metadata only to
+    // reconstruct boundaries, and the S3-validated checksum as authority.
+    p,err=newS3OrderedPublisherWithClient(testOrderedS3Pattern,S3OrderedOpts{MultipartPartSize:8<<20},fake)
+    require.NoError(t,err)
+    w,err:=newS3OrderedTopicMaterializerWithPublisher(wal,p,1,time.Minute)
+    require.NoError(t,err)
+    require.NoError(t,w.Flush(context.Background()))
+    require.Equal(t,int64(1),wal.TopicProgress("big").Cursor)
+    require.Zero(t,fake.puts)
+    require.Zero(t,fake.creates)
+    require.Equal(t,expected,fake.objects["root/big/messages-00000001.jsonl"].checksum)
+}
+
+func TestS3OrderedMultipartPartChecksumMismatchFailsClosed(t *testing.T) {
+    wal:=orderedTestLog(t)
+    fake:=newFakeOrderedS3()
+    fake.corruptPart=true
+    p,err:=newS3OrderedPublisherWithClient(testOrderedS3Pattern,S3OrderedOpts{MultipartPartSize:5<<20},fake)
+    require.NoError(t,err)
+    w,err:=newS3OrderedTopicMaterializerWithPublisher(wal,p,1,time.Minute)
+    require.NoError(t,err)
+    _,err=wal.AppendTopicBatch([]ksink.WALTopicRecord{{Topic:"big",Data:bytes.Repeat([]byte("x"),(5<<20)+1)}})
+    require.NoError(t,err)
+    require.ErrorContains(t,w.Flush(context.Background()),"BadDigest")
+    require.Zero(t,wal.TopicProgress("big").Cursor)
+    require.Empty(t,fake.objects)
+    require.Equal(t,1,fake.aborts)
 }
 
 func TestS3OrderedOutputBindingAndHeadFailure(t *testing.T) {
