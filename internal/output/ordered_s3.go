@@ -35,6 +35,7 @@ type S3OrderedOpts struct {
 // s3OrderedAPI isolates S3 transport for deterministic publication tests.
 type s3OrderedAPI interface {
     HeadObject(context.Context, *s3.HeadObjectInput, ...func(*s3.Options)) (*s3.HeadObjectOutput, error)
+    GetObject(context.Context, *s3.GetObjectInput, ...func(*s3.Options)) (*s3.GetObjectOutput, error)
     PutObject(context.Context, *s3.PutObjectInput, ...func(*s3.Options)) (*s3.PutObjectOutput, error)
     CreateMultipartUpload(context.Context, *s3.CreateMultipartUploadInput, ...func(*s3.Options)) (*s3.CreateMultipartUploadOutput, error)
     UploadPart(context.Context, *s3.UploadPartInput, ...func(*s3.Options)) (*s3.UploadPartOutput, error)
@@ -206,6 +207,28 @@ func (p *S3OrderedPublisher) inspect(ctx context.Context, key string) (s3Ordered
     return s3OrderedObject{size:aws.ToInt64(out.ContentLength),digest:out.Metadata["ksink-sha256"]},true,nil
 }
 
+// verifyBody attests an already-published object's bytes rather than treating
+// client-controlled S3 user metadata as proof of contents. This is deliberately
+// a streaming GET: recovery should prefer correctness over bandwidth.
+func (p *S3OrderedPublisher) verifyBody(ctx context.Context, key string, size int64, digest string) error {
+    reqCtx,cancel:=context.WithTimeout(ctx,p.opts.RequestTimeout)
+    defer cancel()
+    out,err:=p.client.GetObject(reqCtx,&s3.GetObjectInput{Bucket:aws.String(p.bucket),Key:aws.String(key)})
+    if err!=nil{return fmt.Errorf("GET s3://%s/%s: %w",p.bucket,key,err)}
+    if out==nil || out.Body==nil{return fmt.Errorf("empty S3 GET body for s3://%s/%s",p.bucket,key)}
+    defer out.Body.Close() //nolint:errcheck
+    if aws.ToInt64(out.ContentLength)!=size {
+        return fmt.Errorf("S3 immutable object conflict for s3://%s/%s (body size differs)",p.bucket,key)
+    }
+    hash:=sha256.New()
+    n,err:=io.Copy(hash,out.Body)
+    if err!=nil{return fmt.Errorf("read S3 object s3://%s/%s: %w",p.bucket,key,err)}
+    if n!=size || hex.EncodeToString(hash.Sum(nil))!=digest {
+        return fmt.Errorf("S3 immutable object conflict for s3://%s/%s (body differs from committed WAL bytes)",p.bucket,key)
+    }
+    return nil
+}
+
 func (p *S3OrderedPublisher) reconcile(ctx context.Context, key string, size int64, digest string) (bool,error) {
     info,exists,err:=p.inspect(ctx,key)
     if err!=nil{return false,err}
@@ -213,6 +236,7 @@ func (p *S3OrderedPublisher) reconcile(ctx context.Context, key string, size int
     if info.size!=size || info.digest!=digest {
         return false,fmt.Errorf("S3 immutable object conflict for s3://%s/%s (size/digest mismatch)",p.bucket,key)
     }
+    if err:=p.verifyBody(ctx,key,size,digest);err!=nil{return false,err}
     return true,nil
 }
 
@@ -342,6 +366,9 @@ func (w *OrderedTopicMaterializer) verifyExistingS3(ctx context.Context,topic st
             if digest!=existing.digest {
                 return 0,0,"",fmt.Errorf("S3 object %q has mismatched committed WAL digest",key)
             }
+            // HEAD's ksink-sha256 metadata is mutable by another writer.
+            // Only the actual object bytes may authorize a WAL receipt.
+            if err:=w.s3.verifyBody(ctx,key,total,digest);err!=nil{return 0,0,"",err}
             return pos+1,total,digest,nil
         }
     }
