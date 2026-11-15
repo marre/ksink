@@ -109,9 +109,8 @@ part checksums in `CompleteMultipartUpload`; and `HeadObject` supporting
 `FULL_OBJECT` or `COMPOSITE` type. The backend must provide read-after-write
 consistency for completed object HEAD requests and uphold the immutability
 contract (use bucket policies to restrict overwrites/deletes by other actors).
-Objects published by older ksink versions without S3-validated checksums
-cannot be automatically reconciled if their WAL receipt was not durable:
-migrate or verify them explicitly; user metadata alone is insufficient.
+No legacy S3 object format is supported: all ksink-managed objects must use
+this checksum contract from their first upload.
 S3-compatible providers (including MinIO) **must be tested for these exact
 behaviors**; compatibility must not be assumed from generic S3 API support.
 
