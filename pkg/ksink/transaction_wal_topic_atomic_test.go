@@ -54,12 +54,12 @@ func TestSharedWALUnacceptedBatchDoesNotAdvanceProducerCheckpoint(t *testing.T) 
 
 	// An accepted producer state is allowed only inside the topic acceptance
 	// delimiter. Crash after a complete record frame but before that marker.
-	frame, err := txnWALFrame(transactionWALRecord{
+	frame, err := txnWALFrameWithSequence(transactionWALRecord{
 		Type: "topic-output", TopicOutput: &WALTopicRecord{
 			Topic: "orders", Offset: 0, TransactionID: "orders-producer",
 			Instance: instance, Data: []byte("not-accepted"),
 		},
-	})
+	}, wal.nextFrameSeq)
 	require.NoError(t, err)
 	_, err = wal.logFile.Write(frame)
 	require.NoError(t, err)
@@ -93,7 +93,7 @@ func TestSharedWALRecoversCommitDecisionWhenSeparateMarkerMissing(t *testing.T) 
 	state.States["orders-producer"] = st
 	// Simulate a crash after the complete persisted coordinator state but
 	// before a separate topic-decision history marker is written.
-	frame, err := txnWALFrame(transactionWALRecord{Type: "state", State: &state})
+	frame, err := txnWALFrameWithSequence(transactionWALRecord{Type: "state", State: &state}, wal.nextFrameSeq)
 	require.NoError(t, err)
 	_, err = wal.logFile.Write(frame)
 	require.NoError(t, err)
@@ -298,8 +298,8 @@ func TestSharedWALTornMultiTopicBatchDoesNotExposePartialRecords(t *testing.T) {
 	// A complete, checksummed record frame is not a committed batch until
 	// the acceptance delimiter is durable. This frame belongs to an
 	// interrupted batch that would also have contained a payments record.
-	frame,err:=txnWALFrame(transactionWALRecord{Type:"topic-output",
-		TopicOutput:&WALTopicRecord{Topic:"orders",Offset:1,Data:[]byte("unaccepted")}})
+	frame,err:=txnWALFrameWithSequence(transactionWALRecord{Type:"topic-output",
+		TopicOutput:&WALTopicRecord{Topic:"orders",Offset:1,Data:[]byte("unaccepted")}}, wal.nextFrameSeq)
 	require.NoError(t,err)
 	_,err=wal.logFile.Write(frame)
 	require.NoError(t,err)
