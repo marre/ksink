@@ -4,6 +4,7 @@ import (
     "bytes"
     "context"
     "crypto/sha256"
+    "encoding/base64"
     "encoding/hex"
     "fmt"
     "io"
@@ -101,6 +102,7 @@ func TestOrderedS3MinIOPublicationAndRecovery(t *testing.T) {
         Body:bytes.NewReader([]byte("second\n")),
         ContentLength:aws.Int64(int64(len("second\n"))),
         IfNoneMatch:aws.String("*"),
+        ChecksumSHA256:aws.String(base64.StdEncoding.EncodeToString(sum[:])),
         Metadata:map[string]string{"ksink-sha256":hex.EncodeToString(sum[:]),"ksink-version":"ordered-v1"},
     })
     require.NoError(t,err)
@@ -133,14 +135,16 @@ func TestOrderedS3MinIOPublicationAndRecovery(t *testing.T) {
     _,err=wal.AppendTopicBatch([]ksink.WALTopicRecord{{Topic:"orders",Data:[]byte("third\n")}})
     require.NoError(t,err)
     key="data/orders/messages-00000003.jsonl"
+    wrongChecksum:=sha256.Sum256([]byte("wrong\n"))
     _,err=client.PutObject(ctx,&s3.PutObjectInput{
         Bucket:aws.String(bucket),Key:aws.String(key),
         Body:bytes.NewReader([]byte("wrong\n")),
+        ChecksumSHA256:aws.String(base64.StdEncoding.EncodeToString(wrongChecksum[:])),
         Metadata:map[string]string{"ksink-sha256":hex.EncodeToString(sum[:])},
     })
     require.NoError(t,err)
     err=w.Flush(ctx)
-    require.ErrorContains(t,err,"mismatch")
+    require.ErrorContains(t,err,"server-validated SHA256 checksum differs")
     require.Equal(t,int64(2),wal.TopicProgress("orders").Cursor)
     // Run real Kafka multi-topic transactions into this same S3 backend.
     // A committed object may contain multiple transactions, while aborted
