@@ -202,6 +202,8 @@ func TestWALFaultExternalCampaign(t *testing.T) {
     ambiguousGroups:=make([]externalFaultAmbiguousTxn,0)
     order:=map[string]int{"orders":0,"payments":0}
     lastNext:=map[string]int64{"orders":0,"payments":0}
+    attemptedTransactions:=0
+    completedRestarts:=0
     emit(externalFaultEvent{Operation:"campaign",Phase:"start",
         Payloads:[]string{fmt.Sprintf("seed=%d cycles=%d transactions=%d",seed,cycles,transactions)}})
 
@@ -229,6 +231,7 @@ func TestWALFaultExternalCampaign(t *testing.T) {
             )
             require.NoError(t,clientErr)
             require.NoError(t,client.BeginTransaction())
+            attemptedTransactions++
             for _,rec:=range records {
                 data:=strings.TrimSuffix(string(rec.Value),"\n")
                 all[data]=&externalFaultMessage{
@@ -297,7 +300,11 @@ func TestWALFaultExternalCampaign(t *testing.T) {
             require.LessOrEqual(t,recovered.TopicStableOffset(topic),offset)
         }
         require.NoError(t,recovered.Close())
+        completedRestarts++
     }
+    require.Equal(t,cycles,completedRestarts,"validation must execute every configured process restart")
+    require.Equal(t,cycles*transactions,attemptedTransactions,"validation must attempt every scheduled transaction")
+    require.Len(t,all,2*attemptedTransactions,"each attempted transaction must enroll both topics")
 
     // Converge without faults, then perform a final graceful flush.
     final,logs:=externalFaultAwaitStart(t,binary,addr,walRoot,outputRoot)
@@ -334,9 +341,9 @@ func TestWALFaultExternalCampaign(t *testing.T) {
     require.NoError(t,externalFaultCheckAmbiguousTransactions(ambiguousGroups,seen),
         "an indeterminate EndTxn must never leave only some participant topics committed")
     emit(externalFaultEvent{Operation:"verify",Phase:"ok",
-        Payloads:[]string{fmt.Sprintf("confirmed=%d ambiguous=%d grouped_transactions=%d",confirmed,ambiguous,len(ambiguousGroups))}})
-    t.Logf("external WAL campaign passed: seed=%d cycles=%d transactions/cycle=%d confirmed=%d ambiguous=%d history=%s",
-        seed,cycles,transactions,confirmed,ambiguous,historyPath)
+        Payloads:[]string{fmt.Sprintf("restarts=%d attempted_transactions=%d confirmed=%d ambiguous=%d grouped_transactions=%d",completedRestarts,attemptedTransactions,confirmed,ambiguous,len(ambiguousGroups))}})
+    t.Logf("WAL crash-consistency campaign passed: seed=%d restarts=%d attempted_transactions=%d transactions/cycle=%d confirmed=%d ambiguous=%d history=%s",
+        seed,completedRestarts,attemptedTransactions,transactions,confirmed,ambiguous,historyPath)
 }
 
 // Ensure the log is valid newline-delimited JSON independent of WAL files.
