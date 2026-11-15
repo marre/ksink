@@ -17,7 +17,7 @@ import (
 )
 
 const (
-	transactionWALVersion = 4
+	transactionWALVersion = 5
 	transactionWALMaxFrame = 64 << 20
 	// Compact only when enough WAL bytes are obsolete AND reclaiming
 	// them would remove a meaningful fraction of the file. A 1 GiB
@@ -127,6 +127,7 @@ type TransactionLog struct {
 	markerRefs map[string]walFrameRef
 	faultHook func(string) error // test-only, called while holding mu
 	segmentLimit int64 // tests may reduce rotation threshold; defaults to 64 MiB
+	nextFrameSeq uint64 // monotonic physical frame sequence across snapshots/segments
 }
 
 func txnWALValidInstance(instance string) bool {
@@ -235,7 +236,7 @@ func OpenTransactionLog(path string) (*TransactionLog, error) {
 			_ = log.Close()
 			return nil, fmt.Errorf("create WAL bootstrap marker: %w", err)
 		}
-		_, err = marker.Write([]byte("ksink-wal-v4\n"))
+		_, err = marker.Write([]byte("ksink-wal-v5\n"))
 		if err == nil {
 			err = marker.Sync()
 		}
@@ -277,6 +278,7 @@ func (l *TransactionLog) resetReplay() {
 	l.formatBindingRef=walFrameRef{}
 	l.size=0
 	l.reclaimable=0
+	l.nextFrameSeq=1
 }
 
 func (l *TransactionLog) load() error {
@@ -304,8 +306,9 @@ func (l *TransactionLog) scanWALFile(key walFileKey, active bool) error {
 		offset, bytes int64
 	}
 	var pendingStart int64
+	var pendingStartSeq uint64
 	for {
-		var header [8]byte
+		var header [txnWALHeaderBytes]byte
 		n,err:=io.ReadFull(f,header[:])
 		if errors.Is(err,io.EOF)&&n==0{break}
 		if errors.Is(err,io.EOF)||errors.Is(err,io.ErrUnexpectedEOF){
@@ -313,23 +316,25 @@ func (l *TransactionLog) scanWALFile(key walFileKey, active bool) error {
 			break
 		}
 		if err!=nil{return fmt.Errorf("read WAL header in %s at %d: %w",path,offset,err)}
-		length:=binary.BigEndian.Uint32(header[:4])
-		if length==0 || length>transactionWALMaxFrame {
-			return fmt.Errorf("invalid WAL record length %d in %s at %d",length,path,offset)
+		length,seq,err:=txnWALHeader(header[:])
+		if err!=nil{return fmt.Errorf("invalid WAL frame header in %s at %d: %w",path,offset,err)}
+		if seq<l.nextFrameSeq {
+			return fmt.Errorf("non-monotonic WAL frame sequence %d in %s at %d (next %d)",seq,path,offset,l.nextFrameSeq)
 		}
 		payload:=make([]byte,length)
 		if _,err=io.ReadFull(f,payload);errors.Is(err,io.EOF)||errors.Is(err,io.ErrUnexpectedEOF){
 			if !active{return fmt.Errorf("truncated sealed WAL record in %s at %d",path,offset)}
 			break
 		}else if err!=nil{return fmt.Errorf("read WAL record in %s: %w",path,err)}
-		if crc32.Checksum(payload,transactionWALCRCTable)!=binary.BigEndian.Uint32(header[4:]) {
+		if crc32.Checksum(payload,transactionWALCRCTable)!=binary.BigEndian.Uint32(header[20:24]) {
 			return fmt.Errorf("transaction WAL checksum mismatch in %s at %d",path,offset)
 		}
 		rec,err:=decodeTxnWALRecord(payload)
 		if err!=nil{return fmt.Errorf("decode WAL record in %s at %d: %w",path,offset,err)}
+		l.nextFrameSeq=seq+1
 		frameSize := int64(len(header))+int64(length)
 		if rec.Type == "topic-output" {
-			if len(pending) == 0 { pendingStart = offset }
+			if len(pending) == 0 { pendingStart = offset;pendingStartSeq=seq }
 			if len(pending) >= maxTopicAcceptanceBatchRecords {
 				return fmt.Errorf("topic WAL acceptance batch too large in %s at %d", path, offset)
 			}
@@ -367,6 +372,7 @@ func (l *TransactionLog) scanWALFile(key walFileKey, active bool) error {
 		// A complete prefix of an unacknowledged multi-record batch is NOT
 		// accepted data. Discard it atomically on active-tail recovery.
 		offset=pendingStart
+		l.nextFrameSeq=pendingStartSeq
 	}
 	if info.Size()!=offset {
 		if !active{return fmt.Errorf("sealed WAL %s has incomplete tail",path)}
@@ -638,7 +644,9 @@ func (l *TransactionLog) appendBatchLocked(records []transactionWALRecord) error
 	frames:=make([][]byte,0,len(records)+2)
 	var total int64
 	addFrame:=func(rec transactionWALRecord)error{
-		buf,err:=txnWALFrame(rec)
+		seq:=l.nextFrameSeq+uint64(len(frames))
+		if seq<l.nextFrameSeq || seq==^uint64(0) {return errors.New("WAL frame sequence exhausted")}
+		buf,err:=txnWALFrameWithSequence(rec,seq)
 		if err!=nil{return err}
 		frames=append(frames,buf)
 		total+=int64(len(buf))
@@ -659,16 +667,13 @@ func (l *TransactionLog) appendBatchLocked(records []transactionWALRecord) error
 		// Repeat the current state and binding at each segment boundary so
 		// earlier sealed segments become independently reclaimable once
 		// their payloads and terminal markers are obsolete.
-		var prefix [][]byte
+		frames=frames[:0]
+		total=0
 		if l.binding!=""{
-			b,err:=txnWALFrame(transactionWALRecord{Type:"binding",Binding:l.binding})
-			if err!=nil{return err}
-			prefix=append(prefix,b)
+			if err:=addFrame(transactionWALRecord{Type:"binding",Binding:l.binding});err!=nil{return err}
 		}
-		b,err:=txnWALFrame(transactionWALRecord{Type:"state",State:&l.state})
-		if err!=nil{return err}
-		prefix=append(prefix,b)
-		frames=append(prefix,frames...)
+		if err:=addFrame(transactionWALRecord{Type:"state",State:&l.state});err!=nil{return err}
+		for _,rec:=range records{if err:=addFrame(rec);err!=nil{return err}}
 		current=&walFileStats{}
 		l.fileStats[key]=current
 	}
@@ -712,6 +717,7 @@ func (l *TransactionLog) appendBatchLocked(records []transactionWALRecord) error
 	}
 	current.size+=written
 	l.size+=written
+	l.nextFrameSeq+=uint64(len(frames))
 	if err:=l.maybeCompactLocked();err!=nil{
 		l.broken=fmt.Errorf("transaction WAL compaction failed: %w",err)
 		return l.broken
