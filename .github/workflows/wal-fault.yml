@@ -1,13 +1,14 @@
 name: WAL external crash qualification
+run-name: WAL fault validation (${{ inputs.profile }})
 
 on:
   workflow_dispatch:
     inputs:
       profile:
-        description: 'Run one smoke shard or the 10,000-restart / 100,000-transaction qualification matrix'
+        description: 'Select the full 10,000-restart qualification (default) or a quick smoke check'
         type: choice
         required: true
-        default: smoke
+        default: qualification
         options:
           - smoke
           - qualification
@@ -25,6 +26,7 @@ jobs:
       matrix:
         shard: ${{ fromJSON(inputs.profile == 'qualification' && '[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24]' || '[0]') }}
     env:
+      KSINK_FAULT_PROFILE: ${{ inputs.profile }}
       KSINK_FAULT_CYCLES: ${{ inputs.profile == 'qualification' && '400' || '4' }}
       KSINK_FAULT_TXNS_PER_CYCLE: ${{ inputs.profile == 'qualification' && '10' || '3' }}
       KSINK_FAULT_SEED: ${{ matrix.shard }}
@@ -34,8 +36,46 @@ jobs:
       - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
+      - name: Verify selected profile and display planned workload
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "$KSINK_FAULT_PROFILE" in
+            qualification)
+              [[ "$KSINK_FAULT_CYCLES" == 400 && "$KSINK_FAULT_TXNS_PER_CYCLE" == 10 ]]
+              [[ ${{ matrix.shard }} -ge 0 && ${{ matrix.shard }} -le 24 ]]
+              shards=25
+              ;;
+            smoke)
+              [[ "$KSINK_FAULT_CYCLES" == 4 && "$KSINK_FAULT_TXNS_PER_CYCLE" == 3 ]]
+              [[ ${{ matrix.shard }} == 0 ]]
+              shards=1
+              ;;
+            *) echo "Invalid fault validation profile: $KSINK_FAULT_PROFILE" >&2; exit 1 ;;
+          esac
+          attempts_per_shard=$(( KSINK_FAULT_CYCLES * KSINK_FAULT_TXNS_PER_CYCLE ))
+          total_attempts=$(( shards * attempts_per_shard ))
+          total_restarts=$(( shards * KSINK_FAULT_CYCLES ))
+          echo "Profile=$KSINK_FAULT_PROFILE, shard=${{ matrix.shard }}/$shards, cycles=$KSINK_FAULT_CYCLES, transactions/cycle=$KSINK_FAULT_TXNS_PER_CYCLE"
+          echo "Total planned across all shards: $total_restarts restarts, $total_attempts transactions"
+          {
+            echo "### WAL crash-consistency validation"
+            echo "Profile: **$KSINK_FAULT_PROFILE**; shard: **${{ matrix.shard }}** of **$shards**"
+            echo "Per shard: **$KSINK_FAULT_CYCLES** restarts and **$attempts_per_shard** transactions"
+            echo "All shards planned: **$total_restarts** restarts and **$total_attempts** transactions"
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Confirm external campaign test is discoverable
+        shell: bash
+        run: |
+          set -euo pipefail
+          go test -list 'TestWALFaultExternalCampaign' ./internal/integration | grep -Fx 'TestWALFaultExternalCampaign'
       - name: Run real CLI/Kafka SIGKILL and restart campaign
-        run: go test -count=1 -timeout=160m -run '^TestWALFaultExternalCampaign$' ./internal/integration
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p test-artifacts
+          go test -count=1 -v -timeout=160m -run 'TestWALFaultExternalCampaign' ./internal/integration 2>&1 | tee test-artifacts/fault-test-output.log
+          grep -Eq '^--- PASS: TestWALFaultExternalCampaign ' test-artifacts/fault-test-output.log
       - name: Preserve durable external history
         if: always()
         uses: actions/upload-artifact@v4
@@ -45,7 +85,7 @@ jobs:
           if-no-files-found: warn
           retention-days: 30
 
-# Opt-in qualification: 25 shards x 400 process kills/restarts = 10,000
+# Default qualification: 25 shards x 400 process kills/restarts = 10,000
 # process restarts, 25 x 400 x 10 transaction histories = 100,000 transactions.
 # This test verifies process-crash safety, not physical power-loss or actual
 # EIO/EDQUOT behavior. Those need privileged storage fault infrastructure.
