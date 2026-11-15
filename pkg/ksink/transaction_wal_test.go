@@ -3,7 +3,6 @@ package ksink
 import (
 	"bytes"
 	"errors"
-	"encoding/binary"
 	"os"
 	"path/filepath"
 	"testing"
@@ -137,9 +136,10 @@ func TestTransactionWALTornTailTruncatedAndChecksumCorruptionRejected(t *testing
 
 	f, err = os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0600)
 	require.NoError(t, err)
-	var hdr [8]byte
-	binary.BigEndian.PutUint32(hdr[:4], 3)
-	_, err = f.Write(append(hdr[:], []byte("bad")...)) // full, corrupt frame
+	frame, frameErr := txnWALFrameWithSequence(transactionWALRecord{Type:"binding",Binding:"bad"},again.nextFrameSeq)
+	require.NoError(t,frameErr)
+	frame[len(frame)-1]^=0x80
+	_, err = f.Write(frame) // complete header and length, corrupt payload CRC
 	require.NoError(t, err)
 	require.NoError(t, f.Close())
 	_, err = OpenTransactionLog(filepath.Join(root, ".ksink-kafka-state"))
