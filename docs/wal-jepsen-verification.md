@@ -1,125 +1,163 @@
-# WAL fault testing and consistency model
+# WAL crash-consistency and external history verification
 
-This document defines what a Jepsen-style checker should test for ksink's
-**single-owner, single-partition-per-topic** WAL. It is not a claim that the
-system is a replicated database or that a full Jepsen run has passed.
+Ksink is a **single-owner WAL, with one Kafka partition (0) per topic and
+independent per-topic committed-only output files**. The tests below do not
+make it a replicated Kafka broker or prove exactly-once downstream effects.
+A successful Produce or EndTxn acknowledgment means the **shared local WAL**
+has passed its fsync boundary, not that a corresponding output file or S3
+object is already visible.
 
-## Supported semantics and linearization points
+## WAL v5 frame format (manifest v4)
 
-* **Produce:** successful ordered Produce has durably appended its output
-  records and producer-sequence snapshot in one WAL acceptance group. The
-  successful `fsync` is the durability boundary. A lost response is
-  indeterminate; a correct idempotent retry must not allocate another offset.
-* **EndTxn:** one WAL terminal frame establishes the irreversible commit/abort
-  outcome and allocates a marker in every enrolled topic. The successful
-  `fsync` is the terminal-decision durability boundary.
-* **Publication:** output consists of an immutable, per-topic prefix of
-  committed application records in ascending WAL offset order. Publication
-  receipts and file sequences survive restart. For S3, an existing object
-  must be attested against actual body bytes before a receipt is written.
-* **Recovery:** a torn active append that has no accepted delimiter may be
-  discarded; established sealed records must fail closed on corruption.
-  Any ambiguous I/O or `fsync` error must stop future acknowledgements.
+Each frame is self-identifying, not an unversioned length/CRC tuple:
 
-The model does **not** promise simultaneously visible files/objects across
-different topics, Kafka Fetch/consumer groups, `sendOffsetsToTransaction`,
-exactly-once downstream side effects, consensus/replication, or tolerance of
-two independent writers or broken storage `fsync` contracts.
+| Byte offset | Size | Field |
+| --- | ---: | --- |
+| 0 | 4 | Magic `KSWL` |
+| 4 | 2 | Envelope version 1, big endian |
+| 6 | 2 | Fixed header length 28 |
+| 8 | 8 | Monotonically increasing physical frame sequence |
+| 16 | 4 | Payload length, max 64 MiB |
+| 20 | 4 | CRC32C of the payload |
+| 24 | 4 | CRC32C of header bytes 0–23 |
 
-## History schema
+The payload is versioned WAL record metadata or binary output data.
+Checkpoint generations use new, greater sequence numbers; WAL replay
+requires strictly increasing sequences across referenced snapshots and
+segments. Indexed reads validate both checksums. A partially written
+unaccepted active tail can be discarded, but corruption in complete
+frames or referenced sealed segments fails closed. Header magic, version
+and header-integrity violations are not silently treated as valid data.
+The manifest version and on-disk WAL version were deliberately bumped;
+**no on-disk migration or backward compatibility is provided**.
 
-Capture a durable external history containing:
+## Supported linearization points
 
-`client-id, invocation-id, operation, txn-id, producer-id, epoch,
-topic, sequence-range, payload-id, invoke-time, complete-time,
-response, returned-offset`.
+* **Produce:** acceptance and producer dedup state are one replay-atomic
+  WAL batch. Success requires an fsync. A lost response after fsync is
+  indeterminate; idempotent retry must not allocate another Kafka offset.
+* **EndTxn:** one durable terminal record fixes COMMIT/ABORT and control
+  markers for all enrolled topics, with a single fsync boundary.
+* **Publication:** ordered immutable final files contain a committed-only
+  prefix per topic. Publication receipts and independent file sequences
+  are journaled back to the WAL. A crash after publication but before a
+  receipt is resolved against the existing final name/bytes.
+* **S3 publication:** conditional `If-None-Match: *` plus server-validated
+  SHA-256 checksums (full-object or composite multipart) and checksum-mode
+  `HeadObject` reconcile existing objects **without downloading them**.
+* **Recovery:** after ambiguous write/fsync, the owner must stop
+  acknowledging mutations. Startup either reconstructs a valid history
+  or rejects corrupted/unsupported storage.
 
-Operations: `init-producer`, `add-topic`, `produce`, `commit`,
-`abort`, `kill`, `restart`, `read-output`, `inspect-wal`.
+## Safety invariants
 
-Each payload needs a unique run/client/transaction/operation ID. Treat a
-timeout, disconnection, or killed client as **indeterminate**, not as failure
-or success. The checker must reconcile indeterminate operations against
-subsequent retries and recovered WAL/output state.
+1. Successfully acknowledged committed records are not lost after
+   restart and final convergence.
+2. Abort/undecided payloads never enter committed output.
+3. Idempotent retries preserve the original topic offset, without
+   duplicates, even after a lost response.
+4. Topic offsets and file sequences do not regress or collide. Kafka
+   control markers occupy offsets but never appear in final files.
+5. A transaction instance has one irreversible outcome, including
+   across multi-topic transactions and producer epoch fencing.
+6. Each topic's files preserve committed WAL offset order.
+7. No final S3 key or local file name is successfully overwritten with
+   different bytes after a crash or a competing writer.
+8. An EIO, ENOSPC, EDQUOT, short write, fsync or manifest failure poisons
+   the current owner; it cannot acknowledge further data.
+9. At most one cooperating process holds the same WAL directory lock.
+10. Referenced sealed frames and snapshots must never be silently
+    discarded on corruption, version mismatch or missing files.
 
-## Required safety invariants
-
-1. No successful, committed Produce is missing after recovery and convergence.
-2. Aborted and undecided transaction data never appears in committed output.
-3. A retained idempotent batch retry returns its original offset without a
-   second logical record, including lost acknowledgements.
-4. Per-topic offsets never collide or regress; control markers occupy offsets
-   but do not appear as application data.
-5. Each transaction instance has one irreversible terminal outcome across its
-   topic participants, even if its EndTxn response is lost.
-6. Output equals the committed-only projection of a stable per-topic WAL
-   prefix, in exactly the same offset order.
-7. Immutable output names never refer to different bytes, including after
-   crash-between-publication-and-receipt.
-8. Old producer epochs are fenced after a newer epoch or a server restart.
-9. After disk I/O or `fsync` ambiguity, the old owner cannot continue to ack
-   mutations; restart either recovers an internally consistent history or
-   fails closed on verified corruption.
-10. At most one cooperating process owns any WAL at a time.
-
-## Deterministic CI tests
-
-Run:
+## Deterministic CI coverage
 
 ```sh
 go test -race -count=1 ./...
-go test -count=1 ./pkg/ksink -run 'TestKafkaCRC|TestWALJepsen'
-go test -count=1 ./internal/output -run 'TestS3Ordered'
+go test -count=1 ./pkg/ksink -run 'TestWALJepsen|TestSharedWAL|TestTransactionWAL'
+go test -count=1 ./internal/integration -run 'TestOrderedS3MinIOPublicationAndRecovery'
 ```
 
-The `TestWALJepsen*` tests exercise process ownership, active-tail byte
-cuts, and after-fsync/before-response ambiguity for both Produce and
-multi-topic terminal decisions. Kafka CRC tests verify no producer-sequence
-or offset consumption on malformed input. S3 recovery tests verify
-server-validated SHA-256 HEAD reconciliation (without object downloads), checksum-mismatch and missing-checksum fail-closed errors.
+The WAL fault matrix injects Linux EIO/ENOSPC/EDQUOT, short successful
+writes, errors before and after append fsync, checkpoint creation/write/
+fsync/directory sync, segment create/fsync, manifest write/short-write/
+rename/parent directory fsync, segment rotation, and garbage collection.
+It verifies fail-stop, active-tail repair, and acknowledged-prefix safety
+after independent restart. Dedicated tests alter each frame header
+integrity field and replay the resulting on-disk corruption. Other
+tests exercise byte cuts, post-fsync lost responses, checkpoints,
+multiple topics, producer dedup, and owner SIGKILL/lock release.
 
-Existing WAL suites additionally cover segment rotation, compaction,
-unaccepted acceptance groups, and sealed checksum corruption. All these
-tests belong in the normal PR CI, but a passing unit suite is **not** a
-substitute for crash-consistency validation under real process and
-filesystem failure.
+The pinned MinIO integration exercises actual concurrent conditional
+`PutObject` publishers (independent WALs with the same final S3 key)
+and racing SHA-256 multipart completions, enforcing a single winner
+and rejecting all conflicting publication receipts. Unit tests also
+cover lost upload completion responses, checksum absence/mismatch,
+corrupted bodies and changing multipart boundary settings.
 
-## External fault campaign before declaring Jepsen-ready
+The injected syscall error is returned **at the real WAL code boundary**,
+but is not itself a real kernel EIO/ENOSPC, and does not simulate drive
+write caches or unflushed filesystem journal sectors.
 
-Run a black-box Kafka-client history checker using real idempotent and
-transactional clients against ksink, capturing the history outside ksink's
-WAL. Randomize the following faults:
+## External black-box crash campaign
 
-* SIGKILL at every WAL append, sync, acceptance delimiter, terminal decision,
-  manifest switch, compaction checkpoint and publication receipt boundary.
-* Response drops after durable Produce/EndTxn and after S3 PUT/MPU completion.
-* EIO, short write, ENOSPC, EDQUOT, failed file/parent-directory `fsync`,
-  missing segments and injected active-tail/sealed-frame corruption.
-* Concurrent writers to the same S3 key, 409/412, checksum HEAD timeouts, lost
-  multipart completion responses and orphaned uploads.
-* Transactional producers across topics, up to five inflight idempotent
-  batches, overlapping commits/aborts, restart/fencing, and owner takeover.
-* Local WAL on a dedicated supported filesystem; test power-loss semantics
-  separately with block-device failure injection, not just SIGKILL.
+`TestWALJepsenExternalCampaign` builds and starts the **actual ksink CLI**
+as a child process, uses Kafka transactional clients to Produce/Commit/
+Abort across two topics, and records invocation/response histories in
+fsynced JSONL **outside** the target WAL directory. It kills the server
+with SIGKILL (including EndTxn-in-flight), restarts the owner, checks
+per-topic Kafka offsets, then runs a no-fault final convergence/flush.
+The independent checker rejects ghost, duplicated, out-of-order and
+confirmed-aborted payloads and requires every **confirmed committed**
+payload to appear. An EndTxn with no successful response is classified
+as *indeterminate*; its output is permitted only if it was actually
+produced, never conflated with a confirmed abort.
 
-A release gate should target **at least 100,000 randomized histories** and
-**10,000 kill/restart cycles**, exhaustive defined durable-stage cuts, the
-full disk-error matrix, and a final no-fault convergence phase proving the
-committed WAL projection equals output. These are proposed external
-qualification thresholds, **not executions claimed by this repository**.
+Local reproduction:
 
-## Explicit follow-up work
+```sh
+KSINK_JEPSEN_SEED=42 \
+KSINK_JEPSEN_CYCLES=10 \
+KSINK_JEPSEN_TXNS_PER_CYCLE=10 \
+KSINK_JEPSEN_ARTIFACT_DIR=./test-artifacts \
+go test -count=1 -timeout=30m -run '^TestWALJepsenExternalCampaign$' ./internal/integration
+```
 
-* Version the WAL frame envelope with magic/version, header integrity and a
-  monotonic frame sequence, with unambiguous active-tail repair and
-  fail-closed sealed corruption. A storage-format change needs a separate
-  migration/compatibility plan and must not be silently shipped as a
-  small reliability patch.
-* Expand test-only deterministic failpoints to cover file writes, real
-  `fsync` failures, manifest `rename` and directory `fsync`, receipt
-  appends, and segment deletion; add an external fault-proxy/MinIO race suite.
-* Add a standalone linearizability/transaction-history checker and
-  black-box fault orchestration. The bounded unit tests above are only
-  building blocks of that campaign.
-* Treat WAL on network/shared filesystems and concurrent noncooperating
-  writers as unsupported until separately qualified.
+The manual GitHub Actions workflow
+[`WAL external crash qualification`](../.github/workflows/wal-jepsen.yml)
+offers a small smoke profile or a sharded **qualification** profile:
+25 shards × 400 independent kill/restart cycles × 10 transaction
+attempts = **10,000 restart cycles and 100,000 transaction attempts**.
+It writes per-shard JSONL histories to CI artifacts and limits
+concurrent shards to control CI cost. **These counts are configured
+targets, not evidence that a qualification workflow has run.**
+Do not claim completion until all 25 shards have actually passed and
+their histories/reports have been inspected.
+
+## Separate destructive qualifications still needed
+
+* **Real power loss:** filesystem/block-device flush and rename
+  durability require controlled hardware, loop-device/dm-flakey,
+  or VM disk-fault infrastructure. SIGKILL cannot simulate loss of
+  data that the kernel acknowledged as cached.
+* **Physical storage exhaustion:** use a restricted filesystem/volume
+  to induce actual ENOSPC/EDQUOT, and I/O fault injection to cause
+  kernel-level EIO and directory fsync errors.
+* **Network and object-store faults:** run against the intended AWS S3
+  or S3-compatible production version with injected slow/failed HEAD,
+  dropped PUT/CompleteMultipartUpload responses, 409/412 races and
+  orphaned MPU cleanup. The pinned MinIO races verify conditional
+  semantics but do not represent every object store.
+* **Producer-history breadth:** the external CLI campaign validates
+  committed-only projection and ambiguous EndTxn with multiple topics.
+  Comprehensive Jepsen certification would additionally need
+  concurrent overlapping producers, five in-flight batches, response
+  partitioning, producer ID fencing under sustained partitions, and
+  independent read/write-linearizability analysis.
+* **Unsupported contracts:** shared/network WAL filesystems, concurrent
+  noncooperating owners, simultaneous cross-topic external visibility,
+  Kafka Fetch/consumer groups, sendOffsetsToTransaction, replication
+  and exactly-once consumer side effects remain outside this design.
+
+A passing test suite, or even a full configured SIGKILL campaign,
+**does not alone establish physical durability guarantees on every
+supported filesystem or S3-compatible backend**.
