@@ -5,7 +5,6 @@ import (
     "context"
     "crypto/sha256"
     "encoding/base64"
-    "encoding/hex"
     "fmt"
     "io"
     "net/http"
@@ -16,6 +15,7 @@ import (
     "github.com/aws/aws-sdk-go-v2/aws"
     "github.com/aws/aws-sdk-go-v2/config"
     "github.com/aws/aws-sdk-go-v2/service/s3"
+    "github.com/aws/aws-sdk-go-v2/service/s3/types"
     "github.com/marre/ksink/internal/output"
     "github.com/marre/ksink/pkg/ksink"
     "github.com/ory/dockertest/v3"
@@ -89,7 +89,14 @@ func TestOrderedS3MinIOPublicationAndRecovery(t *testing.T) {
     require.NoError(t,obj.Body.Close())
     require.Equal(t,"first\n",string(got))
     sum:=sha256.Sum256(got)
-    require.Equal(t,hex.EncodeToString(sum[:]),obj.Metadata["ksink-sha256"])
+    head,err:=client.HeadObject(ctx,&s3.HeadObjectInput{
+        Bucket:aws.String(bucket),Key:aws.String(key),
+        ChecksumMode:types.ChecksumModeEnabled,
+    })
+    require.NoError(t,err)
+    require.Equal(t,base64.StdEncoding.EncodeToString(sum[:]),aws.ToString(head.ChecksumSHA256))
+    require.Equal(t,types.ChecksumTypeFullObject,head.ChecksumType)
+    require.Empty(t,obj.Metadata["ksink-sha256"])
     require.Equal(t,uint64(2),wal.TopicProgress("orders").NextFile)
 
     // Emulate a completed object before the corresponding WAL receipt.
@@ -103,7 +110,6 @@ func TestOrderedS3MinIOPublicationAndRecovery(t *testing.T) {
         ContentLength:aws.Int64(int64(len("second\n"))),
         IfNoneMatch:aws.String("*"),
         ChecksumSHA256:aws.String(base64.StdEncoding.EncodeToString(sum[:])),
-        Metadata:map[string]string{"ksink-sha256":hex.EncodeToString(sum[:]),"ksink-version":"ordered-v1"},
     })
     require.NoError(t,err)
     require.NoError(t,wal.Close())
@@ -140,7 +146,6 @@ func TestOrderedS3MinIOPublicationAndRecovery(t *testing.T) {
         Bucket:aws.String(bucket),Key:aws.String(key),
         Body:bytes.NewReader([]byte("wrong\n")),
         ChecksumSHA256:aws.String(base64.StdEncoding.EncodeToString(wrongChecksum[:])),
-        Metadata:map[string]string{"ksink-sha256":hex.EncodeToString(sum[:])},
     })
     require.NoError(t,err)
     err=w.Flush(ctx)
