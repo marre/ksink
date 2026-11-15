@@ -335,11 +335,10 @@ func (p *S3OrderedPublisher) publish(ctx context.Context,key string,file *os.Fil
             Body:io.NewSectionReader(file,0,size),ContentLength:aws.Int64(size),
             IfNoneMatch:aws.String("*"),
             ChecksumAlgorithm:types.ChecksumAlgorithmSha256,ChecksumSHA256:aws.String(checksum),
-            Metadata:map[string]string{"ksink-sha256":digest,"ksink-version":"ordered-v1"},
         })
         cancel()
     } else {
-        uploadErr=p.multipart(ctx,key,file,size,digest)
+        uploadErr=p.multipart(ctx,key,file,size)
     }
     // Even a 200 response must be independently verified before a durable WAL
     // receipt. A compatible endpoint that silently ignores checksum inputs
@@ -351,16 +350,13 @@ func (p *S3OrderedPublisher) publish(ctx context.Context,key string,file *os.Fil
     return fmt.Errorf("S3 upload returned success but checksum-validated HEAD cannot find s3://%s/%s",p.bucket,key)
 }
 
-func (p *S3OrderedPublisher) multipart(ctx context.Context,key string,file *os.File,size int64,digest string) error {
+func (p *S3OrderedPublisher) multipart(ctx context.Context,key string,file *os.File,size int64) error {
     partSize:=s3OrderedPartSize(size,p.opts.MultipartPartSize)
     reqCtx,cancel:=context.WithTimeout(ctx,p.opts.RequestTimeout)
     started,err:=p.client.CreateMultipartUpload(reqCtx,&s3.CreateMultipartUploadInput{
         Bucket:aws.String(p.bucket),Key:aws.String(key),
         ChecksumAlgorithm:types.ChecksumAlgorithmSha256,ChecksumType:types.ChecksumTypeComposite,
-        Metadata:map[string]string{
-            "ksink-sha256":digest,"ksink-version":"ordered-v1",
-            "ksink-part-size":strconv.FormatInt(partSize,10),
-        },
+        Metadata:map[string]string{"ksink-part-size":strconv.FormatInt(partSize,10)},
     })
     cancel()
     if err!=nil{return fmt.Errorf("initiate S3 multipart: %w",err)}
