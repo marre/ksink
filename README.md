@@ -430,27 +430,11 @@ shards; run it explicitly rather than adding this cost to every PR.
 To reproduce or customize a shard locally:
 
 ```sh
-KSINK_JEPSEN_SEED=0 KSINK_JEPSEN_CYCLES=400 \\
-KSINK_JEPSEN_TXNS_PER_CYCLE=10 \\
-KSINK_JEPSEN_ARTIFACT_DIR=./test-artifacts \\
-go test -count=1 -timeout=160m -run '^TestWALJepsenExternalCampaign
-
-ksink remains a producer-facing sink, not a complete Kafka broker: it does
-not offer Kafka Fetch/consumer groups, `sendOffsetsToTransaction`, a
-global topic ordering, or an `isolation.level` toggle for filesystem
-output. Filesystem output always follows committed-only visibility.
-
-The ordered writer requires a local filesystem supporting atomic hard-link
-creation and durable file/directory `fsync`. Some network filesystems do not
-provide these guarantees. Disk exhaustion or corruption is an error, not
-an invitation to discard acknowledged WAL records. Output readers control
-their own retention of finished files. The WAL must be sized for the largest
-unresolved transaction and for publication backlog.
-
-An ordered formatted record that produces zero bytes is unsupported: an
-empty record cannot create a visible immutable file while preserving its
-file-sequence receipt.
- ./internal/integration
+KSINK_JEPSEN_SEED=0 \
+KSINK_JEPSEN_CYCLES=400 \
+KSINK_JEPSEN_TXNS_PER_CYCLE=10 \
+KSINK_JEPSEN_ARTIFACT_DIR=./test-artifacts \
+go test -count=1 -timeout=160m -run '^TestWALJepsenExternalCampaign$' ./internal/integration
 ```
 
 The full qualification result must be evaluated from actual completed
