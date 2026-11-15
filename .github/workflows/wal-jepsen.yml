@@ -1,0 +1,51 @@
+name: WAL external crash qualification
+
+on:
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: 'Run one smoke shard or the 10,000-restart / 100,000-transaction qualification matrix'
+        type: choice
+        required: true
+        default: smoke
+        options:
+          - smoke
+          - qualification
+
+permissions:
+  contents: read
+
+jobs:
+  external-campaign:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      max-parallel: 5
+      matrix:
+        shard: ${{ fromJSON(inputs.profile == 'qualification' && '[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24]' || '[0]') }}
+    env:
+      KSINK_JEPSEN_CYCLES: ${{ inputs.profile == 'qualification' && '400' || '4' }}
+      KSINK_JEPSEN_TXNS_PER_CYCLE: ${{ inputs.profile == 'qualification' && '10' || '3' }}
+      KSINK_JEPSEN_SEED: ${{ matrix.shard }}
+      KSINK_JEPSEN_ARTIFACT_DIR: ${{ github.workspace }}/test-artifacts
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: Run real CLI/Kafka SIGKILL and restart campaign
+        run: go test -count=1 -timeout=160m -run '^TestWALJepsenExternalCampaign$' ./internal/integration
+      - name: Preserve durable external history
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: wal-jepsen-${{ inputs.profile }}-${{ matrix.shard }}
+          path: test-artifacts/
+          if-no-files-found: warn
+          retention-days: 30
+
+# Opt-in qualification: 25 shards x 400 process kills/restarts = 10,000
+# process restarts, 25 x 400 x 10 transaction histories = 100,000 transactions.
+# This test verifies process-crash safety, not physical power-loss or actual
+# EIO/EDQUOT behavior. Those need privileged storage fault infrastructure.
