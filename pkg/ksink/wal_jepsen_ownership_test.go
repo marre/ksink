@@ -2,7 +2,6 @@ package ksink
 
 import (
     "bufio"
-    "bytes"
     "context"
     "fmt"
     "os"
@@ -38,8 +37,7 @@ func TestWALJepsenExclusiveProcessOwnership(t *testing.T) {
     child := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestWALJepsenExclusiveProcessOwnership$")
     child.Env = append(os.Environ(),
         "KSINK_TEST_WAL_OWNER_CHILD=1", "KSINK_TEST_WAL_OWNER_DIR="+stateDir)
-    var stderr bytes.Buffer
-    child.Stderr = &stderr
+    child.Stderr = os.Stderr
     pipe, err := child.StdoutPipe()
     require.NoError(t, err)
     stdin, err := child.StdinPipe() // keep open: child blocks holding its WAL lock
@@ -54,12 +52,12 @@ func TestWALJepsenExclusiveProcessOwnership(t *testing.T) {
     })
 
     ready, err := bufio.NewReader(pipe).ReadString('\n')
-    require.NoError(t, err, stderr.String())
-    require.Equal(t, "wal-owner-ready", strings.TrimSpace(ready), stderr.String())
+    require.NoError(t, err)
+    require.Equal(t, "wal-owner-ready", strings.TrimSpace(ready))
 
     _, err = OpenTransactionLog(stateDir)
     require.Error(t, err, "two independent processes must not write one WAL")
-    require.NoError(t, child.Process.Kill(), stderr.String())
+    require.NoError(t, child.Process.Kill())
     require.Error(t, child.Wait(), "SIGKILL should terminate the owning process")
 
     recovered, err := OpenTransactionLog(stateDir)
