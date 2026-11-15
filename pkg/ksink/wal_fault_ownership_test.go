@@ -17,7 +17,7 @@ import (
 // The child process is intentionally killed without running deferred cleanup.
 // This exercises the kernel lock-release semantics rather than an orderly
 // TransactionLog.Close, and detects accidental concurrent WAL ownership.
-func TestWALJepsenExclusiveProcessOwnership(t *testing.T) {
+func TestWALFaultExclusiveProcessOwnership(t *testing.T) {
     if os.Getenv("KSINK_TEST_WAL_OWNER_CHILD") == "1" {
         wal, err := OpenTransactionLog(os.Getenv("KSINK_TEST_WAL_OWNER_DIR"))
         if err != nil {
@@ -34,7 +34,7 @@ func TestWALJepsenExclusiveProcessOwnership(t *testing.T) {
     stateDir := filepath.Join(t.TempDir(), "wal")
     ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
     defer cancel()
-    child := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestWALJepsenExclusiveProcessOwnership$")
+    child := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestWALFaultExclusiveProcessOwnership$")
     child.Env = append(os.Environ(),
         "KSINK_TEST_WAL_OWNER_CHILD=1", "KSINK_TEST_WAL_OWNER_DIR="+stateDir)
     child.Stderr = os.Stderr

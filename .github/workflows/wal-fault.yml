@@ -25,22 +25,22 @@ jobs:
       matrix:
         shard: ${{ fromJSON(inputs.profile == 'qualification' && '[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24]' || '[0]') }}
     env:
-      KSINK_JEPSEN_CYCLES: ${{ inputs.profile == 'qualification' && '400' || '4' }}
-      KSINK_JEPSEN_TXNS_PER_CYCLE: ${{ inputs.profile == 'qualification' && '10' || '3' }}
-      KSINK_JEPSEN_SEED: ${{ matrix.shard }}
-      KSINK_JEPSEN_ARTIFACT_DIR: ${{ github.workspace }}/test-artifacts
+      KSINK_FAULT_CYCLES: ${{ inputs.profile == 'qualification' && '400' || '4' }}
+      KSINK_FAULT_TXNS_PER_CYCLE: ${{ inputs.profile == 'qualification' && '10' || '3' }}
+      KSINK_FAULT_SEED: ${{ matrix.shard }}
+      KSINK_FAULT_ARTIFACT_DIR: ${{ github.workspace }}/test-artifacts
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
       - name: Run real CLI/Kafka SIGKILL and restart campaign
-        run: go test -count=1 -timeout=160m -run '^TestWALJepsenExternalCampaign$' ./internal/integration
+        run: go test -count=1 -timeout=160m -run '^TestWALFaultExternalCampaign$' ./internal/integration
       - name: Preserve durable external history
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: wal-jepsen-${{ inputs.profile }}-${{ matrix.shard }}
+          name: wal-fault-${{ inputs.profile }}-${{ matrix.shard }}
           path: test-artifacts/
           if-no-files-found: warn
           retention-days: 30

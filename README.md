@@ -430,18 +430,18 @@ shards; run it explicitly rather than adding this cost to every PR.
 To reproduce or customize a shard locally:
 
 ```sh
-KSINK_JEPSEN_SEED=0 \
-KSINK_JEPSEN_CYCLES=400 \
-KSINK_JEPSEN_TXNS_PER_CYCLE=10 \
-KSINK_JEPSEN_ARTIFACT_DIR=./test-artifacts \
-go test -count=1 -timeout=160m -run '^TestWALJepsenExternalCampaign$' ./internal/integration
+KSINK_FAULT_SEED=0 \
+KSINK_FAULT_CYCLES=400 \
+KSINK_FAULT_TXNS_PER_CYCLE=10 \
+KSINK_FAULT_ARTIFACT_DIR=./test-artifacts \
+go test -count=1 -timeout=160m -run '^TestWALFaultExternalCampaign$' ./internal/integration
 ```
 
 The full qualification result must be evaluated from actual completed
 workflow runs and their retained JSONL histories; merely having the workflow
 does **not** mean that the large campaign has been executed. SIGKILL and
 injected syscall errors also do not prove true power-loss durability on a
-specific block device. See [WAL fault verification](docs/wal-jepsen-verification.md).
+specific block device. See [WAL fault verification](docs/wal-fault-verification.md).
 
 #### Intentional limitations
 

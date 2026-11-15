@@ -27,7 +27,7 @@ import (
 // All client operations and outcomes are written OUTSIDE the WAL. The checker
 // must not infer a successful EndTxn from an unreturned RPC. This is a
 // process-level, black-box campaign, unlike in-process WAL fault hooks.
-type externalJepsenEvent struct {
+type externalFaultEvent struct {
     At string `json:"at"`
     Cycle int `json:"cycle"`
     Txn string `json:"txn,omitempty"`
@@ -37,7 +37,7 @@ type externalJepsenEvent struct {
     Error string `json:"error,omitempty"`
 }
 
-type externalJepsenMessage struct {
+type externalFaultMessage struct {
     topic string
     data string
     fate string // commit, abort or indeterminate
@@ -47,7 +47,7 @@ type externalJepsenMessage struct {
 // Keep the operation identity and all enrolled topic payloads together.
 // A lost EndTxn response is uncertain about COMMIT versus ABORT, not about
 // whether only a subset of the transaction committed.
-type externalJepsenAmbiguousTxn struct {
+type externalFaultAmbiguousTxn struct {
     operationID string
     payloads []string
 }
@@ -55,7 +55,7 @@ type externalJepsenAmbiguousTxn struct {
 // Check the final converged output, not transient cross-topic visibility.
 // An ambiguous EndTxn may commit or abort, but all its topic payloads must
 // share that one outcome.
-func externalJepsenCheckAmbiguousTransactions(groups []externalJepsenAmbiguousTxn, seen map[string]int) error {
+func externalFaultCheckAmbiguousTransactions(groups []externalFaultAmbiguousTxn, seen map[string]int) error {
     for _, group := range groups {
         if len(group.payloads)==0 {
             return fmt.Errorf("ambiguous transaction %q has no payloads",group.operationID)
@@ -74,7 +74,7 @@ func externalJepsenCheckAmbiguousTransactions(groups []externalJepsenAmbiguousTx
     return nil
 }
 
-func externalJepsenCount(t *testing.T,name string,defaultValue int) int {
+func externalFaultCount(t *testing.T,name string,defaultValue int) int {
     t.Helper()
     value:=os.Getenv(name)
     if value=="" {return defaultValue}
@@ -84,7 +84,7 @@ func externalJepsenCount(t *testing.T,name string,defaultValue int) int {
     return n
 }
 
-func externalJepsenOutput(t *testing.T,root,topic string) []string {
+func externalFaultOutput(t *testing.T,root,topic string) []string {
     t.Helper()
     dir:=filepath.Join(root,topic)
     entries,err:=os.ReadDir(dir)
@@ -111,7 +111,7 @@ func externalJepsenOutput(t *testing.T,root,topic string) []string {
     return result
 }
 
-func externalJepsenAwaitStart(t *testing.T,bin,addr,walRoot,outputRoot string)(*exec.Cmd,*bytes.Buffer) {
+func externalFaultAwaitStart(t *testing.T,bin,addr,walRoot,outputRoot string)(*exec.Cmd,*bytes.Buffer) {
     t.Helper()
     cmd:=exec.Command(bin,
         "--addr",addr,"--transactional",
@@ -139,14 +139,14 @@ func externalJepsenAwaitStart(t *testing.T,bin,addr,walRoot,outputRoot string)(*
     return nil,nil
 }
 
-func externalJepsenKill(t *testing.T,cmd *exec.Cmd) {
+func externalFaultKill(t *testing.T,cmd *exec.Cmd) {
     t.Helper()
     require.NoError(t,cmd.Process.Kill())
     // SIGKILL is expected. Wait to release OS file locks before restart.
     _=cmd.Wait()
 }
 
-func externalJepsenGracefulStop(t *testing.T,cmd *exec.Cmd,logs *bytes.Buffer) {
+func externalFaultGracefulStop(t *testing.T,cmd *exec.Cmd,logs *bytes.Buffer) {
     t.Helper()
     require.NoError(t,cmd.Process.Signal(syscall.SIGTERM))
     done:=make(chan error,1)
@@ -161,30 +161,30 @@ func externalJepsenGracefulStop(t *testing.T,cmd *exec.Cmd,logs *bytes.Buffer) {
     }
 }
 
-func TestWALJepsenExternalCampaign(t *testing.T) {
+func TestWALFaultExternalCampaign(t *testing.T) {
     if testing.Short(){t.Skip("external-process crash campaign")}
-    cycles:=externalJepsenCount(t,"KSINK_JEPSEN_CYCLES",3)
-    transactions:=externalJepsenCount(t,"KSINK_JEPSEN_TXNS_PER_CYCLE",4)
+    cycles:=externalFaultCount(t,"KSINK_FAULT_CYCLES",3)
+    transactions:=externalFaultCount(t,"KSINK_FAULT_TXNS_PER_CYCLE",4)
     seed:=int64(47751)
-    if raw:=os.Getenv("KSINK_JEPSEN_SEED");raw!="" {
+    if raw:=os.Getenv("KSINK_FAULT_SEED");raw!="" {
         parsed,err:=strconv.ParseInt(raw,10,64)
         require.NoError(t,err)
         seed=parsed
     }
     rng:=rand.New(rand.NewSource(seed))
     root:=t.TempDir()
-    artifacts:=os.Getenv("KSINK_JEPSEN_ARTIFACT_DIR")
+    artifacts:=os.Getenv("KSINK_FAULT_ARTIFACT_DIR")
     if artifacts=="" {artifacts=root}
     require.NoError(t,os.MkdirAll(artifacts,0700))
-    historyPath:=filepath.Join(artifacts,fmt.Sprintf("wal-jepsen-history-%d.jsonl",seed))
+    historyPath:=filepath.Join(artifacts,fmt.Sprintf("wal-fault-history-%d.jsonl",seed))
     history,err:=os.OpenFile(historyPath,os.O_CREATE|os.O_EXCL|os.O_WRONLY,0600)
     require.NoError(t,err)
     defer func(){require.NoError(t,history.Close())}()
     encoder:=json.NewEncoder(history)
-    emit:=func(event externalJepsenEvent) {
+    emit:=func(event externalFaultEvent) {
         event.At=time.Now().UTC().Format(time.RFC3339Nano)
         require.NoError(t,encoder.Encode(event))
-        require.NoError(t,history.Sync(),"Jepsen history must outlive the WAL process")
+        require.NoError(t,history.Sync(),"Crash-test history must outlive the WAL process")
     }
 
     binary:=filepath.Join(root,"ksink")
@@ -198,16 +198,16 @@ func TestWALJepsenExternalCampaign(t *testing.T) {
     require.NoError(t,os.MkdirAll(outputRoot,0700))
     port:=getFreePort(t)
     addr:=fmt.Sprintf("127.0.0.1:%d",port)
-    all:=make(map[string]*externalJepsenMessage)
-    ambiguousGroups:=make([]externalJepsenAmbiguousTxn,0)
+    all:=make(map[string]*externalFaultMessage)
+    ambiguousGroups:=make([]externalFaultAmbiguousTxn,0)
     order:=map[string]int{"orders":0,"payments":0}
     lastNext:=map[string]int64{"orders":0,"payments":0}
-    emit(externalJepsenEvent{Operation:"campaign",Phase:"start",
+    emit(externalFaultEvent{Operation:"campaign",Phase:"start",
         Payloads:[]string{fmt.Sprintf("seed=%d cycles=%d transactions=%d",seed,cycles,transactions)}})
 
     for cycle:=0;cycle<cycles;cycle++ {
-        cmd,_:=externalJepsenAwaitStart(t,binary,addr,walRoot,outputRoot)
-        emit(externalJepsenEvent{Cycle:cycle,Operation:"start",Phase:"ok"})
+        cmd,_:=externalFaultAwaitStart(t,binary,addr,walRoot,outputRoot)
+        emit(externalFaultEvent{Cycle:cycle,Operation:"start",Phase:"ok"})
         if cycle==0 {
             _,err=ksink.OpenTransactionLog(walRoot)
             require.Error(t,err,"a second process must not own the running WAL")
@@ -215,13 +215,13 @@ func TestWALJepsenExternalCampaign(t *testing.T) {
         crashed:=false
         for iteration:=0;iteration<transactions;iteration++ {
             ctx,cancel:=context.WithTimeout(context.Background(),5*time.Second)
-            txnID:=fmt.Sprintf("jepsen-producer-%d",iteration%8)
+            txnID:=fmt.Sprintf("fault-producer-%d",iteration%8)
             // Unique payloads allow an external checker to detect duplicates
             // even when a client loses an EndTxn response.
             operationID:=fmt.Sprintf("%d-%d-%d",seed,cycle,iteration)
             records:=[]*kgo.Record{
-                {Topic:"orders",Value:[]byte("jepsen-"+operationID+"-orders\n")},
-                {Topic:"payments",Value:[]byte("jepsen-"+operationID+"-payments\n")},
+                {Topic:"orders",Value:[]byte("fault-"+operationID+"-orders\n")},
+                {Topic:"payments",Value:[]byte("fault-"+operationID+"-payments\n")},
             }
             client,clientErr:=kgo.NewClient(
                 kgo.SeedBrokers(addr),kgo.TransactionalID(txnID),
@@ -231,28 +231,28 @@ func TestWALJepsenExternalCampaign(t *testing.T) {
             require.NoError(t,client.BeginTransaction())
             for _,rec:=range records {
                 data:=strings.TrimSuffix(string(rec.Value),"\n")
-                all[data]=&externalJepsenMessage{
+                all[data]=&externalFaultMessage{
                     topic:rec.Topic,data:data,fate:"indeterminate",ordinal:order[rec.Topic],
                 }
                 order[rec.Topic]++
             }
             payloads:=[]string{strings.TrimSuffix(string(records[0].Value),"\n"),
                 strings.TrimSuffix(string(records[1].Value),"\n")}
-            emit(externalJepsenEvent{Cycle:cycle,Txn:txnID,Operation:"produce",Phase:"invoke",Payloads:payloads})
+            emit(externalFaultEvent{Cycle:cycle,Txn:txnID,Operation:"produce",Phase:"invoke",Payloads:payloads})
             results:=client.ProduceSync(ctx,records...)
             if produceErr:=results.FirstErr();produceErr!=nil {
                 client.Close()
                 cancel()
-                externalJepsenKill(t,cmd)
+                externalFaultKill(t,cmd)
                 t.Fatalf("unexpected Kafka Produce error in campaign cycle %d: %v",cycle,produceErr)
             }
-            emit(externalJepsenEvent{Cycle:cycle,Txn:txnID,Operation:"produce",Phase:"ok",Payloads:payloads})
+            emit(externalFaultEvent{Cycle:cycle,Txn:txnID,Operation:"produce",Phase:"ok",Payloads:payloads})
 
             abort:=rng.Intn(5)==0
             action:=kgo.TryCommit
             operation:="commit"
             if abort {action=kgo.TryAbort;operation="abort"}
-            emit(externalJepsenEvent{Cycle:cycle,Txn:txnID,Operation:operation,Phase:"invoke",Payloads:payloads})
+            emit(externalFaultEvent{Cycle:cycle,Txn:txnID,Operation:operation,Phase:"invoke",Payloads:payloads})
             // Every other cycle kills the actual process during one EndTxn.
             // Neither a connection error nor timeout is recorded as an abort.
             killDuringEnd:=iteration==transactions-1 && cycle%2==1 && !abort
@@ -260,17 +260,17 @@ func TestWALJepsenExternalCampaign(t *testing.T) {
                 done:=make(chan error,1)
                 go func(){done<-client.EndTransaction(ctx,action)}()
                 time.Sleep(time.Duration(rng.Intn(4))*time.Millisecond)
-                externalJepsenKill(t,cmd)
+                externalFaultKill(t,cmd)
                 crashed=true
                 endErr:=<-done
-                event:=externalJepsenEvent{Cycle:cycle,Txn:txnID,Operation:operation,Payloads:payloads}
+                event:=externalFaultEvent{Cycle:cycle,Txn:txnID,Operation:operation,Payloads:payloads}
                 if endErr==nil {
                     event.Phase="ok"
                     for _,data:=range payloads {all[data].fate="commit"}
                 }else {
                     event.Phase="indeterminate"
                     event.Error=endErr.Error()
-                    ambiguousGroups=append(ambiguousGroups,externalJepsenAmbiguousTxn{
+                    ambiguousGroups=append(ambiguousGroups,externalFaultAmbiguousTxn{
                         operationID:operationID,payloads:append([]string(nil),payloads...),
                     })
                 }
@@ -279,14 +279,14 @@ func TestWALJepsenExternalCampaign(t *testing.T) {
                 endErr:=client.EndTransaction(ctx,action)
                 require.NoError(t,endErr,"EndTxn %s in campaign cycle %d",operation,cycle)
                 for _,data:=range payloads {all[data].fate=operation}
-                emit(externalJepsenEvent{Cycle:cycle,Txn:txnID,Operation:operation,Phase:"ok",Payloads:payloads})
+                emit(externalFaultEvent{Cycle:cycle,Txn:txnID,Operation:operation,Phase:"ok",Payloads:payloads})
             }
             client.Close()
             cancel()
             if crashed {break}
         }
-        if !crashed {externalJepsenKill(t,cmd)}
-        emit(externalJepsenEvent{Cycle:cycle,Operation:"SIGKILL",Phase:"ok"})
+        if !crashed {externalFaultKill(t,cmd)}
+        emit(externalFaultEvent{Cycle:cycle,Operation:"SIGKILL",Phase:"ok"})
         recovered,openErr:=ksink.OpenTransactionLog(walRoot)
         require.NoError(t,openErr,"recover after SIGKILL cycle %d",cycle)
         for _,topic:=range []string{"orders","payments"} {
@@ -300,13 +300,13 @@ func TestWALJepsenExternalCampaign(t *testing.T) {
     }
 
     // Converge without faults, then perform a final graceful flush.
-    final,logs:=externalJepsenAwaitStart(t,binary,addr,walRoot,outputRoot)
-    externalJepsenGracefulStop(t,final,logs)
-    emit(externalJepsenEvent{Operation:"final-flush",Phase:"ok"})
+    final,logs:=externalFaultAwaitStart(t,binary,addr,walRoot,outputRoot)
+    externalFaultGracefulStop(t,final,logs)
+    emit(externalFaultEvent{Operation:"final-flush",Phase:"ok"})
     seen:=make(map[string]int)
     for _,topic:=range []string{"orders","payments"} {
         lastOrdinal:=-1
-        for _,payload:=range externalJepsenOutput(t,outputRoot,topic) {
+        for _,payload:=range externalFaultOutput(t,outputRoot,topic) {
             msg,ok:=all[payload]
             require.True(t,ok,"uninvoked/ghost output payload %q",payload)
             require.Equal(t,topic,msg.topic,"cross-topic output corruption")
@@ -331,17 +331,17 @@ func TestWALJepsenExternalCampaign(t *testing.T) {
             ambiguous++
         }
     }
-    require.NoError(t,externalJepsenCheckAmbiguousTransactions(ambiguousGroups,seen),
+    require.NoError(t,externalFaultCheckAmbiguousTransactions(ambiguousGroups,seen),
         "an indeterminate EndTxn must never leave only some participant topics committed")
-    emit(externalJepsenEvent{Operation:"verify",Phase:"ok",
+    emit(externalFaultEvent{Operation:"verify",Phase:"ok",
         Payloads:[]string{fmt.Sprintf("confirmed=%d ambiguous=%d grouped_transactions=%d",confirmed,ambiguous,len(ambiguousGroups))}})
     t.Logf("external WAL campaign passed: seed=%d cycles=%d transactions/cycle=%d confirmed=%d ambiguous=%d history=%s",
         seed,cycles,transactions,confirmed,ambiguous,historyPath)
 }
 
 // Ensure the log is valid newline-delimited JSON independent of WAL files.
-func TestWALJepsenExternalHistorySchema(t *testing.T) {
-    var event externalJepsenEvent
+func TestWALFaultExternalHistorySchema(t *testing.T) {
+    var event externalFaultEvent
     require.NoError(t,json.Unmarshal([]byte(`{"at":"2026-01-01T00:00:00Z","cycle":1,"txn":"t","operation":"commit","phase":"indeterminate","payloads":["a"]}`),&event))
     require.Equal(t,"indeterminate",event.Phase)
     scanner:=bufio.NewScanner(strings.NewReader("{}\n"))
@@ -350,8 +350,8 @@ func TestWALJepsenExternalHistorySchema(t *testing.T) {
 
 // A per-payload checker would accept the partial result in the second
 // case; operation-level consistency must reject it after convergence.
-func TestWALJepsenAmbiguousMultiTopicTransactionIsAtomic(t *testing.T) {
-    groups:=[]externalJepsenAmbiguousTxn{{
+func TestWALFaultAmbiguousMultiTopicTransactionIsAtomic(t *testing.T) {
+    groups:=[]externalFaultAmbiguousTxn{{
         operationID:"lost-endtxn-1",payloads:[]string{"orders:1","payments:1"},
     }}
     for _,tc:=range []struct{
@@ -366,7 +366,7 @@ func TestWALJepsenAmbiguousMultiTopicTransactionIsAtomic(t *testing.T) {
         {name:"duplicate member",seen:map[string]int{"orders:1":2,"payments:1":1},wantError:"copies"},
     }{
         t.Run(tc.name,func(t *testing.T){
-            err:=externalJepsenCheckAmbiguousTransactions(groups,tc.seen)
+            err:=externalFaultCheckAmbiguousTransactions(groups,tc.seen)
             if tc.wantError=="" {require.NoError(t,err)} else {require.ErrorContains(t,err,tc.wantError)}
         })
     }

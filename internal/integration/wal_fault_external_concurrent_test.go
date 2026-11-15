@@ -22,9 +22,9 @@ import (
 // Produce, racing commits and aborts, process crashes between rounds and
 // recovery. The external oracle uses actual Kafka-assigned offsets, not
 // invocation order (which is intentionally nondeterministic here).
-func TestWALJepsenExternalConcurrentTransactions(t *testing.T) {
+func TestWALFaultExternalConcurrentTransactions(t *testing.T) {
     if testing.Short() {t.Skip("external-process concurrency fault campaign")}
-    cycles:=externalJepsenCount(t,"KSINK_JEPSEN_PARALLEL_CYCLES",2)
+    cycles:=externalFaultCount(t,"KSINK_FAULT_PARALLEL_CYCLES",2)
     const producers=5
     root:=t.TempDir()
     bin:=filepath.Join(root,"ksink")
@@ -33,15 +33,15 @@ func TestWALJepsenExternalConcurrentTransactions(t *testing.T) {
     out,err:=build.CombinedOutput()
     require.NoError(t,err,"build real ksink executable: %s",out)
 
-    artifacts:=os.Getenv("KSINK_JEPSEN_ARTIFACT_DIR")
+    artifacts:=os.Getenv("KSINK_FAULT_ARTIFACT_DIR")
     if artifacts=="" {artifacts=root}
     require.NoError(t,os.MkdirAll(artifacts,0700))
-    history,err:=os.OpenFile(filepath.Join(artifacts,"wal-jepsen-concurrent-history.jsonl"),
+    history,err:=os.OpenFile(filepath.Join(artifacts,"wal-fault-concurrent-history.jsonl"),
         os.O_CREATE|os.O_EXCL|os.O_WRONLY,0600)
     require.NoError(t,err)
     defer func(){require.NoError(t,history.Close())}()
     encoder:=json.NewEncoder(history)
-    emit:=func(cycle int,result concurrentJepsenResult){
+    emit:=func(cycle int,result concurrentFaultResult){
         require.NoError(t,encoder.Encode(map[string]any{
             "cycle":cycle,"operation":"end-txn","client":result.client,
             "phase":"ok","decision":result.decision,
@@ -63,16 +63,16 @@ func TestWALJepsenExternalConcurrentTransactions(t *testing.T) {
     forbidden:=map[string]bool{}
     lastOffsets:=map[string]int64{}
     for cycle:=0;cycle<cycles;cycle++ {
-        process,_:=externalJepsenAwaitStart(t,bin,addr,walRoot,outputRoot)
+        process,_:=externalFaultAwaitStart(t,bin,addr,walRoot,outputRoot)
         start:=make(chan struct{})
-        results:=make([]concurrentJepsenResult,producers)
+        results:=make([]concurrentFaultResult,producers)
         var wg sync.WaitGroup
         for i:=range results {
             wg.Add(1)
             go func(i int) {
                 defer wg.Done()
                 <-start
-                results[i]=runConcurrentJepsenTxn(addr,cycle,i)
+                results[i]=runConcurrentFaultTxn(addr,cycle,i)
             }(i)
         }
         close(start)
@@ -88,7 +88,7 @@ func TestWALJepsenExternalConcurrentTransactions(t *testing.T) {
                 forbidden[r.paymentPayload]=true
             }
         }
-        externalJepsenKill(t,process)
+        externalFaultKill(t,process)
         recovered,err:=ksink.OpenTransactionLog(walRoot)
         require.NoError(t,err,"parallel producer recovery in cycle %d",cycle)
         for _,topic:=range []string{"orders","payments"} {
@@ -98,10 +98,10 @@ func TestWALJepsenExternalConcurrentTransactions(t *testing.T) {
         }
         require.NoError(t,recovered.Close())
     }
-    final,logs:=externalJepsenAwaitStart(t,bin,addr,walRoot,outputRoot)
-    externalJepsenGracefulStop(t,final,logs)
+    final,logs:=externalFaultAwaitStart(t,bin,addr,walRoot,outputRoot)
+    externalFaultGracefulStop(t,final,logs)
     for _,topic:=range []string{"orders","payments"} {
-        outputs:=externalJepsenOutput(t,outputRoot,topic)
+        outputs:=externalFaultOutput(t,outputRoot,topic)
         seen:=make(map[string]bool)
         prev:=int64(-1)
         for _,payload:=range outputs {
@@ -118,7 +118,7 @@ func TestWALJepsenExternalConcurrentTransactions(t *testing.T) {
     }
 }
 
-type concurrentJepsenResult struct {
+type concurrentFaultResult struct {
     client int
     decision string
     orderPayload string
@@ -128,8 +128,8 @@ type concurrentJepsenResult struct {
     err error
 }
 
-func runConcurrentJepsenTxn(addr string,cycle,clientID int) concurrentJepsenResult {
-    result:=concurrentJepsenResult{client:clientID}
+func runConcurrentFaultTxn(addr string,cycle,clientID int) concurrentFaultResult {
+    result:=concurrentFaultResult{client:clientID}
     result.orderPayload="parallel-"+strconv.Itoa(cycle)+"-"+strconv.Itoa(clientID)+"-orders"
     result.paymentPayload="parallel-"+strconv.Itoa(cycle)+"-"+strconv.Itoa(clientID)+"-payments"
     ctx,cancel:=context.WithTimeout(context.Background(),15*time.Second)

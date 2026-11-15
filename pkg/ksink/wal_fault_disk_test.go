@@ -18,7 +18,7 @@ import (
 // unacknowledged acceptance group may survive a simulated pre-sync failure;
 // the independent safety requirement is that acknowledged earlier records
 // survive and the poisoned owner never acknowledges anything afterwards.
-func TestWALJepsenDiskAppendFaultMatrix(t *testing.T) {
+func TestWALFaultDiskAppendFaultMatrix(t *testing.T) {
     cases:=[]struct{stage string;cause error}{
         {"append:write",syscall.EIO},
         {"append:write",syscall.ENOSPC},
@@ -66,7 +66,7 @@ func TestWALJepsenDiskAppendFaultMatrix(t *testing.T) {
     }
 }
 
-func TestWALJepsenShortAppendWriteRepairsUnacceptedTail(t *testing.T) {
+func TestWALFaultShortAppendWriteRepairsUnacceptedTail(t *testing.T) {
     root:=t.TempDir()
     wal,_:=testOpenWALWithActiveTransaction(t,root)
     _,err:=wal.AppendTopicBatch([]WALTopicRecord{{Topic:"orders",Data:[]byte("acknowledged")}})
@@ -90,7 +90,7 @@ func TestWALJepsenShortAppendWriteRepairsUnacceptedTail(t *testing.T) {
     require.Equal(t,"acknowledged",string(rec.Data))
 }
 
-func TestWALJepsenManifestAndCheckpointFailureMatrix(t *testing.T) {
+func TestWALFaultManifestAndCheckpointFailureMatrix(t *testing.T) {
     stages:=[]string{
         "compact:create","compact:write","compact:sync","compact:dir-sync",
         "compact:snapshot-synced",
@@ -127,7 +127,7 @@ func TestWALJepsenManifestAndCheckpointFailureMatrix(t *testing.T) {
     }
 }
 
-func TestWALJepsenManifestShortWriteFailsClosed(t *testing.T) {
+func TestWALFaultManifestShortWriteFailsClosed(t *testing.T) {
     root:=t.TempDir()
     wal,_:=testOpenWALWithActiveTransaction(t,root)
     _,err:=wal.AppendTopicBatch([]WALTopicRecord{{Topic:"orders",Data:[]byte("durable")}})
@@ -145,7 +145,7 @@ func TestWALJepsenManifestShortWriteFailsClosed(t *testing.T) {
     require.Equal(t,int64(1),reopened.NextTopicOffset("orders"))
 }
 
-func TestWALJepsenManifestRotationFailureMatrix(t *testing.T) {
+func TestWALFaultManifestRotationFailureMatrix(t *testing.T) {
     for _,stage:=range []string{"segment:create","segment:sync","segment:dir-sync",
         "manifest:create","manifest:write","manifest:sync","manifest:rename","manifest:dir-sync",
         "rotate:segment-synced","rotate:manifest-synced"}{
@@ -176,7 +176,7 @@ func TestWALJepsenManifestRotationFailureMatrix(t *testing.T) {
     }
 }
 
-func TestWALJepsenFrameHeaderIntegrityAndSequence(t *testing.T){
+func TestWALFaultFrameHeaderIntegrityAndSequence(t *testing.T){
     cases:=[]struct{
         name string
         modify func([]byte)

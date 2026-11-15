@@ -9,7 +9,7 @@ import (
     "github.com/stretchr/testify/require"
 )
 
-type walJepsenModelSlot struct {
+type walFaultModelSlot struct {
     payload  string
     instance string
     decision string
@@ -19,8 +19,8 @@ type walJepsenModelSlot struct {
 // A deliberately independent model: we append expected slots only after
 // successful API calls, never reconstruct them from WAL internals. Every
 // close/reopen/compaction checks no acknowledged loss, reuse or reordering.
-func checkWALJepsenModel(t *testing.T, wal *TransactionLog,
-    expected map[string][]walJepsenModelSlot, decisions map[string]string) {
+func checkWALFaultModel(t *testing.T, wal *TransactionLog,
+    expected map[string][]walFaultModelSlot, decisions map[string]string) {
     t.Helper()
     for instance, decision := range decisions {
         require.Equal(t, decision, wal.TopicTransactionDecision(instance),
@@ -54,7 +54,7 @@ func checkWALJepsenModel(t *testing.T, wal *TransactionLog,
     }
 }
 
-func TestWALJepsenSeededTransactionalHistorySurvivesCompactionAndRestarts(t *testing.T) {
+func TestWALFaultSeededTransactionalHistorySurvivesCompactionAndRestarts(t *testing.T) {
     for seed := int64(0); seed < 4; seed++ {
         t.Run(fmt.Sprintf("seed-%d", seed), func(t *testing.T) {
             rng := rand.New(rand.NewSource(seed))
@@ -64,7 +64,7 @@ func TestWALJepsenSeededTransactionalHistorySurvivesCompactionAndRestarts(t *tes
             require.NoError(t, wal.BindOutput(filepath.Join(t.TempDir(), "{topic}", "messages-{seq:08}.jsonl")))
 
             topics := []string{"orders", "payments"}
-            expected := map[string][]walJepsenModelSlot{"orders": {}, "payments": {}}
+            expected := map[string][]walFaultModelSlot{"orders": {}, "payments": {}}
             decisions := map[string]string{}
             for step := 0; step < 32; step++ {
                 if rng.Intn(4) == 0 {
@@ -77,7 +77,7 @@ func TestWALJepsenSeededTransactionalHistorySurvivesCompactionAndRestarts(t *tes
                     })
                     require.NoError(t, err)
                     require.Equal(t, []int64{before}, offsets)
-                    expected[topic] = append(expected[topic], walJepsenModelSlot{payload: payload})
+                    expected[topic] = append(expected[topic], walFaultModelSlot{payload: payload})
                 } else {
                     id := fmt.Sprintf("seed-%d-txn-%d", seed, step)
                     instance, err := newTxnInstance(id)
@@ -114,25 +114,25 @@ func TestWALJepsenSeededTransactionalHistorySurvivesCompactionAndRestarts(t *tes
                     decisions[instance] = decision
                     for _, record := range batch {
                         expected[record.Topic] = append(expected[record.Topic],
-                            walJepsenModelSlot{
+                            walFaultModelSlot{
                                 payload: string(record.Data), instance: instance, decision: decision,
                             },
-                            walJepsenModelSlot{instance: instance, decision: decision, marker: true})
+                            walFaultModelSlot{instance: instance, decision: decision, marker: true})
                     }
                 }
-                checkWALJepsenModel(t, wal, expected, decisions)
+                checkWALFaultModel(t, wal, expected, decisions)
                 if step%8 == 7 {
                     require.NoError(t, wal.Compact())
                     require.NoError(t, wal.Close())
                     wal, err = OpenTransactionLog(dir)
                     require.NoError(t, err)
-                    checkWALJepsenModel(t, wal, expected, decisions)
+                    checkWALFaultModel(t, wal, expected, decisions)
                 }
             }
             require.NoError(t, wal.Close())
             final, err := OpenTransactionLog(dir)
             require.NoError(t, err)
-            checkWALJepsenModel(t, final, expected, decisions)
+            checkWALFaultModel(t, final, expected, decisions)
             require.NoError(t, final.Close())
         })
     }

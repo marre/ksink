@@ -73,7 +73,7 @@ The manifest version and on-disk WAL version were deliberately bumped;
 
 ```sh
 go test -race -count=1 ./...
-go test -count=1 ./pkg/ksink -run 'TestWALJepsen|TestSharedWAL|TestTransactionWAL'
+go test -count=1 ./pkg/ksink -run 'TestWALFault|TestSharedWAL|TestTransactionWAL'
 go test -count=1 ./internal/integration -run 'TestOrderedS3MinIOPublicationAndRecovery'
 ```
 
@@ -106,7 +106,7 @@ write caches or unflushed filesystem journal sectors.
 
 ## External black-box crash campaign
 
-`TestWALJepsenExternalCampaign` builds and starts the **actual ksink CLI**
+`TestWALFaultExternalCampaign` builds and starts the **actual ksink CLI**
 as a child process, uses Kafka transactional clients to Produce/Commit/
 Abort across two topics, and records invocation/response histories in
 fsynced JSONL **outside** the target WAL directory. It kills the server
@@ -121,15 +121,15 @@ produced, never conflated with a confirmed abort.
 Local reproduction:
 
 ```sh
-KSINK_JEPSEN_SEED=42 \
-KSINK_JEPSEN_CYCLES=10 \
-KSINK_JEPSEN_TXNS_PER_CYCLE=10 \
-KSINK_JEPSEN_ARTIFACT_DIR=./test-artifacts \
-go test -count=1 -timeout=30m -run '^TestWALJepsenExternalCampaign$' ./internal/integration
+KSINK_FAULT_SEED=42 \
+KSINK_FAULT_CYCLES=10 \
+KSINK_FAULT_TXNS_PER_CYCLE=10 \
+KSINK_FAULT_ARTIFACT_DIR=./test-artifacts \
+go test -count=1 -timeout=30m -run '^TestWALFaultExternalCampaign$' ./internal/integration
 ```
 
 The manual GitHub Actions workflow
-[`WAL external crash qualification`](../.github/workflows/wal-jepsen.yml)
+[`WAL external crash qualification`](../.github/workflows/wal-fault.yml)
 offers a small smoke profile or a sharded **qualification** profile:
 25 shards × 400 independent kill/restart cycles × 10 transaction
 attempts = **10,000 restart cycles and 100,000 transaction attempts**.
@@ -155,7 +155,7 @@ their histories/reports have been inspected.
   semantics but do not represent every object store.
 * **Producer-history breadth:** the external CLI campaign validates
   committed-only projection and ambiguous EndTxn with multiple topics.
-  Comprehensive Jepsen certification would additionally need
+  Comprehensive crash-consistency qualification would additionally need
   five in-flight batches within the same producer, response
   partitioning, producer ID fencing under sustained partitions, and
   independent read/write-linearizability analysis.

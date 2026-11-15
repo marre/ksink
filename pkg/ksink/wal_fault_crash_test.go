@@ -12,7 +12,7 @@ import (
 // A post-fsync failure is deliberately ambiguous to the caller: the response
 // must be an error and the live WAL must fail-stop. After restart, however,
 // the entire acceptance batch and its producer checkpoint must exist together.
-func TestWALJepsenPostSyncProduceAmbiguityReplaysAtomicBatch(t *testing.T) {
+func TestWALFaultPostSyncProduceAmbiguityReplaysAtomicBatch(t *testing.T) {
     root := t.TempDir()
     wal, instance := testOpenWALWithActiveTransaction(t, root)
     state := wal.CurrentState()
@@ -51,7 +51,7 @@ func TestWALJepsenPostSyncProduceAmbiguityReplaysAtomicBatch(t *testing.T) {
 
 // One terminal frame decides all enrolled topics. A lost EndTxn response
 // cannot cause a later restart to change commit to abort or lose a marker.
-func TestWALJepsenPostSyncEndTxnAmbiguityHasOneDurableOutcome(t *testing.T) {
+func TestWALFaultPostSyncEndTxnAmbiguityHasOneDurableOutcome(t *testing.T) {
     root := t.TempDir()
     wal, instance := testOpenWALWithActiveTransaction(t, root)
     state := wal.CurrentState()
@@ -92,7 +92,7 @@ func TestWALJepsenPostSyncEndTxnAmbiguityHasOneDurableOutcome(t *testing.T) {
 // Every byte cut of a pending topic-output frame must preserve the previous
 // acknowledged acceptance delimiter. In particular a completely written but
 // unaccepted frame is not visible; its existence does not advance offsets.
-func TestWALJepsenActiveTailEveryByteCutPreservesAcknowledgedPrefix(t *testing.T) {
+func TestWALFaultActiveTailEveryByteCutPreservesAcknowledgedPrefix(t *testing.T) {
     frame, err := txnWALFrame(transactionWALRecord{
         Type: "topic-output",
         TopicOutput: &WALTopicRecord{Topic: "orders", Offset: 1, Data: []byte("not-acknowledged")},
