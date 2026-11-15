@@ -130,11 +130,15 @@ go test -count=1 -timeout=30m -run '^TestWALFaultExternalCampaign$' ./internal/i
 
 The manual GitHub Actions workflow
 [`WAL external crash qualification`](../.github/workflows/wal-fault.yml)
-offers a small smoke profile or a sharded **qualification** profile:
-25 shards × 400 independent kill/restart cycles × 10 transaction
-attempts = **10,000 restart cycles and 100,000 transaction attempts**.
-It writes per-shard JSONL histories to CI artifacts and limits
-concurrent shards to control CI cost. **These counts are configured
+defaults to a sharded **qualification** profile: 25 shards × 400
+independent kill/restart cycles × 10 transaction attempts =
+**10,000 restart cycles and 100,000 transaction attempts**. To run only a
+quick check, select the optional `smoke` profile (one shard, four restarts,
+12 transactions). GitHub Actions shows the selected profile in the run
+name and checks the expected workload before running; the harness also
+asserts that every configured restart and transaction attempt took place.
+Per-shard JSONL histories and verbose logs are stored as artifacts, and at
+most five shards run concurrently to control CI cost. **These counts are configured
 targets, not evidence that a qualification workflow has run.**
 Do not claim completion until all 25 shards have actually passed and
 their histories/reports have been inspected.
