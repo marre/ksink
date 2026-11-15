@@ -68,41 +68,13 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          go test -list '^TestWALFaultExternalCampaign
-      - name: Preserve durable external history
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: wal-fault-${{ inputs.profile }}-${{ matrix.shard }}
-          path: test-artifacts/
-          if-no-files-found: warn
-          retention-days: 30
-
-# Default qualification: 25 shards x 400 process kills/restarts = 10,000
-# process restarts, 25 x 400 x 10 transaction histories = 100,000 transactions.
-# This test verifies process-crash safety, not physical power-loss or actual
-# EIO/EDQUOT behavior. Those need privileged storage fault infrastructure.
- ./internal/integration | grep -Fx 'TestWALFaultExternalCampaign'
+          go test -list 'TestWALFaultExternalCampaign' ./internal/integration | grep -Fx 'TestWALFaultExternalCampaign'
       - name: Run real CLI/Kafka SIGKILL and restart campaign
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p test-artifacts
-          go test -count=1 -v -timeout=160m -run '^TestWALFaultExternalCampaign
-      - name: Preserve durable external history
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: wal-fault-${{ inputs.profile }}-${{ matrix.shard }}
-          path: test-artifacts/
-          if-no-files-found: warn
-          retention-days: 30
-
-# Opt-in qualification: 25 shards x 400 process kills/restarts = 10,000
-# process restarts, 25 x 400 x 10 transaction histories = 100,000 transactions.
-# This test verifies process-crash safety, not physical power-loss or actual
-# EIO/EDQUOT behavior. Those need privileged storage fault infrastructure.
- ./internal/integration 2>&1 | tee test-artifacts/fault-test-output.log
+          go test -count=1 -v -timeout=160m -run 'TestWALFaultExternalCampaign' ./internal/integration 2>&1 | tee test-artifacts/fault-test-output.log
           grep -Eq '^--- PASS: TestWALFaultExternalCampaign ' test-artifacts/fault-test-output.log
       - name: Preserve durable external history
         if: always()
@@ -113,7 +85,7 @@ jobs:
           if-no-files-found: warn
           retention-days: 30
 
-# Opt-in qualification: 25 shards x 400 process kills/restarts = 10,000
+# Default qualification: 25 shards x 400 process kills/restarts = 10,000
 # process restarts, 25 x 400 x 10 transaction histories = 100,000 transactions.
 # This test verifies process-crash safety, not physical power-loss or actual
 # EIO/EDQUOT behavior. Those need privileged storage fault infrastructure.
