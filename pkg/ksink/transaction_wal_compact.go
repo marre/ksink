@@ -20,8 +20,11 @@ func (l *TransactionLog) compactLocked() error {
 	f,err:=os.OpenFile(snapshotPath,os.O_WRONLY|os.O_CREATE|os.O_EXCL,0600)
 	if err!=nil{return fmt.Errorf("create WAL checkpoint: %w",err)}
 	failed:=func(err error)error{_ = f.Close();return err}
+	seq:=l.nextFrameSeq
 	write:=func(rec transactionWALRecord)error{
-		_,err:=writeTxnWALFrame(f,rec)
+		if seq==^uint64(0) {return fmt.Errorf("WAL frame sequence exhausted during checkpoint")}
+		_,err:=writeTxnWALFrameWithSequence(f,rec,seq)
+		seq++
 		return err
 	}
 	if l.binding!=""{
