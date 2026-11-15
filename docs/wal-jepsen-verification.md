@@ -76,7 +76,7 @@ The `TestWALJepsen*` tests exercise process ownership, active-tail byte
 cuts, and after-fsync/before-response ambiguity for both Produce and
 multi-topic terminal decisions. Kafka CRC tests verify no producer-sequence
 or offset consumption on malformed input. S3 recovery tests verify
-body-attested immutable-object reconciliation and fail-closed GET errors.
+server-validated SHA-256 HEAD reconciliation (without object downloads), checksum-mismatch and missing-checksum fail-closed errors.
 
 Existing WAL suites additionally cover segment rotation, compaction,
 unaccepted acceptance groups, and sealed checksum corruption. All these
@@ -95,7 +95,7 @@ WAL. Randomize the following faults:
 * Response drops after durable Produce/EndTxn and after S3 PUT/MPU completion.
 * EIO, short write, ENOSPC, EDQUOT, failed file/parent-directory `fsync`,
   missing segments and injected active-tail/sealed-frame corruption.
-* Concurrent writers to the same S3 key, 409/412, GET/HEAD timeouts, lost
+* Concurrent writers to the same S3 key, 409/412, checksum HEAD timeouts, lost
   multipart completion responses and orphaned uploads.
 * Transactional producers across topics, up to five inflight idempotent
   batches, overlapping commits/aborts, restart/fencing, and owner takeover.
