@@ -217,4 +217,9 @@ func TestOrderedS3MinIOPublicationAndRecovery(t *testing.T) {
         require.Equal(t,uint64(2),txWal.TopicProgress(topic).NextFile)
     }
 
+    // Concurrent ksink writers and concurrent MPU completions exercise
+    // the immutable-key preconditions on this exact pinned S3 backend.
+    exerciseConcurrentS3Publication(t,ctx,client,bucket,opts)
+    exerciseConcurrentS3MultipartCompletion(t,ctx,client,bucket)
+
 }
