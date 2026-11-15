@@ -193,12 +193,12 @@ func TestSharedWALDiscardsCompleteUnacceptedTopicBatchTail(t *testing.T) {
 	// Emulate power loss after multiple complete, checksummed payload frames
 	// reached disk, but before their acceptance delimiter.
 	for i := 0; i < 2; i++ {
-		buf, err := txnWALFrame(transactionWALRecord{
+		buf, err := txnWALFrameWithSequence(transactionWALRecord{
 			Type: "topic-output", TopicOutput: &WALTopicRecord{
 				Topic: "orders", Offset: int64(i), TransactionID: "orders-producer",
 				Instance: instance, Data: []byte("unaccepted"),
 			},
-		})
+		}, wal.nextFrameSeq+uint64(i))
 		require.NoError(t, err)
 		_, err = wal.logFile.Write(buf)
 		require.NoError(t, err)
@@ -236,8 +236,8 @@ func TestSharedWALRejectsMismatchedTopicAcceptanceMarker(t *testing.T) {
 		}},
 		{Type: "topic-accept", BatchCount: 2},
 	}
-	for _, rec := range frames {
-		buf, err := txnWALFrame(rec)
+	for i, rec := range frames {
+		buf, err := txnWALFrameWithSequence(rec, wal.nextFrameSeq+uint64(i))
 		require.NoError(t, err)
 		_, err = wal.logFile.Write(buf)
 		require.NoError(t, err)

@@ -187,10 +187,12 @@ func TestDurableTxnStateLockAndCorruption(t *testing.T) {
 	walPath := filepath.Join(dir, "segments", fmt.Sprintf("%020d.wal", reopened.txnLog.activeKey().id))
 	file, err := os.OpenFile(walPath, os.O_WRONLY|os.O_APPEND, 0600)
 	require.NoError(t, err)
-	header := make([]byte, 8)
-	binary.BigEndian.PutUint32(header[:4], 3)
-	require.NoError(t, binary.Write(file, binary.BigEndian, header))
-	_, err = file.Write([]byte("bad"))
+	frame, err := txnWALFrameWithSequence(transactionWALRecord{
+		Type: "binding", Binding: "bad",
+	}, reopened.txnLog.nextFrameSeq)
+	require.NoError(t, err)
+	frame[len(frame)-1] ^= 0xff // complete v5 header, corrupt payload checksum
+	_, err = file.Write(frame)
 	require.NoError(t, err)
 	require.NoError(t, file.Close())
 	_, err = New(cfg)
@@ -198,7 +200,7 @@ func TestDurableTxnStateLockAndCorruption(t *testing.T) {
 	// Neither the WAL nor the producer ID history may be discarded.
 	contents, err := os.ReadFile(walPath)
 	require.NoError(t, err)
-	require.Equal(t, []byte("bad"), contents[len(contents)-3:])
+	require.Equal(t, frame, contents[len(contents)-len(frame):])
 }
 
 func TestDurableTxnSequenceSnapshotSurvivesRestart(t *testing.T) {

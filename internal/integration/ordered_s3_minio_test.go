@@ -4,7 +4,7 @@ import (
     "bytes"
     "context"
     "crypto/sha256"
-    "encoding/hex"
+    "encoding/base64"
     "fmt"
     "io"
     "net/http"
@@ -15,6 +15,7 @@ import (
     "github.com/aws/aws-sdk-go-v2/aws"
     "github.com/aws/aws-sdk-go-v2/config"
     "github.com/aws/aws-sdk-go-v2/service/s3"
+    "github.com/aws/aws-sdk-go-v2/service/s3/types"
     "github.com/marre/ksink/internal/output"
     "github.com/marre/ksink/pkg/ksink"
     "github.com/ory/dockertest/v3"
@@ -88,7 +89,14 @@ func TestOrderedS3MinIOPublicationAndRecovery(t *testing.T) {
     require.NoError(t,obj.Body.Close())
     require.Equal(t,"first\n",string(got))
     sum:=sha256.Sum256(got)
-    require.Equal(t,hex.EncodeToString(sum[:]),obj.Metadata["ksink-sha256"])
+    head,err:=client.HeadObject(ctx,&s3.HeadObjectInput{
+        Bucket:aws.String(bucket),Key:aws.String(key),
+        ChecksumMode:types.ChecksumModeEnabled,
+    })
+    require.NoError(t,err)
+    require.Equal(t,base64.StdEncoding.EncodeToString(sum[:]),aws.ToString(head.ChecksumSHA256))
+    require.Equal(t,types.ChecksumTypeFullObject,head.ChecksumType)
+    require.Empty(t,obj.Metadata["ksink-sha256"])
     require.Equal(t,uint64(2),wal.TopicProgress("orders").NextFile)
 
     // Emulate a completed object before the corresponding WAL receipt.
@@ -101,7 +109,7 @@ func TestOrderedS3MinIOPublicationAndRecovery(t *testing.T) {
         Body:bytes.NewReader([]byte("second\n")),
         ContentLength:aws.Int64(int64(len("second\n"))),
         IfNoneMatch:aws.String("*"),
-        Metadata:map[string]string{"ksink-sha256":hex.EncodeToString(sum[:]),"ksink-version":"ordered-v1"},
+        ChecksumSHA256:aws.String(base64.StdEncoding.EncodeToString(sum[:])),
     })
     require.NoError(t,err)
     require.NoError(t,wal.Close())
@@ -133,14 +141,15 @@ func TestOrderedS3MinIOPublicationAndRecovery(t *testing.T) {
     _,err=wal.AppendTopicBatch([]ksink.WALTopicRecord{{Topic:"orders",Data:[]byte("third\n")}})
     require.NoError(t,err)
     key="data/orders/messages-00000003.jsonl"
+    wrongChecksum:=sha256.Sum256([]byte("wrong\n"))
     _,err=client.PutObject(ctx,&s3.PutObjectInput{
         Bucket:aws.String(bucket),Key:aws.String(key),
         Body:bytes.NewReader([]byte("wrong\n")),
-        Metadata:map[string]string{"ksink-sha256":hex.EncodeToString(sum[:])},
+        ChecksumSHA256:aws.String(base64.StdEncoding.EncodeToString(wrongChecksum[:])),
     })
     require.NoError(t,err)
     err=w.Flush(ctx)
-    require.ErrorContains(t,err,"mismatch")
+    require.ErrorContains(t,err,"server-validated SHA256 checksum differs")
     require.Equal(t,int64(2),wal.TopicProgress("orders").Cursor)
     // Run real Kafka multi-topic transactions into this same S3 backend.
     // A committed object may contain multiple transactions, while aborted
@@ -207,5 +216,10 @@ func TestOrderedS3MinIOPublicationAndRecovery(t *testing.T) {
         require.NotContains(t,string(data),"aborted")
         require.Equal(t,uint64(2),txWal.TopicProgress(topic).NextFile)
     }
+
+    // Concurrent ksink writers and concurrent MPU completions exercise
+    // the immutable-key preconditions on this exact pinned S3 backend.
+    exerciseConcurrentS3Publication(t,ctx,client,bucket,opts)
+    exerciseConcurrentS3MultipartCompletion(t,ctx,client,bucket)
 
 }

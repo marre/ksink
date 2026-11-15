@@ -183,13 +183,14 @@ func TestWALInterruptedPayloadFrameIsNotAccepted(t *testing.T) {
 	root:=t.TempDir()
 	wal,instance:=testOpenWALWithActiveTransaction(t,root)
 	before:=wal.size
+	seq:=wal.nextFrameSeq
 	path:=wal.walPath(wal.activeKey())
 	require.NoError(t,wal.Close())
 
-	buf,err:=txnWALFrame(transactionWALRecord{
+	buf,err:=txnWALFrameWithSequence(transactionWALRecord{
 		Type:"output",
 		Output:&WALOutputRecord{TransactionID:"orders-producer",Instance:instance,Path:"partial.bin",Data:[]byte("never acknowledged")},
-	})
+	}, seq)
 	require.NoError(t,err)
 	f,err:=os.OpenFile(path,os.O_WRONLY|os.O_APPEND,0600)
 	require.NoError(t,err)

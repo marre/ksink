@@ -1134,7 +1134,8 @@ func (s *Server) parseRecords(connID uint64, topic string, partition int32, data
 		Topic:                topic,
 		Partition:            partition,
 		KeepControlRecords:   false,
-		DisableCRCValidation: true,
+		// Kafka record-batch CRC32C is part of ingress integrity. A WAL checksum
+		// cannot detect bytes that were already corrupt when accepted.
 	}
 
 	fp, _ := kgo.ProcessFetchPartition(opts, &fakePartition, s.decompressor, nil)
