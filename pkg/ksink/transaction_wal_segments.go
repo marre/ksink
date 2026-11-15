@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -57,28 +58,42 @@ func validateWALManifest(m walManifest) error {
 }
 
 func (l *TransactionLog) persistManifest(m walManifest) error {
-	if err:=validateWALManifest(m);err!=nil{return err}
-	encoded,err:=json.Marshal(m)
-	if err!=nil{return err}
-	temp:=l.manifestPath()+".tmp"
-	file,err:=os.OpenFile(temp,os.O_CREATE|os.O_TRUNC|os.O_WRONLY,0600)
-	if err!=nil{return err}
-	if _,err=file.Write(encoded);err==nil{err=file.Sync()}
-	if closeErr:=file.Close();err==nil{err=closeErr}
-	if err!=nil{return fmt.Errorf("write WAL manifest: %w",err)}
-	if err=os.Rename(temp,l.manifestPath());err!=nil{return fmt.Errorf("replace WAL manifest: %w",err)}
-	if err=txnSyncDirectory(l.dir);err!=nil{return fmt.Errorf("sync WAL manifest directory: %w",err)}
-	return nil
+    if err:=validateWALManifest(m);err!=nil{return err}
+    encoded,err:=json.Marshal(m)
+    if err!=nil{return err}
+    temp:=l.manifestPath()+".tmp"
+    if err=l.failpoint("manifest:create");err!=nil{return fmt.Errorf("create WAL manifest: %w",err)}
+    file,err:=os.OpenFile(temp,os.O_CREATE|os.O_TRUNC|os.O_WRONLY,0600)
+    if err!=nil{return err}
+    if err=l.failpoint("manifest:write");err==nil{
+        writer:=l.manifestWrite
+        if writer==nil {writer=(*os.File).Write}
+        var n int
+        n,err=writer(file,encoded)
+        if err==nil && n!=len(encoded) {err=io.ErrShortWrite}
+    }
+    if err==nil {err=l.failpoint("manifest:sync")}
+    if err==nil {err=file.Sync()}
+    if closeErr:=file.Close();err==nil {err=closeErr}
+    if err!=nil{return fmt.Errorf("write WAL manifest: %w",err)}
+    if err=l.failpoint("manifest:rename");err!=nil{return fmt.Errorf("replace WAL manifest: %w",err)}
+    if err=os.Rename(temp,l.manifestPath());err!=nil{return fmt.Errorf("replace WAL manifest: %w",err)}
+    if err=l.failpoint("manifest:dir-sync");err!=nil{return fmt.Errorf("sync WAL manifest directory: %w",err)}
+    if err=txnSyncDirectory(l.dir);err!=nil{return fmt.Errorf("sync WAL manifest directory: %w",err)}
+    return nil
 }
 
 // makeSegment writes a new, empty, fsynced segment before the manifest can
 // reference it. An interrupted creation leaves an unreferenced orphan.
 func (l *TransactionLog) makeSegment(id uint64)(*os.File,error){
 	path:=l.walPath(walFileKey{id:id})
+	if err:=l.failpoint("segment:create");err!=nil{return nil,err}
 	file,err:=os.OpenFile(path,os.O_CREATE|os.O_EXCL|os.O_RDWR,0600)
 	if err!=nil{return nil,err}
-	if err=file.Sync();err!=nil{_ = file.Close();return nil,err}
-	if err=txnSyncDirectory(filepath.Dir(path));err!=nil{_ = file.Close();return nil,err}
+	if err=l.failpoint("segment:sync");err==nil {err=file.Sync()}
+    if err!=nil{_ = file.Close();return nil,err}
+    if err=l.failpoint("segment:dir-sync");err==nil {err=txnSyncDirectory(filepath.Dir(path))}
+    if err!=nil{_ = file.Close();return nil,err}
 	return file,nil
 }
 
@@ -213,12 +228,14 @@ func (l *TransactionLog) deleteFullyDeadSegmentsLocked() error {
 	if err:=l.failpoint("gc:manifest-synced");err!=nil{return err}
 	for _,id:=range removed {
 		key:=walFileKey{id:id}
+		if err:=l.failpoint("gc:remove");err!=nil{return err}
 		if err:=os.Remove(l.walPath(key));err!=nil{return err}
 		st:=l.fileStats[key]
 		l.size-=st.size
 		l.reclaimable-=st.dead
 		delete(l.fileStats,key)
 	}
+	if err:=l.failpoint("gc:dir-sync");err!=nil{return err}
 	if err:=txnSyncDirectory(filepath.Join(l.dir,"segments"));err!=nil{return err}
 	return nil
 }
