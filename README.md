@@ -423,9 +423,12 @@ files contain the acknowledged committed-only history without duplicates.
 A separate external smoke test runs five overlapping transactional producers,
 competing commits and aborts across two topics, and checks final publication
 order against Kafka-assigned offsets across restarts.
-The default smoke profile is small. The opt-in `qualification` profile
-distributes **10,000 restarts and 100,000 transaction attempts** over 25
-shards; run it explicitly rather than adding this cost to every PR.
+The manually triggered action defaults to the full `qualification` profile:
+**10,000 restarts and 100,000 transaction attempts** across 25 shards.
+Select `smoke` explicitly for a quick, single-shard check (4 restarts,
+12 transaction attempts). The Actions run title, job summary, and verbose
+test output identify which profile ran, so a smoke pass cannot be mistaken
+for full qualification. Neither profile runs automatically on every PR.
 
 To reproduce or customize a shard locally:
 
