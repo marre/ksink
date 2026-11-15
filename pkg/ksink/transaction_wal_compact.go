@@ -17,12 +17,14 @@ func (l *TransactionLog) compactLocked() error {
 	segmentID:=snapshotID+1
 	snapshotKey:=walFileKey{id:snapshotID,snapshot:true}
 	snapshotPath:=l.walPath(snapshotKey)
+	if err:=l.failpoint("compact:create");err!=nil{return fmt.Errorf("create WAL checkpoint: %w",err)}
 	f,err:=os.OpenFile(snapshotPath,os.O_WRONLY|os.O_CREATE|os.O_EXCL,0600)
 	if err!=nil{return fmt.Errorf("create WAL checkpoint: %w",err)}
 	failed:=func(err error)error{_ = f.Close();return err}
 	seq:=l.nextFrameSeq
 	write:=func(rec transactionWALRecord)error{
 		if seq==^uint64(0) {return fmt.Errorf("WAL frame sequence exhausted during checkpoint")}
+		if err:=l.failpoint("compact:write");err!=nil{return err}
 		_,err:=writeTxnWALFrameWithSequence(f,rec,seq)
 		seq++
 		return err
@@ -135,8 +137,10 @@ func (l *TransactionLog) compactLocked() error {
 			return failed(err)
 		}
 	}
+	if err=l.failpoint("compact:sync");err!=nil{return failed(fmt.Errorf("sync WAL checkpoint: %w",err))}
 	if err=f.Sync();err!=nil{return failed(fmt.Errorf("sync WAL checkpoint: %w",err))}
 	if err=f.Close();err!=nil{return err}
+	if err=l.failpoint("compact:dir-sync");err!=nil{return err}
 	if err=txnSyncDirectory(filepath.Dir(snapshotPath));err!=nil{return err}
 	if err=l.failpoint("compact:snapshot-synced");err!=nil{return err}
 
