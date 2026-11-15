@@ -396,11 +396,65 @@ absolute per-topic next-offset counters so an old completed file cannot
 cause offset or filename reuse after recovery. Pending records remain live
 in the WAL, including when another topic is blocked.
 
-The current transaction WAL format is **v4** with manifest **v3**. **No
-migration or backwards compatibility is provided** for older/unmerged
-transaction WALs or old `committed/<txnID>` directories. Start a new
+The current transaction WAL format is **v5** with manifest **v4**.
+Every physical frame has a `KSWL` magic value, envelope version, fixed header
+size, monotonic frame sequence, CRC32C of the header and CRC32C of the
+payload. Active unaccepted tails may be repaired; corrupt complete frames
+and sealed files fail closed. **No migration or backwards compatibility is
+provided** for older transaction WAL files or old `committed/<txnID>`
+directories. Start a new
 state/output directory when switching to this layout. An unsupported WAL
 manifest fails startup rather than resetting acknowledged history. The WAL also binds the output serialization settings; changing `--output-format`, its formatting options, or the binary delimiter with the same WAL is rejected. Size and interval rotation settings may change.
+
+#### WAL fault verification and external crash campaign
+
+The PR CI includes deterministic WAL fault injection for failed and short
+writes, EIO/ENOSPC/EDQUOT, fsync, manifest write/rename/directory fsync,
+segment creation, checkpoint/rotation and garbage collection, as well as
+integrity checks for the versioned frame envelope. The pinned MinIO
+integration test exercises parallel writers to the same immutable key and
+racing SHA-256 multipart completions.
+
+A separate `WAL external crash qualification` GitHub Actions workflow
+(`workflow_dispatch`) runs the real ksink CLI in child processes, talks to
+it with Kafka transactional clients, records durable operation histories
+outside the WAL, repeatedly sends SIGKILL, restarts and checks that published
+files contain the acknowledged committed-only history without duplicates.
+The default smoke profile is small. The opt-in `qualification` profile
+distributes **10,000 restarts and 100,000 transaction attempts** over 25
+shards; run it explicitly rather than adding this cost to every PR.
+
+To reproduce or customize a shard locally:
+
+```sh
+KSINK_JEPSEN_SEED=0 KSINK_JEPSEN_CYCLES=400 \\
+KSINK_JEPSEN_TXNS_PER_CYCLE=10 \\
+KSINK_JEPSEN_ARTIFACT_DIR=./test-artifacts \\
+go test -count=1 -timeout=160m -run '^TestWALJepsenExternalCampaign
+
+ksink remains a producer-facing sink, not a complete Kafka broker: it does
+not offer Kafka Fetch/consumer groups, `sendOffsetsToTransaction`, a
+global topic ordering, or an `isolation.level` toggle for filesystem
+output. Filesystem output always follows committed-only visibility.
+
+The ordered writer requires a local filesystem supporting atomic hard-link
+creation and durable file/directory `fsync`. Some network filesystems do not
+provide these guarantees. Disk exhaustion or corruption is an error, not
+an invitation to discard acknowledged WAL records. Output readers control
+their own retention of finished files. The WAL must be sized for the largest
+unresolved transaction and for publication backlog.
+
+An ordered formatted record that produces zero bytes is unsupported: an
+empty record cannot create a visible immutable file while preserving its
+file-sequence receipt.
+ ./internal/integration
+```
+
+The full qualification result must be evaluated from actual completed
+workflow runs and their retained JSONL histories; merely having the workflow
+does **not** mean that the large campaign has been executed. SIGKILL and
+injected syscall errors also do not prove true power-loss durability on a
+specific block device. See [WAL fault verification](docs/wal-jepsen-verification.md).
 
 #### Intentional limitations
 
