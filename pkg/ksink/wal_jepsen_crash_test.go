@@ -107,6 +107,11 @@ func TestWALJepsenActiveTailEveryByteCutPreservesAcknowledgedPrefix(t *testing.T
         }})
         require.NoError(t, err)
         require.Equal(t, []int64{0}, offsets)
+        frame, err = txnWALFrameWithSequence(transactionWALRecord{
+            Type: "topic-output",
+            TopicOutput: &WALTopicRecord{Topic: "orders", Offset: 1, Data: []byte("not-acknowledged")},
+        },wal.nextFrameSeq)
+        require.NoError(t,err)
         file := wal.walPath(wal.activeKey())
         before, err := os.Stat(file)
         require.NoError(t, err)
