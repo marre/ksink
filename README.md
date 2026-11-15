@@ -80,23 +80,51 @@ Kafka control markers are omitted. Objects are ordered independently per
 topic, and there is no simultaneous visibility guarantee across topics.
 
 An object is published with conditional `If-None-Match: *` (including
-multipart completion) and its SHA-256 is stored in S3 user metadata.
-After a crash between object publication and the WAL receipt, ksink compares
-the object's length and digest metadata against the reconstructed committed
-WAL prefix before recording the receipt. Conflicts fail closed: ksink never
-intentionally overwrites an existing object key. Publication failures
-exhausting SDK retries stop the process, and a restart retries from WAL.
-Object spooling uses temporary disk files, not unbounded transaction buffers.
+multipart completion). **S3 must support checksum-validated SHA-256 uploads
+and checksum-enabled `HeadObject`**, including the `ChecksumSHA256` value
+and `ChecksumType` response. For single-request `PutObject`, ksink sends
+the full-object SHA-256 checksum. For multipart uploads, ksink specifies
+`SHA256`/`COMPOSITE`, supplies and checks a checksum for every part,
+and includes each part's checksum during completion.
+
+**An S3 GET is not required for verification.** After every upload (including
+a successful response), or on recovery from an ambiguous upload/crash, ksink
+compares the server-validated checksum and length returned by
+`HeadObject(ChecksumMode=ENABLED)` with the WAL-derived bytes. Composite
+SHA-256 is the SHA-256 of the concatenated binary part digests, not the hash
+of the entire object. Ksink stores the actual multipart part size in object
+user metadata to reconstruct the same boundaries after restart even if the
+CLI part-size setting changes. User metadata, ETags and object names
+**are never accepted as integrity proof**. A missing, unsupported or mismatched
+S3 checksum fails closed; ksink never intentionally overwrites an existing key.
+Publication failures exhausting SDK retries stop the process, and restart
+retries from WAL. Spooling uses temporary disk files, not unbounded buffers.
+
+**S3 backend requirements:** conditional `PutObject` and
+`CompleteMultipartUpload` with `If-None-Match: *`; server validation of
+`ChecksumSHA256` on PUT and `UploadPart`; `CreateMultipartUpload` with
+`ChecksumAlgorithm=SHA256` and `ChecksumType=COMPOSITE`; propagation of
+part checksums in `CompleteMultipartUpload`; and `HeadObject` supporting
+`ChecksumMode=ENABLED` and returning the persisted SHA-256 checksum and
+`FULL_OBJECT` or `COMPOSITE` type. The backend must provide read-after-write
+consistency for completed object HEAD requests and uphold the immutability
+contract (use bucket policies to restrict overwrites/deletes by other actors).
+Objects published by older ksink versions without S3-validated checksums
+cannot be automatically reconciled if their WAL receipt was not durable:
+migrate or verify them explicitly; user metadata alone is insufficient.
+S3-compatible providers (including MinIO) **must be tested for these exact
+behaviors**; compatibility must not be assumed from generic S3 API support.
 
 S3 settings: `--output-s3-region`, `--output-s3-endpoint`,
 `--output-s3-force-path-style`, `--output-s3-retries` (SDK attempts),
 `--output-s3-request-timeout`, and `--output-s3-multipart-part-size`
 (bytes, minimum 5 MiB, default 8 MiB). Standard AWS credential discovery
 (environment, profile, role) is used; credentials are not embedded in
-`s3://` destinations. Give the role permission to PUT/HEAD objects and
-create/upload/complete/abort multipart uploads, including conditional writes.
-For S3-compatible services, verify conditional PUT and multipart completion
-semantics with your exact server version.
+`s3://` destinations. Give the role permission to PUT/HEAD objects (including
+checksum-mode HEAD), create/upload/complete/abort multipart uploads, and use
+conditional writes. For SSE-KMS objects, checksum-mode HEAD may additionally
+require KMS `Decrypt` (and, depending on configuration, `GenerateDataKey`)
+permissions.
 
 Size/interval rotation and the per-topic file sequence behave like local
 ordered output; no independent S3 batching/transaction parameters exist.
