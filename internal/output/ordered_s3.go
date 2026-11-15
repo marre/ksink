@@ -3,9 +3,11 @@ package output
 import (
     "context"
     "crypto/sha256"
+    "encoding/base64"
     "encoding/hex"
     "errors"
     "fmt"
+    "hash"
     "io"
     "net/url"
     "os"
@@ -35,7 +37,6 @@ type S3OrderedOpts struct {
 // s3OrderedAPI isolates S3 transport for deterministic publication tests.
 type s3OrderedAPI interface {
     HeadObject(context.Context, *s3.HeadObjectInput, ...func(*s3.Options)) (*s3.HeadObjectOutput, error)
-    GetObject(context.Context, *s3.GetObjectInput, ...func(*s3.Options)) (*s3.GetObjectOutput, error)
     PutObject(context.Context, *s3.PutObjectInput, ...func(*s3.Options)) (*s3.PutObjectOutput, error)
     CreateMultipartUpload(context.Context, *s3.CreateMultipartUploadInput, ...func(*s3.Options)) (*s3.CreateMultipartUploadOutput, error)
     UploadPart(context.Context, *s3.UploadPartInput, ...func(*s3.Options)) (*s3.UploadPartOutput, error)
@@ -57,11 +58,81 @@ type S3OrderedPublisher struct {
 
 type s3OrderedObject struct {
     size int64
-    digest string
+    checksum string
+    checksumType types.ChecksumType
+    partSize int64
 }
 
 const s3OrderedMinimumPartSize int64 = 5 << 20
 const s3OrderedDefaultPartSize int64 = 8 << 20
+
+// Multipart SHA256 is the base64 SHA256 of concatenated binary part digests,
+// followed by "-<part count>". A deterministic boundary is needed to recreate
+// this checksum from the WAL after an ambiguous completion or process crash.
+func s3OrderedPartSize(size, configured int64) int64 {
+    if required := (size-1)/10000+1; required > configured {
+        return required
+    }
+    return configured
+}
+
+type s3OrderedHasher struct {
+    whole hash.Hash
+    part hash.Hash
+    composite hash.Hash
+    partSize int64 // zero means a single PutObject / FULL_OBJECT checksum
+    partBytes int64
+    partCount int
+}
+
+func newS3OrderedHasher(partSize int64) *s3OrderedHasher {
+    h := &s3OrderedHasher{whole:sha256.New(),partSize:partSize}
+    if partSize > 0 {
+        h.part = sha256.New()
+        h.composite = sha256.New()
+    }
+    return h
+}
+
+func (h *s3OrderedHasher) Write(data []byte) (int,error) {
+    original := len(data)
+    _,_ = h.whole.Write(data)
+    if h.partSize == 0 {return original,nil}
+    for len(data)>0 {
+        count := int64(len(data))
+        if available:=h.partSize-h.partBytes;count>available{count=available}
+        n:=int(count)
+        _,_=h.part.Write(data[:n])
+        h.partBytes+=count
+        data=data[n:]
+        if h.partBytes==h.partSize {
+            _,_=h.composite.Write(h.part.Sum(nil))
+            h.part.Reset()
+            h.partBytes=0
+            h.partCount++
+        }
+    }
+    return original,nil
+}
+
+func (h *s3OrderedHasher) sums() (digest,checksum string) {
+    whole:=h.whole.Sum(nil)
+    digest=hex.EncodeToString(whole)
+    if h.partSize==0 {return digest,base64.StdEncoding.EncodeToString(whole)}
+    if h.partBytes>0 {
+        _,_=h.composite.Write(h.part.Sum(nil))
+        h.partCount++
+        h.partBytes=0
+    }
+    return digest,base64.StdEncoding.EncodeToString(h.composite.Sum(nil))+"-"+strconv.Itoa(h.partCount)
+}
+
+func s3OrderedChecksumMatch(key string, info s3OrderedObject, size int64, expected string, expectedType types.ChecksumType) error {
+    if info.size!=size || info.checksumType!=expectedType || info.checksum!=expected {
+        return fmt.Errorf("S3 immutable object conflict for %q (size or server-validated SHA256 checksum differs from committed WAL bytes)",key)
+    }
+    return nil
+}
 
 func parseS3OrderedDestination(dst string) (bucket, pattern, root string, width int, err error) {
     u, err := url.Parse(dst)
@@ -198,79 +269,98 @@ func s3OrderedNotFound(err error) bool {
 func (p *S3OrderedPublisher) inspect(ctx context.Context, key string) (s3OrderedObject,bool,error) {
     reqCtx,cancel:=context.WithTimeout(ctx,p.opts.RequestTimeout)
     defer cancel()
-    out,err:=p.client.HeadObject(reqCtx,&s3.HeadObjectInput{Bucket:aws.String(p.bucket),Key:aws.String(key)})
+    out,err:=p.client.HeadObject(reqCtx,&s3.HeadObjectInput{
+        Bucket:aws.String(p.bucket),Key:aws.String(key),ChecksumMode:types.ChecksumModeEnabled,
+    })
     if err!=nil {
         if s3OrderedNotFound(err) {return s3OrderedObject{},false,nil}
-        return s3OrderedObject{},false,fmt.Errorf("HEAD s3://%s/%s: %w",p.bucket,key,err)
+        return s3OrderedObject{},false,fmt.Errorf("HEAD with checksum s3://%s/%s: %w",p.bucket,key,err)
     }
     if out==nil {return s3OrderedObject{},false,errors.New("empty S3 HEAD response")}
-    return s3OrderedObject{size:aws.ToInt64(out.ContentLength),digest:out.Metadata["ksink-sha256"]},true,nil
+    info:=s3OrderedObject{
+        size:aws.ToInt64(out.ContentLength),checksum:aws.ToString(out.ChecksumSHA256),
+        checksumType:out.ChecksumType,
+    }
+    if info.size<=0 || info.checksum=="" ||
+        (info.checksumType!=types.ChecksumTypeFullObject && info.checksumType!=types.ChecksumTypeComposite) {
+        return s3OrderedObject{},false,fmt.Errorf("S3 object s3://%s/%s lacks server-validated SHA256 checksum and checksum type (S3 backend must support checksum-enabled HEAD)",p.bucket,key)
+    }
+    if info.checksumType==types.ChecksumTypeComposite {
+        partSize,parseErr:=strconv.ParseInt(out.Metadata["ksink-part-size"],10,64)
+        if parseErr!=nil || partSize<s3OrderedMinimumPartSize ||
+            (info.size-1)/partSize+1>10000 {
+            return s3OrderedObject{},false,fmt.Errorf("S3 object s3://%s/%s has invalid multipart part-size metadata",p.bucket,key)
+        }
+        info.partSize=partSize
+    }
+    return info,true,nil
 }
 
-// verifyBody attests an already-published object's bytes rather than treating
-// client-controlled S3 user metadata as proof of contents. This is deliberately
-// a streaming GET: recovery should prefer correctness over bandwidth.
-func (p *S3OrderedPublisher) verifyBody(ctx context.Context, key string, size int64, digest string) error {
-    reqCtx,cancel:=context.WithTimeout(ctx,p.opts.RequestTimeout)
-    defer cancel()
-    out,err:=p.client.GetObject(reqCtx,&s3.GetObjectInput{Bucket:aws.String(p.bucket),Key:aws.String(key)})
-    if err!=nil{return fmt.Errorf("GET s3://%s/%s: %w",p.bucket,key,err)}
-    if out==nil || out.Body==nil{return fmt.Errorf("empty S3 GET body for s3://%s/%s",p.bucket,key)}
-    defer out.Body.Close() //nolint:errcheck
-    if aws.ToInt64(out.ContentLength)!=size {
-        return fmt.Errorf("S3 immutable object conflict for s3://%s/%s (body size differs)",p.bucket,key)
+func (p *S3OrderedPublisher) checksumForFile(file *os.File,size int64) (digest,checksum string,kind types.ChecksumType,err error) {
+    partSize:=int64(0)
+    kind=types.ChecksumTypeFullObject
+    if size>=p.opts.MultipartPartSize {
+        kind=types.ChecksumTypeComposite
+        partSize=s3OrderedPartSize(size,p.opts.MultipartPartSize)
     }
-    hash:=sha256.New()
-    n,err:=io.Copy(hash,out.Body)
-    if err!=nil{return fmt.Errorf("read S3 object s3://%s/%s: %w",p.bucket,key,err)}
-    if n!=size || hex.EncodeToString(hash.Sum(nil))!=digest {
-        return fmt.Errorf("S3 immutable object conflict for s3://%s/%s (body differs from committed WAL bytes)",p.bucket,key)
-    }
-    return nil
+    h:=newS3OrderedHasher(partSize)
+    copied,err:=io.Copy(h,io.NewSectionReader(file,0,size))
+    if err!=nil{return "","",kind,fmt.Errorf("hash local S3 publication spool: %w",err)}
+    if copied!=size {return "","",kind,errors.New("local S3 publication spool was truncated")}
+    digest,checksum=h.sums()
+    return digest,checksum,kind,nil
 }
 
-func (p *S3OrderedPublisher) reconcile(ctx context.Context, key string, size int64, digest string) (bool,error) {
+func (p *S3OrderedPublisher) reconcile(ctx context.Context,key string,size int64,checksum string,kind types.ChecksumType) (bool,error) {
     info,exists,err:=p.inspect(ctx,key)
     if err!=nil{return false,err}
     if !exists{return false,nil}
-    if info.size!=size || info.digest!=digest {
-        return false,fmt.Errorf("S3 immutable object conflict for s3://%s/%s (size/digest mismatch)",p.bucket,key)
-    }
-    if err:=p.verifyBody(ctx,key,size,digest);err!=nil{return false,err}
+    if err:=s3OrderedChecksumMatch(key,info,size,checksum,kind);err!=nil{return false,err}
     return true,nil
 }
 
-func (p *S3OrderedPublisher) publish(ctx context.Context,key string, file *os.File,size int64,digest string) error {
+func (p *S3OrderedPublisher) publish(ctx context.Context,key string,file *os.File,size int64,digest string) error {
     if size<=0 || len(digest)!=sha256.Size*2 {return errors.New("invalid S3 object size/digest")}
-    exists,err:=p.reconcile(ctx,key,size,digest)
+    localDigest,checksum,kind,err:=p.checksumForFile(file,size)
+    if err!=nil{return err}
+    if localDigest!=digest {return errors.New("local S3 spool differs from committed WAL digest")}
+    exists,err:=p.reconcile(ctx,key,size,checksum,kind)
     if err!=nil{return err}
     if exists{return nil}
-    if size<p.opts.MultipartPartSize {
+    var uploadErr error
+    if kind==types.ChecksumTypeFullObject {
         reqCtx,cancel:=context.WithTimeout(ctx,p.opts.RequestTimeout)
-        _,err=p.client.PutObject(reqCtx,&s3.PutObjectInput{
+        _,uploadErr=p.client.PutObject(reqCtx,&s3.PutObjectInput{
             Bucket:aws.String(p.bucket),Key:aws.String(key),
             Body:io.NewSectionReader(file,0,size),ContentLength:aws.Int64(size),
             IfNoneMatch:aws.String("*"),
+            ChecksumAlgorithm:types.ChecksumAlgorithmSha256,ChecksumSHA256:aws.String(checksum),
             Metadata:map[string]string{"ksink-sha256":digest,"ksink-version":"ordered-v1"},
         })
         cancel()
     } else {
-        err=p.multipart(ctx,key,file,size,digest)
+        uploadErr=p.multipart(ctx,key,file,size,digest)
     }
-    if err==nil{return nil}
-    // 412 and lost successful responses are both resolved by reading the
-    // immutable result; a mismatch must never be overwritten.
-    exists,reconcileErr:=p.reconcile(ctx,key,size,digest)
-    if reconcileErr!=nil{return errors.Join(err,reconcileErr)}
+    // Even a 200 response must be independently verified before a durable WAL
+    // receipt. A compatible endpoint that silently ignores checksum inputs
+    // must not be able to acknowledge bytes that differ from the WAL.
+    exists,reconcileErr:=p.reconcile(ctx,key,size,checksum,kind)
+    if reconcileErr!=nil{return errors.Join(uploadErr,reconcileErr)}
     if exists{return nil}
-    return fmt.Errorf("publish S3 object s3://%s/%s: %w",p.bucket,key,err)
+    if uploadErr!=nil{return fmt.Errorf("publish S3 object s3://%s/%s: %w",p.bucket,key,uploadErr)}
+    return fmt.Errorf("S3 upload returned success but checksum-validated HEAD cannot find s3://%s/%s",p.bucket,key)
 }
 
 func (p *S3OrderedPublisher) multipart(ctx context.Context,key string,file *os.File,size int64,digest string) error {
+    partSize:=s3OrderedPartSize(size,p.opts.MultipartPartSize)
     reqCtx,cancel:=context.WithTimeout(ctx,p.opts.RequestTimeout)
     started,err:=p.client.CreateMultipartUpload(reqCtx,&s3.CreateMultipartUploadInput{
         Bucket:aws.String(p.bucket),Key:aws.String(key),
-        Metadata:map[string]string{"ksink-sha256":digest,"ksink-version":"ordered-v1"},
+        ChecksumAlgorithm:types.ChecksumAlgorithmSha256,ChecksumType:types.ChecksumTypeComposite,
+        Metadata:map[string]string{
+            "ksink-sha256":digest,"ksink-version":"ordered-v1",
+            "ksink-part-size":strconv.FormatInt(partSize,10),
+        },
     })
     cancel()
     if err!=nil{return fmt.Errorf("initiate S3 multipart: %w",err)}
@@ -287,27 +377,32 @@ func (p *S3OrderedPublisher) multipart(ctx context.Context,key string,file *os.F
             Bucket:aws.String(p.bucket),Key:aws.String(key),UploadId:uploadID,
         })
     }()
-    partSize:=p.opts.MultipartPartSize
-    // S3 supports at most 10,000 parts. Raise the size for unusually large
-    // objects rather than creating an invalid upload or buffering the object.
-    if required:=(size-1)/10000+1; required>partSize {partSize=required}
     parts:=make([]types.CompletedPart,0)
     for offset,number:=int64(0),int32(1);offset<size;offset,number=offset+partSize,number+1 {
         if err:=ctx.Err();err!=nil{return err}
         n:=partSize
         if size-offset<n {n=size-offset}
+        partHash:=sha256.New()
+        copied,err:=io.Copy(partHash,io.NewSectionReader(file,offset,n))
+        if err!=nil{return fmt.Errorf("hash S3 part %d: %w",number,err)}
+        if copied!=n {return fmt.Errorf("S3 part %d local spool truncated",number)}
+        partChecksum:=base64.StdEncoding.EncodeToString(partHash.Sum(nil))
         reqCtx,cancel:=context.WithTimeout(ctx,p.opts.RequestTimeout)
         uploaded,partErr:=p.client.UploadPart(reqCtx,&s3.UploadPartInput{
             Bucket:aws.String(p.bucket),Key:aws.String(key),UploadId:uploadID,
             PartNumber:aws.Int32(number),ContentLength:aws.Int64(n),
+            ChecksumSHA256:aws.String(partChecksum),
             Body:io.NewSectionReader(file,offset,n),
         })
         cancel()
         if partErr!=nil{return fmt.Errorf("upload S3 part %d: %w",number,partErr)}
-        if uploaded==nil || aws.ToString(uploaded.ETag)=="" {
-            return fmt.Errorf("S3 part %d returned no ETag",number)
+        if uploaded==nil || aws.ToString(uploaded.ETag)=="" ||
+            aws.ToString(uploaded.ChecksumSHA256)!=partChecksum {
+            return fmt.Errorf("S3 part %d returned no ETag or a mismatched SHA256 checksum",number)
         }
-        parts=append(parts,types.CompletedPart{PartNumber:aws.Int32(number),ETag:uploaded.ETag})
+        parts=append(parts,types.CompletedPart{
+            PartNumber:aws.Int32(number),ETag:uploaded.ETag,ChecksumSHA256:aws.String(partChecksum),
+        })
     }
     reqCtx,cancel=context.WithTimeout(ctx,p.opts.RequestTimeout)
     _,err=p.client.CompleteMultipartUpload(reqCtx,&s3.CompleteMultipartUploadInput{
@@ -345,10 +440,8 @@ func newS3OrderedTopicMaterializerWithPublisher(wal *ksink.TransactionLog,p *S3O
 
 func (w *OrderedTopicMaterializer) verifyExistingS3(ctx context.Context,topic string,
     start,stable int64,key string,existing s3OrderedObject) (int64,int64,string,error) {
-    if existing.size<=0 || len(existing.digest)!=sha256.Size*2 {
-        return 0,0,"",fmt.Errorf("S3 object %q missing valid size/digest metadata",key)
-    }
-    hash:=sha256.New()
+    if existing.size<=0 {return 0,0,"",fmt.Errorf("S3 object %q has invalid size",key)}
+    h:=newS3OrderedHasher(existing.partSize)
     var total int64
     for pos:=start;pos<stable;pos++ {
         if err:=ctx.Err();err!=nil{return 0,0,"",err}
@@ -358,17 +451,15 @@ func (w *OrderedTopicMaterializer) verifyExistingS3(ctx context.Context,topic st
             if len(record.Data)==0 || int64(len(record.Data))>existing.size-total {
                 return 0,0,"",fmt.Errorf("S3 object %q differs from committed WAL bytes",key)
             }
-            _,_=hash.Write(record.Data)
+            _,_=h.Write(record.Data)
             total+=int64(len(record.Data))
         }
         if total==existing.size {
-            digest:=hex.EncodeToString(hash.Sum(nil))
-            if digest!=existing.digest {
-                return 0,0,"",fmt.Errorf("S3 object %q has mismatched committed WAL digest",key)
+            digest,checksum:=h.sums()
+            if err:=s3OrderedChecksumMatch(key,existing,total,checksum,
+                map[bool]types.ChecksumType{true:types.ChecksumTypeComposite,false:types.ChecksumTypeFullObject}[existing.partSize>0]);err!=nil{
+                return 0,0,"",err
             }
-            // HEAD's ksink-sha256 metadata is mutable by another writer.
-            // Only the actual object bytes may authorize a WAL receipt.
-            if err:=w.s3.verifyBody(ctx,key,total,digest);err!=nil{return 0,0,"",err}
             return pos+1,total,digest,nil
         }
     }
