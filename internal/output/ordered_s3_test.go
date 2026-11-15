@@ -368,7 +368,7 @@ func TestS3OrderedWALBindsSharedConfigEndpointAndRegion(t *testing.T) {
     t.Setenv("AWS_PROFILE","default")
     configFile:=filepath.Join(t.TempDir(),"aws-config")
     require.NoError(t,os.WriteFile(configFile,[]byte(
-        "[default]\\nregion = eu-north-1\\nendpoint_url = http://localhost:9100\\n"),0600))
+        "[default]\nregion = eu-north-1\nendpoint_url = http://localhost:9100\n"),0600))
     t.Setenv("AWS_CONFIG_FILE",configFile)
     first,err:=newS3OrderedPublisher(testOrderedS3Pattern,S3OrderedOpts{})
     require.NoError(t,err)
@@ -378,7 +378,7 @@ func TestS3OrderedWALBindsSharedConfigEndpointAndRegion(t *testing.T) {
     _,err=newS3OrderedTopicMaterializerWithPublisher(wal,first,1,time.Minute)
     require.NoError(t,err)
     require.NoError(t,os.WriteFile(configFile,[]byte(
-        "[default]\\nregion = eu-north-1\\nendpoint_url = http://localhost:9101\\n"),0600))
+        "[default]\nregion = eu-north-1\nendpoint_url = http://localhost:9101\n"),0600))
     changed,err:=newS3OrderedPublisher(testOrderedS3Pattern,S3OrderedOpts{})
     require.NoError(t,err)
     require.Contains(t,changed.identity,"http://localhost:9101")
@@ -387,7 +387,7 @@ func TestS3OrderedWALBindsSharedConfigEndpointAndRegion(t *testing.T) {
     // The AWS region also influences the default S3 service endpoint.
     t.Setenv("AWS_ENDPOINT_URL_S3","")
     require.NoError(t,os.WriteFile(configFile,[]byte(
-        "[default]\\nregion = eu-west-1\\n"),0600))
+        "[default]\nregion = eu-west-1\n"),0600))
     regionChanged,err:=newS3OrderedPublisher(testOrderedS3Pattern,S3OrderedOpts{})
     require.NoError(t,err)
     require.Contains(t,regionChanged.identity,`region="eu-west-1"`)
