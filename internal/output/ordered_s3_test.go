@@ -302,6 +302,26 @@ func TestS3OrderedMissingChecksumFailsClosed(t *testing.T) {
     require.Zero(t,fake.puts)
 }
 
+func TestS3OrderedSuccessfulPutRequiresVerifiedHEAD(t *testing.T) {
+    wal:=orderedTestLog(t)
+    fake:=newFakeOrderedS3()
+    fake.headMissingChecksum=true
+    w:=testOrderedS3Materializer(t,wal,fake,1)
+    _,err:=wal.AppendTopicBatch([]ksink.WALTopicRecord{{Topic:"orders",Data:[]byte("record")}})
+    require.NoError(t,err)
+    // The backend returned 200 for a complete upload, but did not expose
+    // its S3-validated checksum. No WAL receipt is permitted.
+    require.ErrorContains(t,w.Flush(context.Background()),"lacks server-validated SHA256")
+    require.Equal(t,1,fake.puts)
+    require.Zero(t,wal.TopicProgress("orders").Cursor)
+    // When checksum-mode HEAD is supported, the durable object is reconciled
+    // without overwriting or downloading its body.
+    fake.headMissingChecksum=false
+    require.NoError(t,w.Flush(context.Background()))
+    require.Equal(t,1,fake.puts)
+    require.Equal(t,int64(1),wal.TopicProgress("orders").Cursor)
+}
+
 func TestS3OrderedPUTChecksumMismatchFailsClosed(t *testing.T) {
     wal:=orderedTestLog(t)
     fake:=newFakeOrderedS3()
