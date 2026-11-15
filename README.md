@@ -420,6 +420,9 @@ A separate `WAL external crash qualification` GitHub Actions workflow
 it with Kafka transactional clients, records durable operation histories
 outside the WAL, repeatedly sends SIGKILL, restarts and checks that published
 files contain the acknowledged committed-only history without duplicates.
+A separate external smoke test runs five overlapping transactional producers,
+competing commits and aborts across two topics, and checks final publication
+order against Kafka-assigned offsets across restarts.
 The default smoke profile is small. The opt-in `qualification` profile
 distributes **10,000 restarts and 100,000 transaction attempts** over 25
 shards; run it explicitly rather than adding this cost to every PR.
