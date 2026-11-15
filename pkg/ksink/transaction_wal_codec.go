@@ -20,8 +20,8 @@ const (
 )
 
 // encodeTxnWALRecord stores output bytes without JSON/base64 expansion.
-// Metadata records remain small, versioned JSON documents. The outer 8-byte
-// length and CRC32C envelope is identical for both types of record.
+// Metadata records remain versioned JSON. Every record has a self-identifying,
+// checksum-protected envelope (including header fields and monotonic LSN).
 func encodeTxnWALRecord(rec transactionWALRecord) ([]byte, error) {
 	rec.Version = transactionWALVersion
 	if rec.Type == "topic-output" {
@@ -127,35 +127,76 @@ func decodeTxnWALRecord(raw []byte) (transactionWALRecord, error) {
 	}}, nil
 }
 
+// WAL v5 physical frame header: magic[4], version[2], header length[2],
+// sequence[8], payload length[4], payload CRC32C[4], header CRC32C[4].
+// All integers are big-endian. Sequence is strictly increasing for frames
+// in physical WAL replay order (including checkpoint generations).
+const (
+    txnWALMagic = "KSWL"
+    txnWALFrameVersion uint16 = 1
+    txnWALHeaderBytes = 28
+)
+
+func txnWALHeader(data []byte) (uint32,uint64,error) {
+    if len(data)!=txnWALHeaderBytes {return 0,0,fmt.Errorf("truncated WAL frame header")}
+    if string(data[:4])!=txnWALMagic {return 0,0,errors.New("unrecognized WAL frame magic")}
+    if v:=binary.BigEndian.Uint16(data[4:6]);v!=txnWALFrameVersion {
+        return 0,0,fmt.Errorf("unsupported WAL frame version %d",v)
+    }
+    if n:=binary.BigEndian.Uint16(data[6:8]);n!=txnWALHeaderBytes {
+        return 0,0,fmt.Errorf("unsupported WAL frame header size %d",n)
+    }
+    if crc32.Checksum(data[:24],transactionWALCRCTable)!=binary.BigEndian.Uint32(data[24:28]){
+        return 0,0,errors.New("WAL frame header checksum mismatch")
+    }
+    n:=binary.BigEndian.Uint32(data[16:20])
+    if n==0 || n>transactionWALMaxFrame{return 0,0,fmt.Errorf("invalid WAL record length %d",n)}
+    seq:=binary.BigEndian.Uint64(data[8:16])
+    if seq==0 || seq==^uint64(0) {return 0,0,fmt.Errorf("invalid WAL frame sequence %d",seq)}
+    return n,seq,nil
+}
+
+func txnWALFrameWithSequence(rec transactionWALRecord,seq uint64) ([]byte,error) {
+    payload,err:=encodeTxnWALRecord(rec)
+    if err!=nil{return nil,err}
+    if seq==0 || seq==^uint64(0){return nil,fmt.Errorf("invalid WAL frame sequence %d",seq)}
+    var header [txnWALHeaderBytes]byte
+    copy(header[:4],txnWALMagic)
+    binary.BigEndian.PutUint16(header[4:6],txnWALFrameVersion)
+    binary.BigEndian.PutUint16(header[6:8],txnWALHeaderBytes)
+    binary.BigEndian.PutUint64(header[8:16],seq)
+    binary.BigEndian.PutUint32(header[16:20],uint32(len(payload)))
+    binary.BigEndian.PutUint32(header[20:24],crc32.Checksum(payload,transactionWALCRCTable))
+    binary.BigEndian.PutUint32(header[24:28],crc32.Checksum(header[:24],transactionWALCRCTable))
+    return append(header[:],payload...),nil
+}
+
+// txnWALFrame is a standalone fixture helper; production always allocates
+// sequences under the WAL mutex or the checkpoint writer.
 func txnWALFrame(rec transactionWALRecord) ([]byte,error) {
-	payload,err:=encodeTxnWALRecord(rec)
-	if err!=nil {return nil,err}
-	var header [8]byte
-	binary.BigEndian.PutUint32(header[:4],uint32(len(payload)))
-	binary.BigEndian.PutUint32(header[4:],crc32.Checksum(payload,transactionWALCRCTable))
-	return append(header[:],payload...),nil
+    return txnWALFrameWithSequence(rec,1)
 }
 
-// readTxnWALFrameAt verifies the checksum and structured representation,
-// ensuring that indexed payload streaming is also protected against bit rot.
+// readTxnWALFrameAt validates both envelope checksums before decoding an
+// indexed frame. Replay additionally validates strictly increasing sequences.
 func readTxnWALFrameAt(file *os.File,offset int64)(transactionWALRecord,int64,error){
-	var header [8]byte
-	if _,err:=file.ReadAt(header[:],offset);err!=nil{return transactionWALRecord{},0,err}
-	n:=binary.BigEndian.Uint32(header[:4])
-	if n==0 || n>transactionWALMaxFrame {return transactionWALRecord{},0,fmt.Errorf("invalid WAL record length %d",n)}
-	buf:=make([]byte,int(n))
-	if _,err:=file.ReadAt(buf,offset+8);err!=nil{return transactionWALRecord{},0,err}
-	if crc32.Checksum(buf,transactionWALCRCTable)!=binary.BigEndian.Uint32(header[4:]){
-		return transactionWALRecord{},0,fmt.Errorf("WAL checksum mismatch at %d",offset)
-	}
-	rec,err:=decodeTxnWALRecord(buf)
-	return rec,int64(n)+8,err
+    var header [txnWALHeaderBytes]byte
+    if _,err:=file.ReadAt(header[:],offset);err!=nil{return transactionWALRecord{},0,err}
+    n,_,err:=txnWALHeader(header[:])
+    if err!=nil{return transactionWALRecord{},0,fmt.Errorf("WAL header at %d: %w",offset,err)}
+    buf:=make([]byte,int(n))
+    if _,err:=file.ReadAt(buf,offset+txnWALHeaderBytes);err!=nil{return transactionWALRecord{},0,err}
+    if crc32.Checksum(buf,transactionWALCRCTable)!=binary.BigEndian.Uint32(header[20:24]){
+        return transactionWALRecord{},0,fmt.Errorf("WAL checksum mismatch at %d",offset)
+    }
+    rec,err:=decodeTxnWALRecord(buf)
+    return rec,int64(n)+txnWALHeaderBytes,err
 }
 
-func writeTxnWALFrame(w io.Writer, rec transactionWALRecord) (int64,error){
-	b,err:=txnWALFrame(rec)
-	if err!=nil{return 0,err}
-	n,err:=w.Write(b)
-	if err==nil && n!=len(b){err=io.ErrShortWrite}
-	return int64(n),err
+func writeTxnWALFrameWithSequence(w io.Writer,rec transactionWALRecord,seq uint64) (int64,error){
+    b,err:=txnWALFrameWithSequence(rec,seq)
+    if err!=nil{return 0,err}
+    n,err:=w.Write(b)
+    if err==nil && n!=len(b){err=io.ErrShortWrite}
+    return int64(n),err
 }
