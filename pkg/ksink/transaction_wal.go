@@ -2,7 +2,6 @@ package ksink
 
 import (
 	"crypto/rand"
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"hash/crc32"
