@@ -232,6 +232,8 @@ func TestS3OrderedPublicationReceiptAndPerTopicOrdering(t *testing.T) {
     hash:=sha256.Sum256([]byte("c\n"))
     require.Equal(t,hex.EncodeToString(hash[:]),receipt.SHA256)
     require.Equal(t,3,fake.puts)
+    require.Empty(t,fake.objects["root/orders/messages-00000002.jsonl"].meta,
+        "single-part checksums must not need redundant digest/version metadata")
     // Removal after a durable receipt never reuses its sequence.
     delete(fake.objects,"root/orders/messages-00000001.jsonl")
     _,err=wal.AppendTopicBatch([]ksink.WALTopicRecord{{Topic:"orders",Data:[]byte("later\n")}})
@@ -379,6 +381,9 @@ func TestS3OrderedMultipartAndAmbiguousCompletion(t *testing.T) {
     require.Equal(t,1,fake.completes)
     require.Equal(t,0,fake.puts)
     require.Equal(t,data,fake.objects["root/big/messages-00000001.jsonl"].data)
+    require.Equal(t,map[string]string{"ksink-part-size":strconv.FormatInt(5<<20,10)},
+        fake.objects["root/big/messages-00000001.jsonl"].meta,
+        "multipart metadata should only preserve checksum boundaries")
     require.Equal(t,int64(1),wal.TopicProgress("big").Cursor)
 }
 
