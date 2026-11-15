@@ -126,6 +126,7 @@ type TransactionLog struct {
 	formatBindingRef walFrameRef
 	markerRefs map[string]walFrameRef
 	faultHook func(string) error // test-only, called while holding mu
+	frameWrite func(*os.File,[]byte)(int,error) // test-only: inject partial writes and syscall failures
 	segmentLimit int64 // tests may reduce rotation threshold; defaults to 64 MiB
 	nextFrameSeq uint64 // monotonic physical frame sequence across snapshots/segments
 }
@@ -680,13 +681,23 @@ func (l *TransactionLog) appendBatchLocked(records []transactionWALRecord) error
 	base:=current.size
 	var written int64
 	for _,buf:=range frames {
-		n,err:=l.logFile.Write(buf)
+		if err:=l.failpoint("append:write");err!=nil{
+			l.broken=fmt.Errorf("transaction WAL append permanently failed: %w",err)
+			return l.broken
+		}
+		writer:=l.frameWrite
+		if writer==nil {writer=(*os.File).Write}
+		n,err:=writer(l.logFile,buf)
 		written+=int64(n)
 		if err==nil && n!=len(buf){err=io.ErrShortWrite}
 		if err!=nil {
 			l.broken=fmt.Errorf("transaction WAL append permanently failed: %w",err)
 			return l.broken
 		}
+	}
+	if err:=l.failpoint("append:fsync");err!=nil{
+		l.broken=fmt.Errorf("transaction WAL fsync permanently failed: %w",err)
+		return l.broken
 	}
 	if err:=l.logFile.Sync();err!=nil {
 		l.broken=fmt.Errorf("transaction WAL fsync permanently failed: %w",err)
