@@ -61,6 +61,7 @@ func TestWALJepsenSeededTransactionalHistorySurvivesCompactionAndRestarts(t *tes
             dir := filepath.Join(t.TempDir(), "state")
             wal, err := OpenTransactionLog(dir)
             require.NoError(t, err)
+            require.NoError(t, wal.BindOutput(filepath.Join(t.TempDir(), "{topic}", "messages-{seq:08}.jsonl")))
 
             topics := []string{"orders", "payments"}
             expected := map[string][]walJepsenModelSlot{"orders": {}, "payments": {}}
