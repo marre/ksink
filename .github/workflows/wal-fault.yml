@@ -78,7 +78,7 @@ jobs:
           grep -Eq '^--- PASS: TestWALFaultExternalCampaign ' test-artifacts/fault-test-output.log
       - name: Preserve durable external history
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: wal-fault-${{ inputs.profile }}-${{ matrix.shard }}
           path: test-artifacts/
